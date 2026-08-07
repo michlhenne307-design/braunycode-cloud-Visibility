@@ -1,0 +1,31 @@
+# Referenz-Unit. install.sh schreibt diese Datei mit den echten Pfaden
+# nach /etc/systemd/system/braunycode.service - hier nur zum Nachschlagen.
+#
+# Platzhalter: __USER__ __HOME__ __PORT__
+
+[Unit]
+Description=BraunyCode Cloud Agent
+After=network-online.target docker.service ollama.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=__USER__
+# Primaergruppe docker: so kommt der Dienst an /var/run/docker.sock, ohne
+# dass sich der Benutzer nach dem usermod erst neu anmelden muss.
+Group=docker
+WorkingDirectory=__HOME__/braunycode/app
+# Eigenes TMPDIR statt PrivateTmp=true: die Projektverzeichnisse werden per
+# bind-mount an Docker gereicht. Ein privater /tmp-Namespace ist fuer den
+# Docker-Daemon unsichtbar, der Mount waere leer.
+Environment=TMPDIR=__HOME__/braunycode/tmp
+EnvironmentFile=__HOME__/braunycode/brauny.env
+ExecStart=__HOME__/braunycode/venv/bin/uvicorn main:app \
+          --app-dir __HOME__/braunycode/app \
+          --host 0.0.0.0 --port __PORT__
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
