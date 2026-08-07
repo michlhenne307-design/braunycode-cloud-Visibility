@@ -89,8 +89,9 @@ Der Installer läuft 10–20 Minuten und erledigt:
 3. Docker + `python:3.11-slim` als Sandbox-Image
 4. Ollama + Modell `llama3.1:8b` (mehrere GB)
 5. Python-venv (nötig wegen PEP 668 auf Ubuntu 24.04)
-6. Zufälliges Zugangs-Token, systemd-Dienst
-7. Lokale iptables-Regel für Port 8000
+6. PWA-Icons, falls sie fehlen
+7. Zufälliges Zugangs-Token, systemd-Dienst
+8. Lokale iptables-Regel für Port 8000
 
 Am Ende stehen **Adresse und Token** im Terminal. Token notieren.
 
@@ -135,16 +136,34 @@ Termius kannst du schließen — tmux brauchst du nicht.
 
 ---
 
+## 7. Als App auf den Home-Bildschirm
+
+In Safari auf der geöffneten Seite: **Teilen-Symbol** (Quadrat mit Pfeil nach
+oben) → **Zum Home-Bildschirm** → **Hinzufügen**.
+
+Ab jetzt liegt BraunyCode als eigenes Icon auf dem Home-Bildschirm und startet
+im Vollbild ohne Safari-Leiste. Das Token bleibt gespeichert.
+
+> Über HTTP registriert Safari keinen Service Worker — die App läuft trotzdem,
+> nur ohne Offline-Hülle. Auch der Kopieren-Knopf im Code-Reiter braucht einen
+> sicheren Kontext. Wer beides will, nimmt den SSH-Tunnel unten oder setzt
+> einen TLS-Proxy davor.
+
+---
+
 ## Wenn etwas nicht geht
 
 | Symptom | Ursache und Behebung |
 |---|---|
 | Safari: „Server nicht erreichbar" | Ingress-Regel aus Schritt 5 fehlt. Gegenprobe auf dem Server: `curl -s localhost:8000/healthz` — antwortet das, liegt es sicher an der Firewall. |
-| `[FEHLER] ... model not found` | Modell fehlt. `ollama pull llama3.1:8b`, dann `sudo systemctl restart braunycode` |
-| `[FEHLER] ... permission denied ... docker.sock` | Docker-Gruppe. `sudo systemctl restart braunycode`, sonst einmal aus- und einloggen. |
+| Meldung „model not found“ | Modell fehlt. `ollama pull llama3.1:8b`, dann `sudo systemctl restart braunycode` |
+| Meldung „permission denied … docker.sock“ | Docker-Gruppe. `sudo systemctl restart braunycode`, sonst einmal aus- und einloggen. |
 | Dienst startet nicht | `journalctl -u braunycode -n 50 --no-pager` |
 | Antworten sehr langsam | Normal. Ohne GPU rechnet das Modell auf der CPU, ein Lauf dauert Minuten. |
 | `externally-managed-environment` | Es wurde `pip3 install` ohne venv benutzt. Der Installer macht das richtig — nutze ihn statt manueller Installation. |
+| Statuspunkt oben ist rot | `curl -s localhost:8000/healthz` nennt Ollama bzw. Docker im Klartext. |
+| Kopieren-Knopf tut nichts | Braucht HTTPS. Über den SSH-Tunnel (`http://localhost:8000`) geht es, weil localhost als sicher gilt. |
+| App-Icon fehlt nach dem Hinzufügen | Seite neu laden und erneut hinzufügen; Safari holt das Manifest sonst aus dem Cache. |
 | Alles neu aufsetzen | `bash install.sh` erneut ausführen. Bestehendes Token bleibt erhalten. |
 
 ### Sicherer Zugriff ohne offenen Port

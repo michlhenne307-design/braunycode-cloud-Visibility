@@ -78,6 +78,12 @@ mkdir -p "$BRAUNY_HOME"
 cp -r "$SRC_DIR/app" "$BRAUNY_HOME/"
 cp "$SRC_DIR/requirements.txt" "$BRAUNY_HOME/"
 
+if [ ! -f "$BRAUNY_HOME/app/static/icons/icon-512.png" ]; then
+  step "PWA-Icons erzeugen"
+  python3 "$SRC_DIR/scripts/make_icons.py"
+  cp -r "$SRC_DIR/app/static/icons" "$BRAUNY_HOME/app/static/"
+fi
+
 step "Python-Umgebung anlegen"
 # Ubuntu 24.04 ist PEP-668-"externally managed": ein globales pip3 install
 # bricht mit error: externally-managed-environment ab. Deshalb venv.
@@ -165,6 +171,11 @@ cat <<EOF
         Source CIDR      0.0.0.0/0
         IP Protocol      TCP
         Destination Port $BRAUNY_PORT
+
+  ALS APP AUFS IPHONE:
+    Adresse in Safari oeffnen > Teilen-Symbol >
+    "Zum Home-Bildschirm" > Hinzufuegen.
+    Startet dann im Vollbild ohne Safari-Leiste.
 
   Status    sudo systemctl status braunycode
   Logs      journalctl -u braunycode -f

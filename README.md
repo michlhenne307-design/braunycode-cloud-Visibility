@@ -1,4 +1,4 @@
-# BraunyCode Cloud v1.0.0
+# BraunyCode Cloud v1.1.0
 
 Cloudbasierter KI-Coding-Agent, bedienbar vom iPhone. Läuft komplett auf einem
 eigenen Server — kein API-Key, keine laufenden Kosten.
@@ -22,7 +22,12 @@ Safari (iPhone)  ──WebSocket──▶  FastAPI  ──▶  Ollama (llama3.1:
 | `install.sh` | Vollständige Server-Einrichtung, idempotent |
 | `app/main.py` | FastAPI-Backend, WebSocket-Agent, Auth |
 | `app/sandbox.py` | Gehärtete Docker-Ausführung, Log-Streaming |
-| `app/static/index.html` | Bedienoberfläche, für iPhone optimiert |
+| `app/static/index.html` | PWA-Oberfläche, für iPhone optimiert |
+| `app/static/app.css` | Design-Tokens (shadcn-Schema) und Layout |
+| `app/static/app.js` | WebSocket-Client, Reiter, Verlauf, Service-Worker |
+| `app/static/manifest.json` | PWA-Manifest |
+| `app/static/sw.js` | Service Worker, cacht nur die statische Hülle |
+| `scripts/make_icons.py` | erzeugt die Icons, reine Standardbibliothek |
 | `systemd/braunycode.service` | Referenz-Unit (wird vom Installer geschrieben) |
 | `test_smoke.py` | Tests ohne Docker/Ollama-Abhängigkeit |
 | `docs/SETUP-iPhone.md` | Schritt-für-Schritt vom leeren Oracle-Account bis zum Betrieb |
@@ -64,6 +69,29 @@ Der Installer schreibt `~/braunycode/brauny.env` (Modus 600, nicht im Repo):
 
 Nach Änderungen: `sudo systemctl restart braunycode`
 
+## Als App auf dem iPhone
+
+Die Oberfläche ist eine installierbare PWA. In Safari die Adresse öffnen →
+Teilen-Symbol → **Zum Home-Bildschirm** → Hinzufügen. Danach startet sie im
+Vollbild ohne Safari-Leiste, mit eigenem Icon und dunkler Statusleiste.
+
+Was die Oberfläche kann:
+
+- **Protokoll, Code und Ausgabe getrennt.** Der generierte Code steht in einem
+  eigenen Reiter mit Kopieren-Knopf statt mitten im Log.
+- **Statusanzeige** oben, gespeist aus `/healthz` — zeigt vor dem Start, ob
+  Ollama und Docker erreichbar sind.
+- **Verlauf** der letzten 20 Läufe, lokal im Gerät. Antippen übernimmt den
+  Auftrag erneut.
+- **Stoppen** bricht einen laufenden Auftrag ab; der Server räumt den
+  Container auf.
+- **Offline** bleibt die Hülle nutzbar; Läufe brauchen natürlich den Server.
+
+Zwei Einschränkungen über HTTP: Safari registriert **keinen Service Worker**
+ohne HTTPS — die Seite funktioniert, nur ohne Offline-Hülle. Und der
+Kopieren-Knopf braucht ebenfalls einen sicheren Kontext. Beides löst ein
+TLS-Proxy oder der SSH-Tunnel weiter unten.
+
 ## Betrieb
 
 ```bash
@@ -102,8 +130,9 @@ venv/bin/python test_smoke.py
 ```
 
 Deckt Code-Extraktion, ollama-Antwortformate, Sandbox-Verzeichnisse,
-Log-Streaming samt Timeout, HTTP-Routen und die Token-Prüfung ab.
-Docker und Ollama werden dafür nicht benötigt.
+Log-Streaming samt Timeout, HTTP-Routen, PWA-Auslieferung (Manifest, Service
+Worker, Icons), Frontend-Verdrahtung und das WebSocket-Protokoll samt
+Token-Prüfung ab. Docker und Ollama werden dafür nicht benötigt.
 
 ## Was das System leistet — und was nicht
 

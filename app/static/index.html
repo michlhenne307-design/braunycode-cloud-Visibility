@@ -2,89 +2,84 @@
 <html lang="de">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>BraunyCode Cloud</title>
-<style>
-  :root { color-scheme: dark; --bg:#0b0f16; --panel:#161c26; --line:#26303f;
-          --fg:#e6edf3; --muted:#8b98a8; --accent:#3b82f6; --ok:#34d399; }
-  * { box-sizing: border-box; }
-  body { margin:0; padding:env(safe-area-inset-top) 16px 24px; background:var(--bg);
-         color:var(--fg); font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
-  .wrap { max-width:720px; margin:0 auto; padding-top:24px; }
-  h1 { font-size:24px; margin:0 0 4px; }
-  .sub { color:var(--muted); font-size:14px; margin:0 0 20px; }
-  input, textarea { width:100%; padding:14px; margin-bottom:10px; background:var(--panel);
-                    color:var(--fg); border:1px solid var(--line); border-radius:10px;
-                    font:inherit; -webkit-appearance:none; }
-  textarea { height:110px; resize:vertical; }
-  button { width:100%; padding:15px; border:0; border-radius:10px; background:var(--accent);
-           color:#fff; font:600 17px/1 inherit; }
-  button:disabled { opacity:.5; }
-  #logs { margin-top:16px; padding:14px; background:#000; border:1px solid var(--line);
-          border-radius:10px; height:55vh; overflow-y:auto; white-space:pre-wrap;
-          word-break:break-word; font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;
-          color:var(--ok); }
-  #status { font-size:13px; color:var(--muted); margin-top:10px; }
-</style>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="BraunyCode">
+<meta name="theme-color" content="#1c1f24">
+<meta name="description" content="KI-Coding-Agent mit Sandbox-Ausführung, bedienbar vom iPhone.">
+<title>BraunyCode Control</title>
+<link rel="manifest" href="/manifest.json">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="icon" href="/icons/icon-192.png" sizes="192x192">
+<link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
-<div class="wrap">
-  <h1>BraunyCode Cloud</h1>
-  <p class="sub">Plant, schreibt und testet Code in einer isolierten Sandbox.</p>
 
-  <input id="token" type="password" placeholder="Zugangs-Token" autocomplete="current-password">
-  <textarea id="prompt" placeholder="z. B. Berechne die ersten 50 Primzahlen und gib sie aus"></textarea>
-  <button id="go" onclick="start()">Agent starten</button>
-  <div id="status"></div>
-  <div id="logs"></div>
+<header>
+  <div class="brand">
+    <h1>BraunyCode Control</h1>
+    <p class="meta"><span id="health" class="dot"></span><span id="health-text">verbinde …</span></p>
+  </div>
+  <button class="icon-btn" id="btn-history" type="button" aria-label="Verlauf">☰</button>
+</header>
+
+<main>
+  <textarea id="prompt" placeholder="Was soll gebaut werden?&#10;z. B. Berechne die ersten 50 Primzahlen"
+            enterkeyhint="done" autocapitalize="sentences"></textarea>
+
+  <div class="tabs" role="tablist">
+    <button role="tab" data-panel="log" aria-selected="true">Protokoll</button>
+    <button role="tab" data-panel="code">Code<span class="badge" id="badge-code"></span></button>
+    <button role="tab" data-panel="out">Ausgabe<span class="badge" id="badge-out"></span></button>
+  </div>
+
+  <div class="panel" id="panel-log" role="tabpanel">
+    <div class="empty">Noch kein Lauf gestartet.</div>
+  </div>
+
+  <div class="panel" id="panel-code" role="tabpanel" hidden>
+    <div class="panel-head"><span>main.py</span><button type="button" id="btn-copy">Kopieren</button></div>
+    <div id="code-body"><div class="empty">Der generierte Code erscheint hier.</div></div>
+  </div>
+
+  <div class="panel" id="panel-out" role="tabpanel" hidden>
+    <div class="panel-head"><span>Sandbox-Ausgabe</span></div>
+    <div id="out-body"><div class="empty">Die Ausgabe des Programms erscheint hier.</div></div>
+  </div>
+</main>
+
+<footer>
+  <button class="btn" id="btn-run" type="button">Agent starten</button>
+  <button class="btn ghost" id="btn-clear" type="button" aria-label="Leeren">Leeren</button>
+</footer>
+
+<!-- Token-Abfrage -->
+<div class="sheet" id="gate" hidden>
+  <div class="box">
+    <h2>Anmeldung</h2>
+    <p>Das Zugangs-Token steht in der Ausgabe von <code>install.sh</code>
+       und in <code>~/braunycode/brauny.env</code>.</p>
+    <input id="token" type="password" placeholder="Zugangs-Token"
+           autocomplete="current-password" enterkeyhint="go">
+    <button class="btn" id="btn-login" type="button">Speichern</button>
+  </div>
 </div>
 
-<script>
-const $ = id => document.getElementById(id);
-let ws = null;
+<!-- Verlauf -->
+<div class="sheet" id="history" hidden>
+  <div class="box">
+    <h2>Verlauf</h2>
+    <p>Die letzten Läufe, lokal auf diesem Gerät gespeichert.</p>
+    <ul class="hist" id="hist-list"></ul>
+    <button class="btn ghost" id="btn-hist-clear" type="button">Verlauf löschen</button>
+    <button class="btn" id="btn-hist-close" type="button">Schließen</button>
+  </div>
+</div>
 
-function log(text) {
-  const box = $('logs');
-  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
-  box.textContent += text + '\n';
-  if (atBottom) box.scrollTop = box.scrollHeight;
-}
+<div id="toast"></div>
 
-function setBusy(busy, note) {
-  $('go').disabled = busy;
-  $('go').textContent = busy ? 'Läuft ...' : 'Agent starten';
-  $('status').textContent = note || '';
-}
-
-function start() {
-  const prompt = $('prompt').value.trim();
-  if (!prompt) { $('status').textContent = 'Bitte einen Auftrag eingeben.'; return; }
-
-  const token = $('token').value;
-  localStorage.setItem('brauny_token', token);
-
-  $('logs').textContent = '';
-  setBusy(true, 'Verbinde ...');
-
-  const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${scheme}://${location.host}/ws/agent`);
-
-  ws.onopen = () => {
-    setBusy(true, 'Verbunden - Agent arbeitet.');
-    if (token) ws.send(token);
-    ws.send(prompt);
-  };
-  ws.onmessage = e => log(e.data);
-  ws.onerror = () => log('[VERBINDUNGSFEHLER] Server nicht erreichbar. Port 8000 offen?');
-  ws.onclose = e => {
-    setBusy(false, e.code === 1008 ? 'Abgelehnt - falsches Token.' : 'Verbindung beendet.');
-  };
-}
-
-$('token').value = localStorage.getItem('brauny_token') || '';
-$('prompt').addEventListener('keydown', e => {
-  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) start();
-});
-</script>
+<script src="/static/app.js"></script>
 </body>
 </html>

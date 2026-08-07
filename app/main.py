@@ -2,14 +2,17 @@
 
 import asyncio
 import hmac
+import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
 
 import ollama
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 import sandbox
 
@@ -18,12 +21,14 @@ log = logging.getLogger("brauny")
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
+ICON_DIR = STATIC_DIR / "icons"
 
 MODEL = os.environ.get("BRAUNY_MODEL", "llama3.1:8b")
 TOKEN = os.environ.get("BRAUNY_TOKEN", "")
 MAX_PROMPT = int(os.environ.get("BRAUNY_MAX_PROMPT", "2000"))
 
-app = FastAPI(title="BraunyCode Cloud", version="1.0.0")
+app = FastAPI(title="BraunyCode Cloud", version="1.1.0")
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 CODE_FENCE = re.compile(r"```(?:python|py)?\s*\n(.*?)```", re.S)
 
@@ -57,14 +62,46 @@ async def ask(prompt: str) -> str:
     return message_content(response)
 
 
+# ------------------------------------------------------------------ Seiten
+
 @app.get("/")
 async def index():
-    return HTMLResponse((STATIC_DIR / "index.html").read_text(encoding="utf-8"))
+    return FileResponse(STATIC_DIR / "index.html", media_type="text/html")
+
+
+@app.get("/manifest.json")
+async def manifest():
+    return FileResponse(STATIC_DIR / "manifest.json", media_type="application/manifest+json")
+
+
+@app.get("/sw.js")
+async def service_worker():
+    # Scope "/" erfordert die Auslieferung von der Wurzel, nicht aus /static.
+    # no-store, damit ein Update nicht hinter einem alten Worker haengen bleibt.
+    return FileResponse(
+        STATIC_DIR / "sw.js",
+        media_type="text/javascript",
+        headers={"Service-Worker-Allowed": "/", "Cache-Control": "no-store"},
+    )
+
+
+@app.get("/apple-touch-icon.png")
+async def apple_icon():
+    return FileResponse(ICON_DIR / "apple-touch-icon.png", media_type="image/png")
+
+
+@app.get("/icons/{name}")
+async def icon(name: str):
+    # Feste Liste statt Pfadverkettung - sonst waere /icons/../../etc/passwd offen.
+    allowed = {"icon-192.png", "icon-512.png", "icon-maskable-512.png", "apple-touch-icon.png"}
+    if name not in allowed:
+        raise HTTPException(status_code=404)
+    return FileResponse(ICON_DIR / name, media_type="image/png")
 
 
 @app.get("/healthz")
 async def healthz():
-    status = {"model": MODEL, "auth": bool(TOKEN)}
+    status = {"model": MODEL, "auth": bool(TOKEN), "version": app.version}
     try:
         await asyncio.to_thread(ollama.list)
         status["ollama"] = "ok"
@@ -79,45 +116,50 @@ async def healthz():
     return JSONResponse(status, status_code=200 if healthy else 503)
 
 
+# ------------------------------------------------------------------ Agent
+
 @app.websocket("/ws/agent")
 async def agent(ws: WebSocket):
     await ws.accept()
     container = None
     project_dir = None
+    started = time.monotonic()
 
-    async def say(line: str):
-        await ws.send_text(line)
+    async def send(event_type: str, text: str = "", **extra):
+        await ws.send_text(json.dumps({"type": event_type, "text": text, **extra}))
 
     try:
-        first = await ws.receive_text()
+        try:
+            request = json.loads(await ws.receive_text())
+            prompt = str(request.get("prompt", "")).strip()[:MAX_PROMPT]
+            supplied = str(request.get("token", ""))
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            await send("error", "Ungueltige Anfrage - JSON mit token und prompt erwartet.")
+            await ws.close(code=1003)
+            return
 
-        if TOKEN:
-            # hmac.compare_digest statt == : keine Rueckschluesse ueber Laufzeit
-            if not hmac.compare_digest(first, TOKEN):
-                await say("[FEHLER] Falsches Token.")
-                await ws.close(code=1008)
-                return
-            prompt = await ws.receive_text()
-        else:
-            prompt = first
+        if TOKEN and not hmac.compare_digest(supplied, TOKEN):
+            # compare_digest statt == : keine Rueckschluesse ueber die Laufzeit
+            await send("error", "Token abgelehnt.", code="auth")
+            await ws.close(code=1008)
+            return
 
-        prompt = prompt.strip()[:MAX_PROMPT]
         if not prompt:
-            await say("[FEHLER] Leerer Auftrag.")
+            await send("error", "Leerer Auftrag.")
             return
 
         log.info("Auftrag: %s", prompt[:120])
-        await say(f"[SYSTEM] Modell {MODEL}, Auftrag: {prompt}")
+        await send("status", f"Modell {MODEL} — Auftrag angenommen.")
 
-        await say("[AGENT] Plane Architektur ...")
+        await send("status", "Plane Architektur …")
         plan = await ask(
             f"Du bist ein Software-Architekt. Aufgabe: {prompt}\n"
             "Antworte kurz und ausschliesslich als JSON mit den Schluesseln "
             '"sprache", "dateien", "schritte".'
         )
-        await say(f"[PLAN] {plan}")
+        await send("plan", plan)
 
-        await say("[AGENT] Schreibe Code ...")
+        await send("status", "Schreibe Code …")
         raw = await ask(
             f"Plan:\n{plan}\n\nSchreibe dazu eine einzelne, sofort lauffaehige "
             "Python-Datei main.py. Nur Standardbibliothek, keine externen Pakete, "
@@ -127,37 +169,44 @@ async def agent(ws: WebSocket):
         )
         code = extract_code(raw)
         if not code:
-            await say("[FEHLER] Modell hat keinen Code geliefert.")
+            await send("error", "Das Modell hat keinen Code geliefert.")
+            await send("done", "Abgebrochen.", ok=False, exit=-1,
+                       seconds=round(time.monotonic() - started, 1))
             return
 
-        project_dir = await asyncio.to_thread(sandbox.make_project_dir, {"main.py": code})
-        await say(f"[CODE] {len(code)} Zeichen nach main.py geschrieben.")
-        for line in code.splitlines():
-            await say(f"[CODE] {line}")
+        await send("code", code, lang="python")
 
-        await say("[DOCKER] Starte isolierte Sandbox (kein Netzwerk, 512 MB, 1 CPU) ...")
+        project_dir = await asyncio.to_thread(sandbox.make_project_dir, {"main.py": code})
+        await send("status", "Starte isolierte Sandbox (kein Netzwerk, 512 MB, 1 CPU) …")
         container = await asyncio.to_thread(sandbox.start, project_dir)
 
         try:
             async for line in sandbox.stream_logs(container):
-                await say(f"[SANDBOX] {line}")
+                await send("sandbox", line)
         except asyncio.TimeoutError:
-            await say(f"[ABBRUCH] Timeout nach {sandbox.TIMEOUT}s - Container gestoppt.")
+            await send("error", f"Timeout nach {sandbox.TIMEOUT}s — Container gestoppt.")
+            await send("done", "Abgebrochen.", ok=False, exit=-1,
+                       seconds=round(time.monotonic() - started, 1))
             return
 
         result = await asyncio.to_thread(container.wait, timeout=10)
-        code_exit = result.get("StatusCode", -1) if isinstance(result, dict) else -1
-        if code_exit == 0:
-            await say("[ERFOLG] Programm sauber beendet (Exit 0).")
+        exit_code = result.get("StatusCode", -1) if isinstance(result, dict) else -1
+        seconds = round(time.monotonic() - started, 1)
+        if exit_code == 0:
+            await send("done", f"Sauber beendet in {seconds}s.",
+                       ok=True, exit=0, seconds=seconds)
         else:
-            await say(f"[FEHLGESCHLAGEN] Exit-Code {code_exit}.")
+            await send("done", f"Programm endete mit Exit-Code {exit_code}.",
+                       ok=False, exit=exit_code, seconds=seconds)
 
     except WebSocketDisconnect:
-        log.info("Client hat die Verbindung getrennt.")
+        log.info("Client hat die Verbindung getrennt - raeume auf.")
     except Exception as exc:
         log.exception("Agentenlauf fehlgeschlagen")
         try:
-            await ws.send_text(f"[FEHLER] {type(exc).__name__}: {exc}")
+            await send("error", f"{type(exc).__name__}: {exc}")
+            await send("done", "Fehlgeschlagen.", ok=False, exit=-1,
+                      seconds=round(time.monotonic() - started, 1))
         except Exception:
             pass
     finally:
