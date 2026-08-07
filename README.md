@@ -1,11 +1,12 @@
-# BraunyCode Cloud v1.1.0
+# BraunyCode Cloud v1.2.0
 
 Cloudbasierter KI-Coding-Agent, bedienbar vom iPhone. Läuft komplett auf einem
 eigenen Server — kein API-Key, keine laufenden Kosten.
 
 Der Agent nimmt einen Auftrag entgegen, plant die Umsetzung, generiert Code und
-führt ihn in einer abgeschotteten Docker-Sandbox aus. Der gesamte Ablauf wird
-live per WebSocket ins Browserfenster gestreamt.
+führt ihn in einer abgeschotteten Docker-Sandbox aus. Schlägt der Lauf fehl,
+liest der Agent den Fehler und schreibt den Code neu — bis zu dreimal. Der
+gesamte Ablauf wird live per WebSocket ins Browserfenster gestreamt.
 
 ## Aufbau
 
@@ -63,6 +64,7 @@ Der Installer schreibt `~/braunycode/brauny.env` (Modus 600, nicht im Repo):
 |---|---|---|
 | `BRAUNY_TOKEN` | zufällig erzeugt | Zugangs-Token für die Oberfläche |
 | `BRAUNY_MODEL` | `llama3.1:8b` | Ollama-Modell |
+| `BRAUNY_MAX_ATTEMPTS` | `3` | Versuche inkl. erstem Wurf; `1` schaltet die Selbstkorrektur ab |
 | `BRAUNY_SANDBOX_TIMEOUT` | `60` | Sekunden bis zum Abbruch |
 | `BRAUNY_SANDBOX_MEM` | `512m` | RAM-Limit der Sandbox |
 | `BRAUNY_SANDBOX_CPUS` | `1.0` | CPU-Limit der Sandbox |
@@ -100,6 +102,22 @@ journalctl -u braunycode -f           # Logs live
 curl -s localhost:8000/healthz        # Ollama + Docker prüfen
 ```
 
+## Selbstkorrektur
+
+Der eigentliche Trick, der ein 8B-Modell brauchbar macht: Scheitert der Code in
+der Sandbox — Absturz, falscher Exit-Code oder ein Traceback in der Ausgabe —
+schickt der Agent dem Modell den gescheiterten Code samt echtem Fehler zurück
+und lässt ihn neu schreiben. Das wiederholt sich, bis es läuft oder
+`BRAUNY_MAX_ATTEMPTS` erreicht ist (Standard 3).
+
+Jeder Versuch bekommt eine frische, wieder abgeschottete Sandbox. In der
+Oberfläche siehst du das live: „Versuch 2/3", der Code-Reiter zeigt die
+korrigierte Fassung, die Ausgabe wird für jeden Lauf neu befüllt.
+
+Ein häufiges Beispiel: das Modell schreibt `input()`, obwohl die Sandbox keine
+Eingabe hat → `EOFError` → beim zweiten Versuch ersetzt es das durch einen festen
+Wert und der Lauf gelingt.
+
 ## Sicherheit
 
 Das System führt vom Modell generierten Code aus. Die Absicherung:
@@ -130,9 +148,10 @@ venv/bin/python test_smoke.py
 ```
 
 Deckt Code-Extraktion, ollama-Antwortformate, Sandbox-Verzeichnisse,
-Log-Streaming samt Timeout, HTTP-Routen, PWA-Auslieferung (Manifest, Service
-Worker, Icons), Frontend-Verdrahtung und das WebSocket-Protokoll samt
-Token-Prüfung ab. Docker und Ollama werden dafür nicht benötigt.
+Log-Streaming samt Timeout, HTTP-Routen, PWA-Auslieferung, Frontend-Verdrahtung,
+das WebSocket-Protokoll und die komplette Selbstkorrektur-Schleife ab (Erfolg
+im ersten Anlauf, Reparatur nach Fehler, Aufgabe nach erschöpften Versuchen,
+Traceback-Erkennung bei Exit 0). Docker und Ollama werden dafür nicht benötigt.
 
 ## Was das System leistet — und was nicht
 

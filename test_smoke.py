@@ -189,5 +189,89 @@ check("done traegt numerische Laufzeit",
 check("Laufzeit ist plausibel (keine Epoch-Zeit)",
       0 <= done.get("seconds", -1) < 600, done.get("seconds"))
 
+print("\n[9] Selbstkorrektur-Schleife (run_agent)")
+
+def drive_agent(*, replies, runs, max_attempts=3):
+    """Fuehrt run_agent mit gescripteten Modellantworten und Sandbox-Laeufen.
+
+    replies: Liste der ask_fn-Antworten (Plan, dann je ein Code pro Versuch).
+    runs:    Liste von (exit_code, ausgabe) je Sandbox-Lauf.
+    Gibt die gesammelten Ereignisse und die Zahl der Sandbox-Laeufe zurueck.
+    """
+    events = []
+    reply_iter = iter(replies)
+    run_iter = iter(runs)
+    sandbox_calls = {"n": 0}
+
+    async def send(t, text="", **extra):
+        events.append({"type": t, "text": text, **extra})
+
+    async def ask_fn(_prompt):
+        return next(reply_iter)
+
+    async def run_sandbox(code):
+        sandbox_calls["n"] += 1
+        return next(run_iter)
+
+    asyncio.run(main.run_agent(send, "aufgabe", ask_fn=ask_fn,
+                               run_sandbox=run_sandbox, max_attempts=max_attempts))
+    return events, sandbox_calls["n"]
+
+# Erfolg im ersten Anlauf -> kein Reparaturversuch, genau ein Sandbox-Lauf
+events, runs = drive_agent(
+    replies=["PLAN", "```python\nprint(1)\n```"],
+    runs=[(0, "1")])
+done = next(e for e in events if e["type"] == "done")
+check("Erfolg beim ersten Versuch", done["ok"] is True and done["attempts"] == 1, done)
+check("nur ein Sandbox-Lauf bei Erfolg", runs == 1, runs)
+
+# Erst Fehler, dann repariert -> zwei Laeufe, Erfolg bei Versuch 2
+events, runs = drive_agent(
+    replies=["PLAN",
+             "```python\nprint(1/0)\n```",           # Erstcode: crasht
+             "```python\nprint(1)\n```"],            # Reparatur: laeuft
+    runs=[(1, "Traceback (most recent call last):\nZeroDivisionError"),
+          (0, "1")])
+done = next(e for e in events if e["type"] == "done")
+codes = [e for e in events if e["type"] == "code"]
+check("repariert nach Fehler und meldet Erfolg",
+      done["ok"] is True and done["attempts"] == 2, done)
+check("zweiter Codestand wird geschickt", len(codes) == 2, len(codes))
+check("zweiter Code traegt attempt=2", codes[1].get("attempt") == 2, codes)
+check("zwei Sandbox-Laeufe", runs == 2, runs)
+
+# Bleibt kaputt -> alle Versuche ausgeschoepft, done ok=False
+events, runs = drive_agent(
+    replies=["PLAN",
+             "```python\nboom\n```",
+             "```python\nboom\n```",
+             "```python\nboom\n```"],
+    runs=[(1, "NameError: boom"), (1, "NameError: boom"), (1, "NameError: boom")])
+done = next(e for e in events if e["type"] == "done")
+check("gibt nach max_attempts auf", done["ok"] is False and done["attempts"] == 3, done)
+check("genau max_attempts Sandbox-Laeufe", runs == 3, runs)
+
+# Exit 0, aber Traceback in der Ausgabe -> gilt trotzdem als Fehler
+events, runs = drive_agent(
+    replies=["PLAN",
+             "```python\ntry:\n 1/0\nexcept: import traceback; traceback.print_exc()\n```",
+             "```python\nprint('ok')\n```"],
+    runs=[(0, "Traceback (most recent call last):\nZeroDivisionError: division by zero"),
+          (0, "ok")])
+done = next(e for e in events if e["type"] == "done")
+check("Traceback bei Exit 0 zaehlt als Fehler und triggert Reparatur",
+      done["ok"] is True and done["attempts"] == 2, done)
+
+# Modell liefert keinen Code -> sauberer Abbruch, gar kein Sandbox-Lauf
+events, runs = drive_agent(replies=["PLAN", "   "], runs=[])
+done = next(e for e in events if e["type"] == "done")
+check("kein Code -> Abbruch ohne Sandbox-Lauf",
+      done["ok"] is False and runs == 0, (done, runs))
+
+check("looks_failed erkennt Traceback",
+      main.looks_failed("x\nTraceback (most recent call last):\ny"))
+check("looks_failed erkennt sauberen Lauf nicht als Fehler",
+      not main.looks_failed("Ergebnis: 42\nfertig"))
+
 print(f"\n=== {ok} bestanden, {fail} fehlgeschlagen ===")
 sys.exit(1 if fail else 0)

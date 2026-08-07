@@ -199,13 +199,29 @@ function handleEvent(raw, prompt) {
   switch (ev.type) {
     case 'code': {
       codeText = ev.text || '';
+      const attempt = ev.attempt || 1;
       const body = $('code-body');
       clearPanel(body, null);
       const pre = document.createElement('div');
       pre.textContent = codeText;
       body.appendChild(pre);
+
+      // Kopfzeile des Code-Reiters mit der Versuchsnummer beschriften
+      const head = document.querySelector('#panel-code .panel-head span');
+      if (head) head.textContent = attempt > 1 ? `main.py · Versuch ${attempt}` : 'main.py';
+
+      // Bei einer korrigierten Fassung startet ein frischer Lauf:
+      // alte Ausgabe wegräumen, damit sie sich nicht stapelt.
+      if (attempt > 1) {
+        clearPanel($('out-body'), 'Die Ausgabe des Programms erscheint hier.');
+        outLines = 0;
+        $('badge-out').textContent = '';
+      }
+
       const lines = codeText.split('\n').length;
-      logLine('code', `${lines} Zeilen erzeugt — im Reiter „Code“`);
+      logLine('code', attempt > 1
+        ? `Korrigierte Fassung (Versuch ${attempt}), ${lines} Zeilen — im Reiter „Code“`
+        : `${lines} Zeilen erzeugt — im Reiter „Code“`);
       if ($('panel-code').hidden) $('badge-code').textContent = '•';
       break;
     }

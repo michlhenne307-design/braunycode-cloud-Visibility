@@ -159,6 +159,7 @@ im Vollbild ohne Safari-Leiste. Das Token bleibt gespeichert.
 | Meldung „model not found“ | Modell fehlt. `ollama pull llama3.1:8b`, dann `sudo systemctl restart braunycode` |
 | Meldung „permission denied … docker.sock“ | Docker-Gruppe. `sudo systemctl restart braunycode`, sonst einmal aus- und einloggen. |
 | Dienst startet nicht | `journalctl -u braunycode -n 50 --no-pager` |
+| „Versuch 2/3“ erscheint | Normal — der Agent hat einen Fehler erkannt und repariert den Code selbst. |
 | Antworten sehr langsam | Normal. Ohne GPU rechnet das Modell auf der CPU, ein Lauf dauert Minuten. |
 | `externally-managed-environment` | Es wurde `pip3 install` ohne venv benutzt. Der Installer macht das richtig — nutze ihn statt manueller Installation. |
 | Statuspunkt oben ist rot | `curl -s localhost:8000/healthz` nennt Ollama bzw. Docker im Klartext. |
