@@ -273,5 +273,26 @@ check("looks_failed erkennt Traceback",
 check("looks_failed erkennt sauberen Lauf nicht als Fehler",
       not main.looks_failed("Ergebnis: 42\nfertig"))
 
+print("\n[10] Syntax-Vorpruefung")
+check("syntax_error erkennt kaputten Code", main.syntax_error("def f(:\n pass"))
+check("syntax_error laesst gueltigen Code durch",
+      main.syntax_error("print(1)\n") is None)
+check("syntax_error nennt die Zeile", "Zeile" in main.syntax_error("x = ("))
+
+# Erster Code hat einen Syntaxfehler -> keine Sandbox fuer Versuch 1,
+# Reparatur liefert gueltigen Code -> genau ein Sandbox-Lauf, Erfolg bei 2
+events, runs = drive_agent(
+    replies=["PLAN",
+             "```python\ndef f(:\n    pass\n```",   # Syntaxfehler
+             "```python\nprint('ok')\n```"],         # gueltig
+    runs=[(0, "ok")])
+done = next(e for e in events if e["type"] == "done")
+check("Syntaxfehler wird ohne Sandbox-Start repariert",
+      done["ok"] is True and done["attempts"] == 2, done)
+check("nur ein echter Sandbox-Lauf trotz zwei Versuchen", runs == 1, runs)
+sandbox_events = [e for e in events if e["type"] == "sandbox"]
+check("Syntaxfehler taucht in der Ausgabe auf",
+      any("SyntaxError" in e["text"] for e in sandbox_events), sandbox_events)
+
 print(f"\n=== {ok} bestanden, {fail} fehlgeschlagen ===")
 sys.exit(1 if fail else 0)

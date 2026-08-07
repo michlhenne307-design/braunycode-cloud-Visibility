@@ -1,5 +1,6 @@
 """BraunyCode Cloud - FastAPI-Backend fuer den iPhone-Agenten."""
 
+import ast
 import asyncio
 import hmac
 import json
@@ -115,6 +116,21 @@ def looks_failed(output: str) -> bool:
     return any(m in output for m in markers)
 
 
+def syntax_error(code: str):
+    """Prueft den Code auf Syntaxfehler, bevor eine Sandbox startet.
+
+    Syntaxfehler sind der haeufigste Grund, warum generierter Code nicht
+    laeuft. Sie hier abzufangen spart den Start eines Containers und liefert
+    dem Modell sofort eine praezise Meldung fuer die Reparatur. Gibt die
+    Fehlermeldung als Text zurueck oder None, wenn der Code parst.
+    """
+    try:
+        ast.parse(code)
+        return None
+    except SyntaxError as exc:
+        return f"SyntaxError: {exc.msg} (Zeile {exc.lineno})"
+
+
 # ------------------------------------------------------------------ Agentenlogik
 
 async def run_agent(send, task, *, ask_fn, run_sandbox, max_attempts=MAX_ATTEMPTS):
@@ -144,14 +160,24 @@ async def run_agent(send, task, *, ask_fn, run_sandbox, max_attempts=MAX_ATTEMPT
     last_exit = -1
     for attempt in range(1, max_attempts + 1):
         await send("code", code, lang="python", attempt=attempt)
-        if attempt == 1:
-            await send("status", "Starte isolierte Sandbox "
-                                 "(kein Netzwerk, 512 MB, 1 CPU) …")
-        else:
-            await send("status", f"Versuch {attempt}/{max_attempts}: "
-                                 "starte korrigierte Fassung …")
 
-        exit_code, output = await run_sandbox(code)
+        # Syntax zuerst pruefen: ist der Code gar nicht lauffaehig, sparen wir
+        # den teuren Container-Start und reparieren sofort.
+        syntax = syntax_error(code)
+        if syntax:
+            await send("status", "Syntaxfehler erkannt — überspringe Sandbox, "
+                                 "repariere direkt.")
+            await send("sandbox", syntax)
+            exit_code, output = 1, syntax
+        else:
+            if attempt == 1:
+                await send("status", "Starte isolierte Sandbox "
+                                     "(kein Netzwerk, 512 MB, 1 CPU) …")
+            else:
+                await send("status", f"Versuch {attempt}/{max_attempts}: "
+                                     "starte korrigierte Fassung …")
+            exit_code, output = await run_sandbox(code)
+
         last_exit = exit_code
         failed = exit_code != 0 or looks_failed(output)
 

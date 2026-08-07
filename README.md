@@ -114,6 +114,11 @@ Jeder Versuch bekommt eine frische, wieder abgeschottete Sandbox. In der
 Oberfläche siehst du das live: „Versuch 2/3", der Code-Reiter zeigt die
 korrigierte Fassung, die Ausgabe wird für jeden Lauf neu befüllt.
 
+Vor jedem Lauf prüft der Agent den Code per `ast.parse` auf Syntaxfehler —
+den häufigsten Grund für einen Fehlschlag. Ist der Code schon syntaktisch
+kaputt, startet gar kein Container: der Fehler geht direkt in die Reparatur,
+was einen Container-Start spart und die Meldung präziser macht.
+
 Ein häufiges Beispiel: das Modell schreibt `input()`, obwohl die Sandbox keine
 Eingabe hat → `EOFError` → beim zweiten Versuch ersetzt es das durch einen festen
 Wert und der Lauf gelingt.
