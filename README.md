@@ -1,12 +1,12 @@
-# BraunyCode Cloud v1.3.0
+# BraunyCode Cloud v1.4.0
 
 Cloudbasierter KI-Coding-Agent, bedienbar vom iPhone. Läuft komplett auf einem
 eigenen Server — kein API-Key, keine laufenden Kosten.
 
-Der Agent nimmt einen Auftrag entgegen, plant die Umsetzung, generiert Code und
-führt ihn in einer abgeschotteten Docker-Sandbox aus. Schlägt der Lauf fehl,
-liest der Agent den Fehler und schreibt den Code neu — bis zu dreimal. Der
-gesamte Ablauf wird live per WebSocket ins Browserfenster gestreamt.
+Der Agent arbeitet an einem Projektverzeichnis mit Git-Historie. Mechanische
+Änderungen erledigt er **ohne Modell** direkt über den Syntaxbaum; alles andere
+plant und generiert er, führt es in einer abgeschotteten Docker-Sandbox aus und
+repariert es bei Fehlern selbst. Der Ablauf wird live per WebSocket gestreamt.
 
 ## Aufbau
 
@@ -23,6 +23,8 @@ Browser (iPhone) ──WebSocket──▶  FastAPI  ──▶  Ollama (qwen2.5-c
 | `install.sh` | Vollständige Server-Einrichtung, idempotent |
 | `app/main.py` | FastAPI-Backend, WebSocket-Agent, Auth |
 | `app/sandbox.py` | Gehärtete Docker-Ausführung, Log-Streaming |
+| `app/refactor.py` | Deterministische Umbauten über den Syntaxbaum, ohne Modell |
+| `app/workspace.py` | Projektverzeichnis mit Pfadschutz und Git-Historie |
 | `app/static/index.html` | PWA-Oberfläche, für iPhone optimiert |
 | `app/static/app.css` | Design-Tokens (shadcn-Schema) und Layout |
 | `app/static/app.js` | WebSocket-Client, Reiter, Verlauf, Service-Worker |
@@ -72,6 +74,7 @@ Der Installer schreibt `~/braunycode/brauny.env` (Modus 600, nicht im Repo):
 | `BRAUNY_SANDBOX_TIMEOUT` | `60` | Sekunden bis zum Abbruch |
 | `BRAUNY_SANDBOX_MEM` | `512m` | RAM-Limit der Sandbox |
 | `BRAUNY_SANDBOX_CPUS` | `1.0` | CPU-Limit der Sandbox |
+| `BRAUNY_WORKSPACE` | `~/braunycode/workspace` | Projektverzeichnis des Agenten |
 
 Nach Änderungen: `sudo systemctl restart braunycode`
 
@@ -112,6 +115,46 @@ sudo systemctl status braunycode      # Status
 journalctl -u braunycode -f           # Logs live
 curl -s localhost:8000/healthz        # Ollama + Docker prüfen
 ```
+
+## Zwei Wege: deterministisch und generativ
+
+Nicht jede Änderung braucht ein Sprachmodell. Ein Teil der Alltagsarbeit ist
+rein mechanisch — und dafür ist ein Modell das falsche Werkzeug: es kostet
+Rechenzeit und kann danebenliegen.
+
+**Der deterministische Weg.** Erkennt der Agent einen mechanischen Auftrag,
+läuft er über den konkreten Syntaxbaum (`libcst`) statt über das Modell:
+
+| Auftrag | Beispiel-Formulierung |
+|---|---|
+| Umbenennen | „benenne `calculate_total` in `sum_items` um" |
+| Docstrings ergänzen | „füge Docstrings hinzu" |
+| Tote Importe entfernen | „entferne ungenutzte Imports" |
+
+Gemessen auf einer 245-Zeilen-Datei: **23–36 ms** — kein Modellaufruf, kein
+Container, reproduzierbares Ergebnis. Der Umbau ist dabei präziser als ein
+Modell es wäre: beim Umbenennen bleiben Zeichenketten (`"calculate_total"`),
+Attributzugriffe (`obj.calculate_total()`) und Schlüsselwort-Argumente
+(`f(calculate_total=1)`) unangetastet — sie gehören zu einer fremden
+Schnittstelle. Formatierung und Kommentare bleiben erhalten.
+
+**Der generative Weg.** Alles andere — „baue mir X", „schreib einen
+Algorithmus für Y" — geht wie bisher an das Modell.
+
+Die Erkennung ist bewusst konservativ: Sie ist ein Mustervergleich auf gängige
+Formulierungen, keine Absichtserkennung. Passt kein Muster, oder ist die
+Zieldatei nicht eindeutig, nimmt der Auftrag den normalen Weg. Ein falsch
+erkannter Umbau wäre schlimmer als ein verpasster.
+
+## Projektverzeichnis
+
+Der Agent arbeitet in `~/braunycode/workspace` — die Dateien bleiben liegen,
+statt in einem Wegwerf-Verzeichnis zu verschwinden. Jede Änderung wird
+committet, `git log` zeigt die Historie. Generierter Code landet erst dann im
+Projekt, wenn er in der Sandbox nachweislich gelaufen ist.
+
+Pfade werden gegen Ausbrüche geprüft: absolute Pfade, `..` und Symlinks, die
+aus dem Projekt herauszeigen, werden abgewiesen.
 
 ## Selbstkorrektur
 

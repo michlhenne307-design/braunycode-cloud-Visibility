@@ -6,3 +6,4 @@ brauny.env
 .env
 *.pem
 *.key
+workspace/

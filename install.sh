@@ -106,6 +106,7 @@ BRAUNY_SANDBOX_TIMEOUT=60
 BRAUNY_MAX_ATTEMPTS=3
 BRAUNY_MAX_CONCURRENT=2
 BRAUNY_ASK_TIMEOUT=300
+BRAUNY_WORKSPACE=$BRAUNY_HOME/workspace
 EOF
 fi
 chmod 600 "$ENV_FILE"
@@ -166,6 +167,7 @@ cat <<EOF
   Adresse   http://$IP:$BRAUNY_PORT
   Token     $BRAUNY_TOKEN
   Modell    $BRAUNY_MODEL
+  Projekt   $BRAUNY_HOME/workspace
 
   NOCH ZU TUN in der Oracle Console:
     Networking > Virtual Cloud Networks > dein VCN

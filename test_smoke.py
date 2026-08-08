@@ -463,5 +463,154 @@ html = (main.STATIC_DIR / "index.html").read_text()
 check("index.html traegt sowohl Apple- als auch Standard-Metatag",
       'apple-mobile-web-app-capable' in html and 'name="mobile-web-app-capable"' in html)
 
+print("\n[17] Deterministische Umbauten (refactor)")
+import refactor  # noqa: E402
+import tempfile  # noqa: E402
+import workspace as ws_mod  # noqa: E402
+
+SRC = '''import os
+import json
+
+# Kommentar
+def calculate_total(items):
+    return sum(items)
+
+data = {"calculate_total": "string"}
+obj.calculate_total()
+f(calculate_total=1)
+print(calculate_total([1]), json.dumps(data))
+'''
+
+res = refactor.rename_symbol(SRC, "calculate_total", "sum_items")
+check("rename ändert Definition und Aufruf", res.changed and "def sum_items" in res.code)
+check("rename lässt Strings in Ruhe", '"calculate_total"' in res.code)
+check("rename lässt Attribute in Ruhe", "obj.calculate_total()" in res.code)
+check("rename lässt Schlüsselwort-Argumente in Ruhe", "f(calculate_total=1)" in res.code)
+check("rename zählt korrekt", "2 Vorkommen" in res.summary, res.summary)
+check("rename erhält Kommentare", "# Kommentar" in res.code)
+check("rename meldet, wenn nichts passt",
+      not refactor.rename_symbol(SRC, "gibtsnicht", "x").changed)
+
+res = refactor.add_docstrings(SRC)
+check("docstrings werden ergänzt", res.changed and '"""Calculate total."""' in res.code)
+check("docstrings nicht doppelt", not refactor.add_docstrings(res.code).changed)
+check("einzeiliges def wird ausgelassen",
+      not refactor.add_docstrings("def f(): pass\n").changed)
+
+res = refactor.remove_unused_imports(SRC)
+check("toter Import entfernt", "import os" not in res.code, res.code[:40])
+check("genutzter Import bleibt", "import json" in res.code)
+check("Stern-Import wird nicht angefasst",
+      not refactor.remove_unused_imports("from x import *\n").changed)
+check("__all__ wird nicht angefasst",
+      not refactor.remove_unused_imports('import os\n__all__ = ["a"]\n').changed)
+
+check("kaputter Quelltext wird gemeldet",
+      "nicht parsebar" in refactor.apply(
+          refactor.MechanicalTask("docstrings"), "def f(:\n").summary)
+
+for text, kind in [("benenne foo in bar um", "rename"),
+                   ("rename alpha to beta", "rename"),
+                   ("füge Docstrings hinzu", "docstrings"),
+                   ("entferne ungenutzte Imports", "unused_imports"),
+                   ("remove unused imports", "unused_imports")]:
+    task = refactor.classify(text)
+    check(f"classify: {text!r} -> {kind}", task and task.kind == kind, task)
+for text in ["baue mir eine Todo-App", "benenne foo in foo um", "", "   "]:
+    check(f"classify: {text!r} -> kein Schnellweg", refactor.classify(text) is None)
+
+print("\n[18] Projektverzeichnis (workspace)")
+ws = ws_mod.Workspace(tempfile.mkdtemp())
+ws.write("src/main.py", "print(1)\n")
+check("schreibt und liest", ws.read("src/main.py") == "print(1)\n")
+check("listet Dateien", ws.list_files() == ["src/main.py"], ws.list_files())
+check("exists", ws.exists("src/main.py") and not ws.exists("weg.py"))
+
+for bad in ["../../etc/passwd", "/etc/passwd", "src/../../../tmp/x", "", "   "]:
+    try:
+        ws.resolve(bad)
+        check(f"blockiert {bad!r}", False, "durchgelassen")
+    except ws_mod.WorkspaceError:
+        check(f"blockiert {bad!r}", True)
+
+outside = tempfile.mkdtemp()
+open(os.path.join(outside, "secret.txt"), "w").write("geheim")
+os.symlink(outside, os.path.join(ws.root, "link"))
+try:
+    ws.read("link/secret.txt")
+    check("Symlink nach draußen blockiert", False, "durchgelassen")
+except ws_mod.WorkspaceError:
+    check("Symlink nach draußen blockiert", True)
+
+check("git init", ws.git_ready())
+sha = ws.git_commit("Erster Stand")
+check("erster Commit", bool(sha), sha)
+ws.write("src/main.py", "print(2)\n")
+check("zweiter Commit", bool(ws.git_commit("Änderung")))
+check("kein Leer-Commit", ws.git_commit("nichts") is None)
+check("Historie lesbar", len(ws.git_log()) == 2, ws.git_log())
+
+print("\n[19] Mechanischer Schnellweg im Agenten")
+
+def drive_mech(intent, files, replies=None, runs=None):
+    """Laesst run_agent auf einem echten Projektverzeichnis laufen."""
+    w = ws_mod.Workspace(tempfile.mkdtemp())
+    for name, body in files.items():
+        w.write(name, body)
+    w.git_commit("Start")
+    events = []
+    reply_iter = iter(replies or [])
+    run_iter = iter(runs or [])
+    calls = {"ask": 0, "sandbox": 0}
+
+    async def send(t, text="", **extra):
+        events.append({"type": t, "text": text, **extra})
+
+    async def ask_fn(_p):
+        calls["ask"] += 1
+        return next(reply_iter)
+
+    async def run_sandbox(code):
+        calls["sandbox"] += 1
+        return next(run_iter)
+
+    asyncio.run(main.run_agent(send, intent, ask_fn=ask_fn,
+                               run_sandbox=run_sandbox, workspace=w))
+    return events, calls, w
+
+events, calls, w = drive_mech("benenne calculate_total in sum_items um",
+                              {"main.py": SRC})
+done = next(e for e in events if e["type"] == "done")
+check("Schnellweg meldet Erfolg", done["ok"] is True and done.get("mechanical") is True, done)
+check("Schnellweg ruft KEIN Modell", calls["ask"] == 0, calls)
+check("Schnellweg startet KEINE Sandbox", calls["sandbox"] == 0, calls)
+check("Datei im Projekt geändert", "def sum_items" in w.read("main.py"))
+check("Änderung wurde committet", len(w.git_log()) == 2, w.git_log())
+
+events, calls, w = drive_mech("entferne ungenutzte Imports", {"main.py": SRC})
+check("Importe deterministisch entfernt", "import os" not in w.read("main.py"))
+check("dabei kein Modellaufruf", calls["ask"] == 0)
+
+# Kreativer Auftrag: Schnellweg darf NICHT greifen
+events, calls, w = drive_mech("baue eine Todo-Liste", {"main.py": SRC},
+                              replies=["PLAN", "```python\nprint('ok')\n```"],
+                              runs=[(0, "ok")])
+check("kreativer Auftrag geht ans Modell", calls["ask"] == 2, calls)
+check("kreativer Auftrag nutzt die Sandbox", calls["sandbox"] == 1, calls)
+check("gelungener Code landet im Projekt", "print('ok')" in w.read("main.py"))
+
+# Mehrere .py-Dateien: keine eindeutige Zieldatei -> normaler Weg
+events, calls, w = drive_mech("benenne a in b um",
+                              {"x.py": "a = 1\n", "y.py": "a = 2\n"},
+                              replies=["PLAN", "```python\nprint('ok')\n```"],
+                              runs=[(0, "ok")])
+check("mehrdeutiges Ziel -> Modellweg", calls["ask"] == 2, calls)
+check("Hinweis auf Mehrdeutigkeit",
+      any("eindeutige Zieldatei" in e["text"] for e in events if e["type"] == "status"))
+
+check("ohne Projektverzeichnis kein Schnellweg",
+      asyncio.run(main.try_mechanical(lambda *a, **k: None, "benenne a in b um", None))
+      is False)
+
 print(f"\n=== {ok} bestanden, {fail} fehlgeschlagen ===")
 sys.exit(1 if fail else 0)

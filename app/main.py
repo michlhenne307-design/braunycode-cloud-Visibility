@@ -15,7 +15,9 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+import refactor
 import sandbox
+import workspace as ws_mod
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("brauny")
@@ -43,11 +45,22 @@ ASK_TIMEOUT = int(os.environ.get("BRAUNY_ASK_TIMEOUT", "300"))
 # Zeitfensters wird die Adresse voruebergehend abgewiesen.
 AUTH_MAX_FAILS = max(1, int(os.environ.get("BRAUNY_AUTH_MAX_FAILS", "5")))
 AUTH_WINDOW = int(os.environ.get("BRAUNY_AUTH_WINDOW", "300"))
+# Projektverzeichnis, in dem der Agent arbeitet und seine Historie fuehrt.
+WORKSPACE_ROOT = os.environ.get("BRAUNY_WORKSPACE", str(BASE_DIR.parent / "workspace"))
 
-app = FastAPI(title="BraunyCode Cloud", version="1.3.0")
+app = FastAPI(title="BraunyCode Cloud", version="1.4.0")
 
 # Begrenzt die gleichzeitig laufenden Auftraege.
 run_slots = asyncio.Semaphore(MAX_CONCURRENT)
+
+# Projekt, an dem gearbeitet wird. Faellt auf None zurueck, wenn das
+# Verzeichnis nicht angelegt werden kann - der Agent laeuft dann wie bisher
+# ohne Historie weiter.
+try:
+    WORKSPACE = ws_mod.Workspace(WORKSPACE_ROOT)
+except OSError as exc:
+    logging.getLogger("brauny").warning("Kein Projektverzeichnis: %s", exc)
+    WORKSPACE = None
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 CODE_FENCE = re.compile(r"```(?:python|py)?\s*\n(.*?)```", re.S)
@@ -192,7 +205,65 @@ def syntax_error(code: str):
 
 # ------------------------------------------------------------------ Agentenlogik
 
-async def run_agent(send, task, *, ask_fn, run_sandbox, max_attempts=MAX_ATTEMPTS):
+def pick_target(ws) -> str | None:
+    """Waehlt die Datei, auf die sich ein mechanischer Auftrag bezieht.
+
+    Bewusst eng: nur bei main.py oder genau einer Python-Datei. Bei mehreren
+    Kandidaten ist die Zuordnung nicht eindeutig - dann lieber nichts anfassen.
+    """
+    files = [f for f in ws.list_files() if f.endswith(".py")]
+    if "main.py" in files:
+        return "main.py"
+    return files[0] if len(files) == 1 else None
+
+
+async def try_mechanical(send, task, ws) -> bool:
+    """Deterministischer Schnellweg. True, wenn der Auftrag erledigt wurde.
+
+    Mechanische Aenderungen - umbenennen, Docstrings, tote Importe - laufen
+    ueber den Syntaxbaum statt ueber das Modell: in Millisekunden, ohne
+    Rechenlast, mit reproduzierbarem Ergebnis.
+    """
+    if ws is None:
+        return False
+    mech = refactor.classify(task)
+    if mech is None:
+        return False
+
+    target = pick_target(ws)
+    if target is None:
+        await send("status", f"Mechanischer Auftrag erkannt ({mech.label}), aber "
+                             "keine eindeutige Zieldatei — gehe den normalen Weg.")
+        return False
+
+    await send("status", f"Mechanischer Auftrag erkannt: {mech.label}. "
+                         "Kein Modell nötig.")
+    start = time.monotonic()
+    try:
+        before = ws.read(target)
+    except Exception as exc:
+        await send("status", f"Konnte {target} nicht lesen ({exc}) — normaler Weg.")
+        return False
+
+    result = await asyncio.to_thread(refactor.apply, mech, before)
+    if not result.changed:
+        await send("status", f"{result.summary} Nichts zu ändern.")
+        await send("done", result.summary, ok=True, exit=0, attempts=0,
+                   seconds=round(time.monotonic() - start, 1), mechanical=True)
+        return True
+
+    ws.write(target, result.code)
+    sha = await asyncio.to_thread(ws.git_commit, f"{mech.label} ({target})")
+    await send("code", result.code, lang="python", attempt=1, path=target)
+    await send("sandbox", result.summary)
+    note = f" Commit {sha}." if sha else ""
+    await send("done", f"{result.summary}{note}", ok=True, exit=0, attempts=0,
+               seconds=round(time.monotonic() - start, 1), mechanical=True)
+    return True
+
+
+async def run_agent(send, task, *, ask_fn, run_sandbox, workspace=None,
+                    max_attempts=MAX_ATTEMPTS):
     """Plant, generiert und repariert Code, bis er laeuft oder die Versuche aus sind.
 
     ask_fn und run_sandbox sind hineingereicht, damit die Schleife ohne echtes
@@ -203,6 +274,10 @@ async def run_agent(send, task, *, ask_fn, run_sandbox, max_attempts=MAX_ATTEMPT
 
     def elapsed():
         return round(time.monotonic() - start, 1)
+
+    # Erst der deterministische Weg - er kostet nichts und ist exakt.
+    if await try_mechanical(send, task, workspace):
+        return
 
     await send("status", "Plane Architektur …")
     plan = await ask_fn(plan_prompt(task))
@@ -242,7 +317,15 @@ async def run_agent(send, task, *, ask_fn, run_sandbox, max_attempts=MAX_ATTEMPT
 
         if not failed:
             note = "" if attempt == 1 else f" (nach {attempt} Versuchen)"
-            await send("done", f"Sauber beendet in {elapsed()}s{note}.",
+            commit = ""
+            if workspace is not None:
+                # Erst wenn der Code nachweislich laeuft, landet er im Projekt.
+                workspace.write("main.py", code)
+                sha = await asyncio.to_thread(
+                    workspace.git_commit, f"Agent: {task[:60]}")
+                if sha:
+                    commit = f" Commit {sha}."
+            await send("done", f"Sauber beendet in {elapsed()}s{note}.{commit}",
                        ok=True, exit=0, attempts=attempt, seconds=elapsed())
             return
 
@@ -314,6 +397,10 @@ async def icon(name: str):
 @app.get("/healthz")
 async def healthz():
     status = {"model": MODEL, "auth": bool(TOKEN), "version": app.version}
+    if WORKSPACE is not None:
+        status["workspace"] = {"pfad": str(WORKSPACE.root),
+                               "dateien": len(WORKSPACE.list_files()),
+                               "historie": WORKSPACE.git_log(3)}
     try:
         await asyncio.to_thread(ollama.list)
         status["ollama"] = "ok"
@@ -418,7 +505,8 @@ async def agent(ws: WebSocket):
             async def run_sandbox(code):
                 return await sandbox_runner(send, code)
 
-            await run_agent(send, prompt, ask_fn=ask, run_sandbox=run_sandbox)
+            await run_agent(send, prompt, ask_fn=ask, run_sandbox=run_sandbox,
+                            workspace=WORKSPACE)
         finally:
             run_slots.release()
 
