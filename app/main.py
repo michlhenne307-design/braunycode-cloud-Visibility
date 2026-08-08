@@ -30,10 +30,24 @@ MAX_PROMPT = int(os.environ.get("BRAUNY_MAX_PROMPT", "2000"))
 # Anzahl Versuche inklusive erstem Wurf. 1 = altes Verhalten ohne Reparatur.
 MAX_ATTEMPTS = max(1, int(os.environ.get("BRAUNY_MAX_ATTEMPTS", "3")))
 # Wie viele Zeichen der Fehlerausgabe zurueck ans Modell gehen. Zu viel
-# frisst das Kontextfenster eines 8B-Modells, zu wenig verschluckt den Fehler.
+# frisst das Kontextfenster eines kleinen Modells, zu wenig verschluckt den Fehler.
 ERROR_TAIL = int(os.environ.get("BRAUNY_ERROR_TAIL", "1500"))
 
-app = FastAPI(title="BraunyCode Cloud", version="1.2.0")
+# Gleichzeitige Laeufe. Jeder Lauf haelt einen Container und beschaeftigt das
+# Modell - ohne Deckel legen ein paar parallele Auftraege die Maschine lahm.
+MAX_CONCURRENT = max(1, int(os.environ.get("BRAUNY_MAX_CONCURRENT", "2")))
+# Obergrenze fuer einen einzelnen Modellaufruf. Ohne das haengt ein blockiertes
+# Ollama die WebSocket-Verbindung endlos.
+ASK_TIMEOUT = int(os.environ.get("BRAUNY_ASK_TIMEOUT", "300"))
+# Schutz gegen Token-Raten: nach so vielen Fehlversuchen innerhalb des
+# Zeitfensters wird die Adresse voruebergehend abgewiesen.
+AUTH_MAX_FAILS = max(1, int(os.environ.get("BRAUNY_AUTH_MAX_FAILS", "5")))
+AUTH_WINDOW = int(os.environ.get("BRAUNY_AUTH_WINDOW", "300"))
+
+app = FastAPI(title="BraunyCode Cloud", version="1.3.0")
+
+# Begrenzt die gleichzeitig laufenden Auftraege.
+run_slots = asyncio.Semaphore(MAX_CONCURRENT)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 CODE_FENCE = re.compile(r"```(?:python|py)?\s*\n(.*?)```", re.S)
@@ -60,12 +74,57 @@ def message_content(response) -> str:
 
 
 async def ask(prompt: str) -> str:
-    response = await asyncio.to_thread(
-        ollama.chat,
-        model=MODEL,
-        messages=[{"role": "user", "content": prompt}],
-    )
+    """Fragt das Modell mit Zeitlimit.
+
+    wait_for beendet den Hintergrund-Thread nicht - der laeuft aus. Es loest
+    aber die Verbindung, statt sie unbegrenzt haengen zu lassen.
+    """
+    try:
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                ollama.chat,
+                model=MODEL,
+                messages=[{"role": "user", "content": prompt}],
+            ),
+            timeout=ASK_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        raise TimeoutError(
+            f"Das Modell hat nach {ASK_TIMEOUT}s nicht geantwortet."
+        ) from None
     return message_content(response)
+
+
+# ------------------------------------------------------------------ Auth-Bremse
+
+# Adresse -> Zeitpunkte der letzten Fehlversuche
+_auth_fails: dict[str, list[float]] = {}
+
+
+def _prune_fails(key: str, now: float) -> list[float]:
+    recent = [t for t in _auth_fails.get(key, []) if now - t < AUTH_WINDOW]
+    if recent:
+        _auth_fails[key] = recent
+    else:
+        _auth_fails.pop(key, None)
+    return recent
+
+
+def auth_blocked(key: str, now=None) -> bool:
+    """True, wenn diese Adresse gerade zu viele Fehlversuche hatte."""
+    return len(_prune_fails(key, now or time.monotonic())) >= AUTH_MAX_FAILS
+
+
+def record_auth_fail(key: str, now=None) -> None:
+    now = now or time.monotonic()
+    recent = _prune_fails(key, now)
+    # Deckel, damit ein Dauerbeschuss den Speicher nicht vollschreibt
+    _auth_fails[key] = (recent + [now])[-AUTH_MAX_FAILS:]
+
+
+def clear_auth_fails(key: str) -> None:
+    """Nach erfolgreicher Anmeldung die Zaehler dieser Adresse loeschen."""
+    _auth_fails.pop(key, None)
 
 
 # ------------------------------------------------------------------ Prompts
@@ -200,6 +259,21 @@ async def run_agent(send, task, *, ask_fn, run_sandbox, max_attempts=MAX_ATTEMPT
                ok=False, exit=last_exit, attempts=max_attempts, seconds=elapsed())
 
 
+# ------------------------------------------------------------------ Start
+
+@app.on_event("startup")
+async def on_startup():
+    """Raeumt Container auf, die ein frueherer Absturz liegen gelassen hat."""
+    try:
+        removed = await asyncio.to_thread(sandbox.reap_orphans)
+        if removed:
+            log.info("%d verwaiste Sandbox-Container entfernt.", removed)
+    except Exception as exc:
+        # Docker nicht erreichbar ist beim Start kein Grund, den Dienst
+        # nicht zu starten - /healthz meldet das ohnehin.
+        log.warning("Aufraeumen verwaister Container fehlgeschlagen: %s", exc)
+
+
 # ------------------------------------------------------------------ Seiten
 
 @app.get("/")
@@ -294,6 +368,8 @@ async def agent(ws: WebSocket):
     async def send(event_type: str, text: str = "", **extra):
         await ws.send_text(json.dumps({"type": event_type, "text": text, **extra}))
 
+    peer = ws.client.host if ws.client else "unbekannt"
+
     try:
         try:
             request = json.loads(await ws.receive_text())
@@ -304,24 +380,47 @@ async def agent(ws: WebSocket):
             await ws.close(code=1003)
             return
 
-        if TOKEN and not hmac.compare_digest(supplied, TOKEN):
+        if TOKEN:
+            if auth_blocked(peer):
+                log.warning("Zu viele Fehlversuche von %s - abgewiesen.", peer)
+                await send("error", "Zu viele Fehlversuche. Bitte etwas warten.",
+                           code="auth")
+                await ws.close(code=1008)
+                return
             # compare_digest statt == : keine Rueckschluesse ueber die Laufzeit
-            await send("error", "Token abgelehnt.", code="auth")
-            await ws.close(code=1008)
-            return
+            if not hmac.compare_digest(supplied, TOKEN):
+                record_auth_fail(peer)
+                log.warning("Token abgelehnt von %s.", peer)
+                await send("error", "Token abgelehnt.", code="auth")
+                await ws.close(code=1008)
+                return
+            clear_auth_fails(peer)
 
         if not prompt:
             await send("error", "Leerer Auftrag.")
             return
 
-        log.info("Auftrag: %s", prompt[:120])
-        await send("status", f"Modell {MODEL} — Auftrag angenommen "
-                             f"(bis zu {MAX_ATTEMPTS} Versuche).")
+        # Platz im Lauf-Kontingent holen. Ist alles belegt, sofort und
+        # verstaendlich abweisen statt die Maschine zu ueberladen.
+        try:
+            await asyncio.wait_for(run_slots.acquire(), timeout=0.5)
+        except asyncio.TimeoutError:
+            await send("error", f"Server ausgelastet ({MAX_CONCURRENT} Aufträge "
+                                "laufen bereits). Bitte kurz warten.", code="busy")
+            await send("done", "Abgewiesen.", ok=False, exit=-1, attempts=0, seconds=0)
+            return
 
-        async def run_sandbox(code):
-            return await sandbox_runner(send, code)
+        try:
+            log.info("Auftrag von %s: %s", peer, prompt[:120])
+            await send("status", f"Modell {MODEL} — Auftrag angenommen "
+                                 f"(bis zu {MAX_ATTEMPTS} Versuche).")
 
-        await run_agent(send, prompt, ask_fn=ask, run_sandbox=run_sandbox)
+            async def run_sandbox(code):
+                return await sandbox_runner(send, code)
+
+            await run_agent(send, prompt, ask_fn=ask, run_sandbox=run_sandbox)
+        finally:
+            run_slots.release()
 
     except WebSocketDisconnect:
         log.info("Client hat die Verbindung getrennt - raeume auf.")

@@ -104,6 +104,8 @@ BRAUNY_MODEL=$BRAUNY_MODEL
 BRAUNY_SANDBOX_IMAGE=$SANDBOX_IMAGE
 BRAUNY_SANDBOX_TIMEOUT=60
 BRAUNY_MAX_ATTEMPTS=3
+BRAUNY_MAX_CONCURRENT=2
+BRAUNY_ASK_TIMEOUT=300
 EOF
 fi
 chmod 600 "$ENV_FILE"
@@ -159,7 +161,7 @@ IP="$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || echo '<SERVER-
 cat <<EOF
 
 ============================================================
-  BraunyCode Cloud v1.0.0 laeuft.
+  BraunyCode Cloud laeuft.
 
   Adresse   http://$IP:$BRAUNY_PORT
   Token     $BRAUNY_TOKEN
