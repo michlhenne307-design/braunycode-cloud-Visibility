@@ -1,19 +1,28 @@
-# BraunyCode Cloud v1.5.0
+# BraunyCode Cloud v1.6.0
 
-Cloudbasierter KI-Coding-Agent, bedienbar vom iPhone. Läuft komplett auf einem
-eigenen Server — kein API-Key, keine laufenden Kosten.
+Ein KI-Coding-Agent, der auf **deinem** Server an einem echten
+Projektverzeichnis arbeitet — bedienbar vom Handy wie vom Rechner.
 
-Der Agent arbeitet an einem Projektverzeichnis mit Git-Historie. Mechanische
-Änderungen erledigt er **ohne Modell** direkt über den Syntaxbaum; alles andere
-plant und generiert er, führt es in einer abgeschotteten Docker-Sandbox aus und
-repariert es bei Fehlern selbst. Der Ablauf wird live per WebSocket gestreamt.
+Er ist aufgebaut wie die großen Agenten: das Modell bekommt **Werkzeuge**
+(Dateien auflisten, lesen, schreiben, suchen, ausführen) und entscheidet in
+jedem Schritt selbst, was als Nächstes dran ist. Mechanische Änderungen
+erledigt er ganz **ohne Modell** über den Syntaxbaum. Jede Änderung landet im
+Git-Verlauf. Der Ablauf wird live per WebSocket gestreamt.
 
 ## Aufbau
 
 ```
-Browser (iPhone) ──WebSocket──▶  FastAPI  ──▶  Ollama (qwen2.5-coder:7b, lokal)
-                                    │
-                                    └────────▶  Docker-Sandbox
+Browser (Handy/Rechner) ──WebSocket──▶  FastAPI
+                                          │
+                                          ├─▶  Modell
+                                          │    lokal (Ollama) oder
+                                          │    OpenAI-kompatible API
+                                          │
+                                          ├─▶  Werkzeuge am Projekt
+                                          │    list · read · write · search
+                                          │    outline · run_python · finish
+                                          │
+                                          └─▶  Docker-Sandbox
                                                kein Netz · 512 MB · 1 CPU
                                                non-root · 60 s Timeout
 ```
@@ -21,7 +30,10 @@ Browser (iPhone) ──WebSocket──▶  FastAPI  ──▶  Ollama (qwen2.5-c
 | Datei | Zweck |
 |---|---|
 | `install.sh` | Vollständige Server-Einrichtung, idempotent |
-| `app/main.py` | FastAPI-Backend, WebSocket-Agent, Auth |
+| `app/main.py` | FastAPI-Backend, Wegwahl, WebSocket, Auth |
+| `app/agentloop.py` | Werkzeugschleife: Modell entscheidet, Werkzeug handelt |
+| `app/tools.py` | Die sieben Werkzeuge und ihr Schema |
+| `app/provider.py` | Modellanbindung: lokal oder OpenAI-kompatible API |
 | `app/sandbox.py` | Gehärtete Docker-Ausführung, Log-Streaming |
 | `app/refactor.py` | Deterministische Umbauten über den Syntaxbaum, ohne Modell |
 | `app/workspace.py` | Projektverzeichnis mit Pfadschutz und Git-Historie |
@@ -66,8 +78,13 @@ Der Installer schreibt `~/braunycode/brauny.env` (Modus 600, nicht im Repo):
 | Variable | Standard | Bedeutung |
 |---|---|---|
 | `BRAUNY_TOKEN` | zufällig erzeugt | Zugangs-Token für die Oberfläche |
-| `BRAUNY_MODEL` | `qwen2.5-coder:7b` | Ollama-Modell |
-| `BRAUNY_MAX_ATTEMPTS` | `3` | Versuche inkl. erstem Wurf; `1` schaltet die Selbstkorrektur ab |
+| `BRAUNY_MODEL` | `qwen2.5-coder:7b` | Modellname (bei einer API der Name des Anbieters) |
+| `BRAUNY_PROVIDER` | `ollama` | `ollama` oder `openai` (jede OpenAI-kompatible API) |
+| `BRAUNY_API_BASE` | leer | Basis-URL der API, z. B. `https://…/v1` |
+| `BRAUNY_API_KEY` | leer | Schlüssel für die API, bleibt in der 600er-Datei |
+| `BRAUNY_AGENT` | `auto` | `auto`, `tools` oder `oneshot` — siehe unten |
+| `BRAUNY_MAX_STEPS` | `12` | Werkzeugrunden pro Auftrag |
+| `BRAUNY_MAX_ATTEMPTS` | `3` | Versuche im Einmalwurf; `1` schaltet die Selbstkorrektur ab |
 | `BRAUNY_MAX_CONCURRENT` | `2` | gleichzeitig laufende Aufträge |
 | `BRAUNY_ASK_TIMEOUT` | `300` | Sekunden, die ein Modellaufruf höchstens dauern darf |
 | `BRAUNY_AUTH_MAX_FAILS` | `5` | Fehlversuche bis zur Sperre |
@@ -92,7 +109,7 @@ Was die Oberfläche kann:
 - **Protokoll, Code und Ausgabe getrennt.** Der generierte Code steht in einem
   eigenen Reiter mit Kopieren-Knopf statt mitten im Log.
 - **Statusanzeige** oben, gespeist aus `/healthz` — zeigt vor dem Start, ob
-  Ollama und Docker erreichbar sind.
+  Modell und Docker erreichbar sind.
 - **Verlauf** der letzten 20 Läufe, lokal im Gerät. Antippen übernimmt den
   Auftrag erneut.
 - **Stoppen** bricht einen laufenden Auftrag ab; der Server räumt den
@@ -114,10 +131,62 @@ Kontext. Beides löst ein TLS-Proxy oder der SSH-Tunnel weiter unten.
 ```bash
 sudo systemctl status braunycode      # Status
 journalctl -u braunycode -f           # Logs live
-curl -s localhost:8000/healthz        # Ollama + Docker prüfen
+curl -s localhost:8000/healthz        # Modell + Docker prüfen
 ```
 
-## Zwei Wege: deterministisch und generativ
+## Der Agent: Werkzeuge statt einmal raten
+
+Ein Code-Generator rät einmal eine Datei und ist fertig. Ein **Agent** arbeitet
+wie ein Mensch am Rechner: schauen, lesen, ändern, ausführen, Ergebnis prüfen,
+weitermachen. Genau das macht BraunyCode seit v1.6.0 — das Modell bekommt
+Werkzeuge und entscheidet in jeder Runde selbst, welches dran ist.
+
+| Werkzeug | Was es tut |
+|---|---|
+| `list_files` | alle Dateien im Projekt auflisten |
+| `read_file` | eine Datei lesen (mit Zeilennummern) |
+| `write_file` | eine Datei schreiben |
+| `search` | Text über alle Projektdateien suchen |
+| `outline` | Funktionen, Klassen und Aufrufgraph zeigen |
+| `run_python` | eine Datei in der abgeschotteten Sandbox ausführen |
+| `finish` | Arbeit beenden und zusammenfassen |
+
+Alle Werkzeuge arbeiten ausschließlich innerhalb des Projektverzeichnisses;
+die Pfadprüfung aus `workspace.py` lässt sich nicht umgehen. Ein Fehler wird
+dem Modell **als Text zurückgegeben** statt zu werfen — so kann es reagieren,
+statt dass der Lauf abbricht.
+
+Damit sind zum ersten Mal Aufgaben über **mehrere Dateien und mehrere Runden**
+möglich, statt nur eine `main.py` in einem Wurf.
+
+### Die Schleife ist misstrauisch
+
+Kleine Modelle machen drei Dinge zuverlässig falsch. Alle drei werden erkannt
+und benannt statt beschönigt:
+
+- **Im Kreis drehen.** Derselbe Aufruf mit denselben Argumenten dreimal
+  hintereinander → das Modell bekommt einen ausdrücklichen Hinweis.
+- **Reden statt handeln.** Antwortet es zweimal nur mit Text, endet der Lauf.
+  Passiert das schon in Runde 1, gilt das Modell als werkzeugunfähig und
+  `auto` wechselt auf den Einmalwurf, statt elf Runden zu verschwenden.
+- **Erfolg behaupten.** Meldet das Modell `finish`, ohne den Code je
+  ausgeführt zu haben, steht das explizit im Ergebnis: „Der Agent hat den Code
+  nicht ausgeführt. Die Zusammenfassung ist seine eigene Einschätzung, kein
+  Testergebnis."
+
+### Modelle ohne Werkzeugunterstützung
+
+Nicht jedes kleine Modell beherrscht echte Tool-Calls. Zwei Auffangnetze:
+
+1. Gibt das Modell stattdessen JSON aus (`{"tool": "read_file",
+   "arguments": {…}}`), wird das als Aufruf gewertet.
+2. Kommt gar nichts Brauchbares, wechselt `BRAUNY_AGENT=auto` auf den
+   Einmalwurf — planen, schreiben, ausführen, reparieren.
+
+`BRAUNY_AGENT=tools` erzwingt die Werkzeugschleife ohne Rückfall,
+`BRAUNY_AGENT=oneshot` schaltet sie ganz ab.
+
+## Drei Wege, vom billigsten zum teuersten
 
 Nicht jede Änderung braucht ein Sprachmodell. Ein Teil der Alltagsarbeit ist
 rein mechanisch — und dafür ist ein Modell das falsche Werkzeug: es kostet
@@ -139,13 +208,16 @@ Attributzugriffe (`obj.calculate_total()`) und Schlüsselwort-Argumente
 (`f(calculate_total=1)`) unangetastet — sie gehören zu einer fremden
 Schnittstelle. Formatierung und Kommentare bleiben erhalten.
 
-**Der generative Weg.** Alles andere — „baue mir X", „schreib einen
-Algorithmus für Y" — geht wie bisher an das Modell.
+**Der Werkzeugweg.** Alles andere — „baue mir X", „ändere Y in Z" — geht an
+den Agenten mit seinen Werkzeugen (siehe oben).
 
-Die Erkennung ist bewusst konservativ: Sie ist ein Mustervergleich auf gängige
-Formulierungen, keine Absichtserkennung. Passt kein Muster, oder ist die
-Zieldatei nicht eindeutig, nimmt der Auftrag den normalen Weg. Ein falsch
-erkannter Umbau wäre schlimmer als ein verpasster.
+**Der Einmalwurf.** Rückfallweg für Modelle ohne Werkzeugunterstützung:
+planen, Code schreiben, ausführen, bei Fehler reparieren.
+
+Die mechanische Erkennung ist bewusst konservativ: Sie ist ein Mustervergleich
+auf gängige Formulierungen, keine Absichtserkennung. Passt kein Muster, oder
+ist die Zieldatei nicht eindeutig, nimmt der Auftrag den normalen Weg. Ein
+falsch erkannter Umbau wäre schlimmer als ein verpasster.
 
 ## Projektkontext statt Dokumentation
 
@@ -200,10 +272,10 @@ Projekt, wenn er in der Sandbox nachweislich gelaufen ist.
 Pfade werden gegen Ausbrüche geprüft: absolute Pfade, `..` und Symlinks, die
 aus dem Projekt herauszeigen, werden abgewiesen.
 
-## Selbstkorrektur
+## Selbstkorrektur (Einmalwurf)
 
-Der eigentliche Trick, der ein kleines Modell brauchbar macht: Scheitert der Code in
-der Sandbox — Absturz, falscher Exit-Code oder ein Traceback in der Ausgabe —
+Der Trick, der ein kleines Modell auf dem Rückfallweg brauchbar macht:
+Scheitert der Code in der Sandbox — Absturz, falscher Exit-Code oder ein Traceback in der Ausgabe —
 schickt der Agent dem Modell den gescheiterten Code samt echtem Fehler zurück
 und lässt ihn neu schreiben. Das wiederholt sich, bis es läuft oder
 `BRAUNY_MAX_ATTEMPTS` erreicht ist (Standard 3).
@@ -256,34 +328,80 @@ Verbleibende Einschränkungen, die man kennen sollte:
 ## Tests
 
 ```bash
-python3 -m venv venv && venv/bin/pip install -r requirements.txt httpx
+python3 -m venv venv && venv/bin/pip install -r requirements.txt
 venv/bin/python test_smoke.py
 ```
 
-Deckt Code-Extraktion, ollama-Antwortformate, Sandbox-Verzeichnisse,
-Log-Streaming samt Timeout, HTTP-Routen, PWA-Auslieferung, Frontend-Verdrahtung,
-das WebSocket-Protokoll, die komplette Selbstkorrektur-Schleife (Erfolg im
-ersten Anlauf, Reparatur nach Fehler, Aufgabe nach erschöpften Versuchen,
-Traceback-Erkennung bei Exit 0) sowie die Härtung ab: Auth-Bremse mit
-Zeitfenster, Abweisung bei vollem Kontingent, Aufräumen verwaister Container
-und das Zeitlimit für Modellaufrufe. Docker und Ollama werden dafür nicht
-benötigt.
+**273 Fälle in 24 Abschnitten, ohne Docker und ohne Ollama.** Modell, Sandbox
+und Werkzeugantworten werden gescriptet hineingereicht.
+
+Abgedeckt sind unter anderem:
+
+- **Werkzeuge**: Pfadausbrüche (`..`, absolute Pfade, Symlinks) blockiert,
+  fehlende Dateien und unbekannte Werkzeuge liefern Fehlertext statt Absturz,
+  lange Ausgaben werden gekürzt
+- **Werkzeugschleife**: Aufruf → Ergebnis → nächste Runde, Abbruch bei
+  `finish`, Schrittgrenze hält, Wiederholungsbremse greift, Modellfehler
+  beendet sauber, Verlaufskürzung trennt Aufruf und Ergebnis nicht
+- **Wegwahl**: mechanisch schlägt Werkzeuge schlägt Einmalwurf; beim Wechsel
+  auf den Rückfallweg kommt trotzdem genau ein `done`
+- **Anbieter**: beide ollama-Antwortformate, API-Fehler nennen den Status,
+  aber **nie** den Schlüssel
+- **Härtung**: Auth-Bremse mit Zeitfenster, Abweisung bei vollem Kontingent,
+  Aufräumen verwaister Container, Zeitlimit für Modellaufrufe
 
 ## Was das System leistet — und was nicht
 
-Standardmodell ist **`qwen2.5-coder:7b`** — ein auf Code spezialisiertes Modell.
-Gegenüber einem gleich großen Allzweckmodell trifft es bei Programmieraufgaben
-deutlich besser, ist mit ~4,7 GB etwas kleiner und läuft auf CPU einen Tick
-schneller. Wie alle Ollama-Modelle kostenlos.
+**Was hier steht, ist die Maschinerie, nicht das Modell.** Werkzeuge,
+Schleife, Sandbox, Index und Git-Verlauf sind gebaut und getestet. Wie gut die
+Ergebnisse werden, entscheidet das Modell dahinter — und da gilt ohne
+Beschönigung: ein 7B auf CPU ist nicht auf dem Niveau der großen Agenten.
 
-Auf 4 ARM-Kernen ohne GPU sind grob 5–10 Token/s realistisch. Ein Durchlauf
-dauert also einige Minuten — bei einer Reparatur entsprechend länger. Die
-Qualität reicht für abgegrenzte Aufgaben: Algorithmen, Datenverarbeitung,
-kleine Skripte. Mehrdateiige Anwendungen oder Frontend-Frameworks liegen
-außerhalb dessen, was hier realistisch herauskommt: der Agent erzeugt bewusst
-genau eine `main.py` ohne externe Pakete.
+Was das konkret heißt:
 
-### Anderes Modell setzen
+| | lokal, `qwen2.5-coder:7b` | starkes Modell über API |
+|---|---|---|
+| Kosten | 0 € | pro Token |
+| Tempo | ~5–10 Token/s auf 4 ARM-Kernen, Minuten pro Runde | Sekunden |
+| Werkzeugaufrufe | unzuverlässig, oft nur über den JSON-Notnagel | zuverlässig |
+| Realistisch | abgegrenzte Skripte, Algorithmen, Datenverarbeitung | mehrere Dateien, mehrere Runden |
+
+Beides läuft durch dieselbe Schleife. Der Wechsel ist eine Zeile in
+`brauny.env`. Genau dafür gibt es `provider.py`: die Architektur soll nicht am
+schwächsten Modell hängen.
+
+**Nicht verifiziert** (Stand dieser Fassung): Es gab noch keinen
+End-to-End-Lauf mit echtem Modell und echtem Docker. Die 273 Tests laufen
+gegen gescriptete Modellantworten — sie belegen, dass die Schleife korrekt
+arbeitet, nicht dass ein bestimmtes Modell gute Ergebnisse liefert.
+`install.sh` ist syntaktisch geprüft, aber nicht auf einem frischen
+Ubuntu 24.04 durchgelaufen. Die Zeitmessungen stammen von x86_64, nicht arm64.
+
+### Stärkeres Modell über eine API
+
+Wenn das lokale Modell nicht reicht, hängt BraunyCode an jede
+OpenAI-kompatible API — der Server, die Werkzeuge, die Sandbox und die
+Oberfläche bleiben dieselben:
+
+```bash
+# in ~/braunycode/brauny.env
+BRAUNY_PROVIDER=openai
+BRAUNY_API_BASE=https://<anbieter>/v1
+BRAUNY_API_KEY=<dein-schlüssel>
+BRAUNY_MODEL=<modellname des anbieters>
+```
+
+```bash
+sudo systemctl restart braunycode
+```
+
+Der Schlüssel steht nur in dieser Datei (Rechte 600) und wird nie in
+Fehlermeldungen, Logs oder `/healthz` ausgegeben — dafür gibt es einen Test.
+`/healthz` fragt eine entfernte API bewusst **nicht** an: ein Health-Check
+darf keine kostenpflichtigen Anfragen verbrauchen. Er meldet deshalb
+„konfiguriert (nicht angefragt)" statt „ok".
+
+### Anderes lokales Modell setzen
 
 Alle Varianten sind gratis. Wenn der Arbeitsspeicher reicht, bringt die
 14B-Variante nochmal spürbar bessere Ergebnisse — dafür langsamer:

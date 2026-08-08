@@ -10,14 +10,16 @@ import re
 import time
 from pathlib import Path
 
-import ollama
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+import agentloop
 import codeindex
+import provider
 import refactor
 import sandbox
+import tools
 import workspace as ws_mod
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -48,8 +50,13 @@ AUTH_MAX_FAILS = max(1, int(os.environ.get("BRAUNY_AUTH_MAX_FAILS", "5")))
 AUTH_WINDOW = int(os.environ.get("BRAUNY_AUTH_WINDOW", "300"))
 # Projektverzeichnis, in dem der Agent arbeitet und seine Historie fuehrt.
 WORKSPACE_ROOT = os.environ.get("BRAUNY_WORKSPACE", str(BASE_DIR.parent / "workspace"))
+# Arbeitsweise: "auto"    - Werkzeugschleife, faellt bei Modellen ohne
+#                           Werkzeugunterstuetzung auf den einfachen Weg zurueck
+#               "tools"   - nur Werkzeugschleife
+#               "oneshot" - nur der alte Weg: planen, schreiben, ausfuehren
+AGENT_MODE = os.environ.get("BRAUNY_AGENT", "auto").strip().lower()
 
-app = FastAPI(title="BraunyCode Cloud", version="1.5.0")
+app = FastAPI(title="BraunyCode Cloud", version="1.6.0")
 
 # Begrenzt die gleichzeitig laufenden Auftraege.
 run_slots = asyncio.Semaphore(MAX_CONCURRENT)
@@ -79,34 +86,27 @@ def extract_code(text: str) -> str:
     return text.strip()
 
 
-def message_content(response) -> str:
-    """Liest den Text aus einer ollama-Antwort, egal welche Client-Version."""
-    try:
-        return response["message"]["content"]
-    except (TypeError, KeyError):
-        return response.message.content
-
-
-async def ask(prompt: str) -> str:
-    """Fragt das Modell mit Zeitlimit.
+async def model_chat(messages, schema=None):
+    """Ein Modellaufruf mit Zeitlimit, egal ob lokal oder ueber eine API.
 
     wait_for beendet den Hintergrund-Thread nicht - der laeuft aus. Es loest
     aber die Verbindung, statt sie unbegrenzt haengen zu lassen.
     """
     try:
-        response = await asyncio.wait_for(
-            asyncio.to_thread(
-                ollama.chat,
-                model=MODEL,
-                messages=[{"role": "user", "content": prompt}],
-            ),
+        return await asyncio.wait_for(
+            asyncio.to_thread(provider.chat, messages, schema),
             timeout=ASK_TIMEOUT,
         )
     except asyncio.TimeoutError:
         raise TimeoutError(
             f"Das Modell hat nach {ASK_TIMEOUT}s nicht geantwortet."
         ) from None
-    return message_content(response)
+
+
+async def ask(prompt: str) -> str:
+    """Einzelfrage ohne Werkzeuge - der einfache Weg."""
+    reply = await model_chat([{"role": "user", "content": prompt}])
+    return reply.text
 
 
 # ------------------------------------------------------------------ Auth-Bremse
@@ -282,7 +282,7 @@ async def try_mechanical(send, task, ws) -> bool:
 
 
 async def run_agent(send, task, *, ask_fn, run_sandbox, workspace=None,
-                    max_attempts=MAX_ATTEMPTS):
+                    max_attempts=MAX_ATTEMPTS, skip_mechanical=False):
     """Plant, generiert und repariert Code, bis er laeuft oder die Versuche aus sind.
 
     ask_fn und run_sandbox sind hineingereicht, damit die Schleife ohne echtes
@@ -295,7 +295,9 @@ async def run_agent(send, task, *, ask_fn, run_sandbox, workspace=None,
         return round(time.monotonic() - start, 1)
 
     # Erst der deterministische Weg - er kostet nichts und ist exakt.
-    if await try_mechanical(send, task, workspace):
+    # dispatch() hat ihn ggf. schon probiert und setzt dann skip_mechanical,
+    # damit die Meldungen nicht doppelt erscheinen.
+    if not skip_mechanical and await try_mechanical(send, task, workspace):
         return
 
     # Was das Modell nicht wissen kann: dieses Projekt. Nur die relevanten
@@ -371,6 +373,55 @@ async def run_agent(send, task, *, ask_fn, run_sandbox, workspace=None,
                ok=False, exit=last_exit, attempts=max_attempts, seconds=elapsed())
 
 
+async def dispatch(send, task, *, ask_fn, chat_fn, run_sandbox, workspace=None,
+                   mode=None):
+    """Waehlt den Weg, der zur Aufgabe und zum Modell passt.
+
+    Drei Wege, vom billigsten zum teuersten:
+
+    1. Mechanisch  - Umbenennen, Docstrings, tote Importe. Ueber den
+       Syntaxbaum, in Millisekunden, ohne Modell.
+    2. Werkzeuge   - das Modell arbeitet Schritt fuer Schritt am Projekt.
+       So arbeiten die grossen Agenten, und nur so werden mehrere Dateien
+       und mehrere Runden ueberhaupt moeglich.
+    3. Einmalwurf  - planen, Code schreiben, ausfuehren, reparieren. Der
+       Rueckfallweg fuer Modelle, die keine Werkzeuge koennen.
+    """
+    mode = (mode or AGENT_MODE)
+
+    if await try_mechanical(send, task, workspace):
+        return "mechanical"
+
+    if mode in ("auto", "tools") and workspace is not None:
+        # Nur die Uebersicht als Startpunkt. Den Rest holt sich der Agent
+        # selbst mit read_file - das ist genauer als vorab zu raten, was er
+        # braucht, und haelt den ersten Prompt klein.
+        index = await asyncio.to_thread(codeindex.CodeIndex.build, workspace)
+        context = index.overview()
+
+        toolbox = tools.Toolbox(workspace, run_sandbox=run_sandbox,
+                                index_builder=codeindex.CodeIndex.build)
+        await send("status", f"Werkzeugmodus: bis zu {agentloop.MAX_STEPS} "
+                             "Schritte am Projekt.")
+        outcome = await agentloop.run_tool_agent(
+            send, task, chat_fn=chat_fn, toolbox=toolbox, context=context)
+        if outcome != "no-tools":
+            return outcome
+        if mode == "tools":
+            # Ausdruecklich nur Werkzeuge gewuenscht - dann kein stiller
+            # Wechsel, sondern eine klare Meldung.
+            await send("done", "Das Modell unterstützt keine Werkzeugaufrufe. "
+                               "BRAUNY_AGENT=auto setzen für den Rückfallweg.",
+                       ok=False, exit=-1, attempts=1, seconds=0)
+            return "failed"
+        await send("status", "Modell ohne Werkzeugunterstützung — "
+                             "wechsle auf den einfachen Weg.")
+
+    await run_agent(send, task, ask_fn=ask_fn, run_sandbox=run_sandbox,
+                    workspace=workspace, skip_mechanical=True)
+    return "oneshot"
+
+
 # ------------------------------------------------------------------ Start
 
 @app.on_event("startup")
@@ -425,22 +476,20 @@ async def icon(name: str):
 
 @app.get("/healthz")
 async def healthz():
-    status = {"model": MODEL, "auth": bool(TOKEN), "version": app.version}
+    status = {"model": MODEL, "auth": bool(TOKEN), "version": app.version,
+              "modus": AGENT_MODE, "provider": provider.describe()}
     if WORKSPACE is not None:
         status["workspace"] = {"pfad": str(WORKSPACE.root),
                                "dateien": len(WORKSPACE.list_files()),
                                "historie": WORKSPACE.git_log(3)}
-    try:
-        await asyncio.to_thread(ollama.list)
-        status["ollama"] = "ok"
-    except Exception as exc:
-        status["ollama"] = f"fehler: {exc}"
+    model_ok, model_note = await asyncio.to_thread(provider.health)
+    status["modell_backend"] = model_note
     try:
         await asyncio.to_thread(sandbox.client().ping)
         status["docker"] = "ok"
     except Exception as exc:
         status["docker"] = f"fehler: {exc}"
-    healthy = status.get("ollama") == "ok" and status.get("docker") == "ok"
+    healthy = model_ok and status.get("docker") == "ok"
     return JSONResponse(status, status_code=200 if healthy else 503)
 
 
@@ -528,14 +577,14 @@ async def agent(ws: WebSocket):
 
         try:
             log.info("Auftrag von %s: %s", peer, prompt[:120])
-            await send("status", f"Modell {MODEL} — Auftrag angenommen "
-                                 f"(bis zu {MAX_ATTEMPTS} Versuche).")
+            await send("status", f"Modell {MODEL} über {provider.PROVIDER} — "
+                                 "Auftrag angenommen.")
 
             async def run_sandbox(code):
                 return await sandbox_runner(send, code)
 
-            await run_agent(send, prompt, ask_fn=ask, run_sandbox=run_sandbox,
-                            workspace=WORKSPACE)
+            await dispatch(send, prompt, ask_fn=ask, chat_fn=model_chat,
+                           run_sandbox=run_sandbox, workspace=WORKSPACE)
         finally:
             run_slots.release()
 
