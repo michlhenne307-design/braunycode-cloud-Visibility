@@ -1,7 +1,10 @@
 # Einrichtung vom iPhone aus
 
-Vom leeren Oracle-Account bis zum laufenden Agenten. Du brauchst nur Safari
-und Termius.
+Vom leeren Oracle-Account bis zum laufenden Agenten. Du brauchst nur einen
+Browser (Chrome, Safari, Firefox — egal) und Termius.
+
+> Auf iPhone und iPad benutzen alle Browser dieselbe Engine (WebKit). Nimm
+> also den, den du magst — die App verhält sich überall gleich.
 
 ---
 
@@ -13,7 +16,7 @@ Termius aus dem App Store laden. Das ist dein Terminal. Noch nichts weiter tun.
 
 ## 2. Server bei Oracle anlegen
 
-Safari → `oracle.com/cloud/free` → **Start for free** → registrieren.
+Browser → `oracle.com/cloud/free` → **Start for free** → registrieren.
 
 Zur Verifizierung wird eine Kreditkarte abgefragt. Oracle bucht eine kleine
 Autorisierung (~1 €) und storniert sie wieder. Solange du im Always-Free-Rahmen
@@ -120,7 +123,7 @@ Default Security List → Add Ingress Rule**
 
 ## 6. Öffnen
 
-Safari → `http://<DEINE-IP>:8000`
+Browser öffnen → `http://<DEINE-IP>:8000`
 
 Token eintragen, Auftrag eingeben, **Agent starten**. Plan, Code und
 Sandbox-Ausgabe laufen live durch.
@@ -138,16 +141,20 @@ Termius kannst du schließen — tmux brauchst du nicht.
 
 ## 7. Als App auf den Home-Bildschirm
 
-In Safari auf der geöffneten Seite: **Teilen-Symbol** (Quadrat mit Pfeil nach
-oben) → **Zum Home-Bildschirm** → **Hinzufügen**.
+Auf der geöffneten Seite:
 
-Ab jetzt liegt BraunyCode als eigenes Icon auf dem Home-Bildschirm und startet
-im Vollbild ohne Safari-Leiste. Das Token bleibt gespeichert.
+- **Chrome (iPhone):** Menü **⋯** rechts unten → *Zum Home-Bildschirm*
+- **Safari:** **Teilen-Symbol** (Quadrat mit Pfeil nach oben) → *Zum Home-Bildschirm*
+- **Chrome (Android/Desktop):** Menü **⋮** → *App installieren*
 
-> Über HTTP registriert Safari keinen Service Worker — die App läuft trotzdem,
-> nur ohne Offline-Hülle. Auch der Kopieren-Knopf im Code-Reiter braucht einen
-> sicheren Kontext. Wer beides will, nimmt den SSH-Tunnel unten oder setzt
-> einen TLS-Proxy davor.
+Dann **Hinzufügen**. Ab jetzt liegt BraunyCode als eigenes Icon auf dem
+Home-Bildschirm und startet im Vollbild ohne Browserleiste. Das Token bleibt
+gespeichert.
+
+> Über HTTP wird in **keinem** Browser ein Service Worker registriert — die
+> App läuft trotzdem, nur ohne Offline-Hülle. Auch der Kopieren-Knopf im
+> Code-Reiter braucht einen sicheren Kontext. Wer beides will, nimmt den
+> SSH-Tunnel unten oder setzt einen TLS-Proxy davor.
 
 ---
 
@@ -155,7 +162,7 @@ im Vollbild ohne Safari-Leiste. Das Token bleibt gespeichert.
 
 | Symptom | Ursache und Behebung |
 |---|---|
-| Safari: „Server nicht erreichbar" | Ingress-Regel aus Schritt 5 fehlt. Gegenprobe auf dem Server: `curl -s localhost:8000/healthz` — antwortet das, liegt es sicher an der Firewall. |
+| „Server nicht erreichbar" | Ingress-Regel aus Schritt 5 fehlt. Gegenprobe auf dem Server: `curl -s localhost:8000/healthz` — antwortet das, liegt es sicher an der Firewall. |
 | Meldung „model not found“ | Modell fehlt. `ollama pull qwen2.5-coder:7b`, dann `sudo systemctl restart braunycode` |
 | Meldung „permission denied … docker.sock“ | Docker-Gruppe. `sudo systemctl restart braunycode`, sonst einmal aus- und einloggen. |
 | Dienst startet nicht | `journalctl -u braunycode -n 50 --no-pager` |
@@ -163,8 +170,8 @@ im Vollbild ohne Safari-Leiste. Das Token bleibt gespeichert.
 | Antworten sehr langsam | Normal. Ohne GPU rechnet das Modell auf der CPU, ein Lauf dauert Minuten. |
 | `externally-managed-environment` | Es wurde `pip3 install` ohne venv benutzt. Der Installer macht das richtig — nutze ihn statt manueller Installation. |
 | Statuspunkt oben ist rot | `curl -s localhost:8000/healthz` nennt Ollama bzw. Docker im Klartext. |
-| Kopieren-Knopf tut nichts | Braucht HTTPS. Über den SSH-Tunnel (`http://localhost:8000`) geht es, weil localhost als sicher gilt. |
-| App-Icon fehlt nach dem Hinzufügen | Seite neu laden und erneut hinzufügen; Safari holt das Manifest sonst aus dem Cache. |
+| Kopieren-Knopf tut nichts | Braucht HTTPS — gilt in jedem Browser. Über den SSH-Tunnel (`http://localhost:8000`) geht es, weil localhost als sicher zählt. |
+| App-Icon fehlt nach dem Hinzufügen | Seite neu laden und erneut hinzufügen; der Browser holt das Manifest sonst aus dem Cache. |
 | „Server ausgelastet" | Es laufen schon 2 Aufträge. Kurz warten — schützt die Maschine vor Überlastung. |
 | „Zu viele Fehlversuche" | Token mehrfach falsch eingegeben. Nach 5 Minuten geht es wieder; mit richtigem Token sofort. |
 | Alles neu aufsetzen | `bash install.sh` erneut ausführen. Bestehendes Token bleibt erhalten. |
@@ -178,5 +185,5 @@ Internet gar nicht erreichbar:
 ssh -L 8000:localhost:8000 ubuntu@<DEINE-IP>
 ```
 
-Anschließend `http://localhost:8000` auf dem Gerät öffnen, das den Tunnel hält.
+Anschließend `http://localhost:8000` im Browser des Geräts öffnen, das den Tunnel hält.
 Auf dem iPhone unterstützt Termius Port-Weiterleitung in den Host-Einstellungen.

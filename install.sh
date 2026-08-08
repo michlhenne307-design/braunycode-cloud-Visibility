@@ -175,10 +175,10 @@ cat <<EOF
         IP Protocol      TCP
         Destination Port $BRAUNY_PORT
 
-  ALS APP AUFS IPHONE:
-    Adresse in Safari oeffnen > Teilen-Symbol >
-    "Zum Home-Bildschirm" > Hinzufuegen.
-    Startet dann im Vollbild ohne Safari-Leiste.
+  ALS APP AUFS HANDY (jeder Browser):
+    Adresse oeffnen > Menue- bzw. Teilen-Symbol >
+    "Zum Home-Bildschirm" / "App installieren".
+    Startet dann im Vollbild ohne Browserleiste.
 
   Status    sudo systemctl status braunycode
   Logs      journalctl -u braunycode -f

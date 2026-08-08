@@ -334,7 +334,7 @@ setInterval(checkHealth, 20000);
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
     navigator.serviceWorker.register('/sw.js').catch(() => {
-      /* Ohne HTTPS registriert Safari keinen Service Worker - die App
+      /* Ohne HTTPS registriert kein Browser einen Service Worker - die App
          funktioniert trotzdem, nur ohne Offline-Huelle. */
     });
   });
