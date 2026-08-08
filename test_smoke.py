@@ -435,5 +435,33 @@ async def slow_ask():
 msg = asyncio.run(slow_ask())
 check("bricht haengenden Modellaufruf ab", "nicht geantwortet" in msg, msg)
 
+print("\n[16] Browser-neutral")
+BROWSERS = ("Safari", "Chrome", "Firefox", "Edge")
+# Die Oberflaeche und der Installer duerfen keinen bestimmten Browser
+# voraussetzen - auf iOS teilen sich ohnehin alle dieselbe Engine.
+for path, label in [(main.STATIC_DIR / "index.html", "index.html"),
+                    (main.STATIC_DIR / "app.js", "app.js")]:
+    text = path.read_text()
+    found = [b for b in BROWSERS if b in text]
+    check(f"{label} nennt keinen bestimmten Browser", not found, found)
+
+installer = (main.BASE_DIR.parent / "install.sh")
+if installer.exists():
+    text = installer.read_text()
+    found = [b for b in BROWSERS if b in text]
+    check("install.sh nennt keinen bestimmten Browser", not found, found)
+
+# Die PWA muss ueberall installierbar bleiben: das Manifest darf keine
+# Apple-only-Annahme enthalten, sondern die Standardfelder tragen.
+mani = json.loads((main.STATIC_DIR / "manifest.json").read_text())
+check("Manifest ist Standard-PWA (display standalone)",
+      mani.get("display") == "standalone", mani.get("display"))
+check("Manifest hat start_url und scope",
+      mani.get("start_url") and mani.get("scope"), mani)
+
+html = (main.STATIC_DIR / "index.html").read_text()
+check("index.html traegt sowohl Apple- als auch Standard-Metatag",
+      'apple-mobile-web-app-capable' in html and 'name="mobile-web-app-capable"' in html)
+
 print(f"\n=== {ok} bestanden, {fail} fehlgeschlagen ===")
 sys.exit(1 if fail else 0)

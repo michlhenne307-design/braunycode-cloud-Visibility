@@ -11,7 +11,7 @@ gesamte Ablauf wird live per WebSocket ins Browserfenster gestreamt.
 ## Aufbau
 
 ```
-Safari (iPhone)  ──WebSocket──▶  FastAPI  ──▶  Ollama (qwen2.5-coder:7b, lokal)
+Browser (iPhone) ──WebSocket──▶  FastAPI  ──▶  Ollama (qwen2.5-coder:7b, lokal)
                                     │
                                     └────────▶  Docker-Sandbox
                                                kein Netz · 512 MB · 1 CPU
@@ -77,9 +77,11 @@ Nach Änderungen: `sudo systemctl restart braunycode`
 
 ## Als App auf dem iPhone
 
-Die Oberfläche ist eine installierbare PWA. In Safari die Adresse öffnen →
-Teilen-Symbol → **Zum Home-Bildschirm** → Hinzufügen. Danach startet sie im
-Vollbild ohne Safari-Leiste, mit eigenem Icon und dunkler Statusleiste.
+Die Oberfläche ist eine installierbare PWA und läuft in jedem Browser —
+Chrome, Safari, Firefox, Edge, am Handy wie am Rechner. Adresse öffnen →
+Teilen- bzw. Menü-Symbol → **Zum Home-Bildschirm** → Hinzufügen. Danach
+startet sie im Vollbild ohne Browserleiste, mit eigenem Icon und dunkler
+Statusleiste.
 
 Was die Oberfläche kann:
 
@@ -93,10 +95,15 @@ Was die Oberfläche kann:
   Container auf.
 - **Offline** bleibt die Hülle nutzbar; Läufe brauchen natürlich den Server.
 
-Zwei Einschränkungen über HTTP: Safari registriert **keinen Service Worker**
-ohne HTTPS — die Seite funktioniert, nur ohne Offline-Hülle. Und der
-Kopieren-Knopf braucht ebenfalls einen sicheren Kontext. Beides löst ein
-TLS-Proxy oder der SSH-Tunnel weiter unten.
+Zwei Einschränkungen über HTTP, in **jedem** Browser gleich: ohne HTTPS wird
+**kein Service Worker** registriert — die Seite funktioniert, nur ohne
+Offline-Hülle. Und der Kopieren-Knopf braucht ebenfalls einen sicheren
+Kontext. Beides löst ein TLS-Proxy oder der SSH-Tunnel weiter unten.
+
+> **Hinweis zu iPhone und iPad:** Dort benutzen *alle* Browser dieselbe
+> Engine (WebKit) — Chrome, Firefox und Edge sind andere Oberflächen um
+> denselben Kern. Was die Seite kann und was nicht, ist auf iOS deshalb in
+> jedem Browser identisch. Nimm also ruhig den, den du magst.
 
 ## Betrieb
 
