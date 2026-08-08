@@ -11,7 +11,7 @@ gesamte Ablauf wird live per WebSocket ins Browserfenster gestreamt.
 ## Aufbau
 
 ```
-Safari (iPhone)  ──WebSocket──▶  FastAPI  ──▶  Ollama (llama3.1:8b, lokal)
+Safari (iPhone)  ──WebSocket──▶  FastAPI  ──▶  Ollama (qwen2.5-coder:7b, lokal)
                                     │
                                     └────────▶  Docker-Sandbox
                                                kein Netz · 512 MB · 1 CPU
@@ -36,7 +36,7 @@ Safari (iPhone)  ──WebSocket──▶  FastAPI  ──▶  Ollama (llama3.1:
 ## Voraussetzungen
 
 - Ubuntu 24.04, arm64 oder x86_64
-- 4 CPU-Kerne, mindestens 8 GB RAM (empfohlen 24 GB für llama3.1:8b)
+- 4 CPU-Kerne, mindestens 8 GB RAM (empfohlen 24 GB)
 - ~15 GB freier Speicher
 
 Getestet als Zielumgebung: Oracle Cloud Free Tier, `VM.Standard.A1.Flex`,
@@ -63,7 +63,7 @@ Der Installer schreibt `~/braunycode/brauny.env` (Modus 600, nicht im Repo):
 | Variable | Standard | Bedeutung |
 |---|---|---|
 | `BRAUNY_TOKEN` | zufällig erzeugt | Zugangs-Token für die Oberfläche |
-| `BRAUNY_MODEL` | `llama3.1:8b` | Ollama-Modell |
+| `BRAUNY_MODEL` | `qwen2.5-coder:7b` | Ollama-Modell |
 | `BRAUNY_MAX_ATTEMPTS` | `3` | Versuche inkl. erstem Wurf; `1` schaltet die Selbstkorrektur ab |
 | `BRAUNY_SANDBOX_TIMEOUT` | `60` | Sekunden bis zum Abbruch |
 | `BRAUNY_SANDBOX_MEM` | `512m` | RAM-Limit der Sandbox |
@@ -104,7 +104,7 @@ curl -s localhost:8000/healthz        # Ollama + Docker prüfen
 
 ## Selbstkorrektur
 
-Der eigentliche Trick, der ein 8B-Modell brauchbar macht: Scheitert der Code in
+Der eigentliche Trick, der ein kleines Modell brauchbar macht: Scheitert der Code in
 der Sandbox — Absturz, falscher Exit-Code oder ein Traceback in der Ausgabe —
 schickt der Agent dem Modell den gescheiterten Code samt echtem Fehler zurück
 und lässt ihn neu schreiben. Das wiederholt sich, bis es läuft oder
@@ -160,17 +160,39 @@ Traceback-Erkennung bei Exit 0). Docker und Ollama werden dafür nicht benötigt
 
 ## Was das System leistet — und was nicht
 
-`llama3.1:8b` auf 4 ARM-Kernen ohne GPU schafft grob 5–10 Token/s. Ein
-Durchlauf dauert also einige Minuten. Die Code-Qualität eines 8B-Modells
-reicht für abgegrenzte Aufgaben — Algorithmen, Datenverarbeitung, kleine
-Skripte. Mehrdateiige Anwendungen oder Frontend-Frameworks liegen außerhalb
-dessen, was hier realistisch herauskommt: der Agent erzeugt bewusst genau
-eine `main.py` ohne externe Pakete.
+Standardmodell ist **`qwen2.5-coder:7b`** — ein auf Code spezialisiertes Modell.
+Gegenüber einem gleich großen Allzweckmodell trifft es bei Programmieraufgaben
+deutlich besser, ist mit ~4,7 GB etwas kleiner und läuft auf CPU einen Tick
+schneller. Wie alle Ollama-Modelle kostenlos.
 
-Für stärkere Ergebnisse ein größeres Modell setzen, sofern der RAM reicht:
+Auf 4 ARM-Kernen ohne GPU sind grob 5–10 Token/s realistisch. Ein Durchlauf
+dauert also einige Minuten — bei einer Reparatur entsprechend länger. Die
+Qualität reicht für abgegrenzte Aufgaben: Algorithmen, Datenverarbeitung,
+kleine Skripte. Mehrdateiige Anwendungen oder Frontend-Frameworks liegen
+außerhalb dessen, was hier realistisch herauskommt: der Agent erzeugt bewusst
+genau eine `main.py` ohne externe Pakete.
+
+### Anderes Modell setzen
+
+Alle Varianten sind gratis. Wenn der Arbeitsspeicher reicht, bringt die
+14B-Variante nochmal spürbar bessere Ergebnisse — dafür langsamer:
 
 ```bash
 ollama pull qwen2.5-coder:14b
 sed -i 's/^BRAUNY_MODEL=.*/BRAUNY_MODEL=qwen2.5-coder:14b/' ~/braunycode/brauny.env
 sudo systemctl restart braunycode
 ```
+
+Auf schwächerer Hardware (unter 8 GB RAM) geht auch die kleine Variante:
+
+```bash
+ollama pull qwen2.5-coder:1.5b
+sed -i 's/^BRAUNY_MODEL=.*/BRAUNY_MODEL=qwen2.5-coder:1.5b/' ~/braunycode/brauny.env
+sudo systemctl restart braunycode
+```
+
+| Modell | Größe | RAM | Eignung |
+|---|---|---|---|
+| `qwen2.5-coder:1.5b` | ~1,0 GB | ~4 GB | Notlösung, einfachste Skripte |
+| `qwen2.5-coder:7b` | ~4,7 GB | ~8 GB | **Standard**, guter Kompromiss |
+| `qwen2.5-coder:14b` | ~9,0 GB | ~16 GB | beste Qualität, langsamer |

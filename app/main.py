@@ -24,7 +24,7 @@ BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 ICON_DIR = STATIC_DIR / "icons"
 
-MODEL = os.environ.get("BRAUNY_MODEL", "llama3.1:8b")
+MODEL = os.environ.get("BRAUNY_MODEL", "qwen2.5-coder:7b")
 TOKEN = os.environ.get("BRAUNY_TOKEN", "")
 MAX_PROMPT = int(os.environ.get("BRAUNY_MAX_PROMPT", "2000"))
 # Anzahl Versuche inklusive erstem Wurf. 1 = altes Verhalten ohne Reparatur.

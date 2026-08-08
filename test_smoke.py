@@ -96,7 +96,7 @@ check("GET /static/app.css", client.get("/static/app.css").status_code == 200)
 check("GET /static/app.js", client.get("/static/app.js").status_code == 200)
 r = client.get("/healthz")
 check("healthz meldet 503 ohne Backends", r.status_code == 503, r.status_code)
-check("healthz nennt Modell", r.json().get("model") == "llama3.1:8b")
+check("healthz nennt Modell", r.json().get("model") == "qwen2.5-coder:7b")
 
 print("\n[6] PWA")
 r = client.get("/manifest.json")
@@ -160,7 +160,7 @@ check("lehnt leeren Auftrag ab", ev["type"] == "error" and "Leerer" in ev["text"
 
 ev = ws_exchange({"token": "geheim-test-token", "prompt": "baue etwas"})
 check("korrektes Token passiert das Gate", ev["type"] == "status", ev)
-check("erste Meldung nennt das Modell", "llama3.1:8b" in ev["text"], ev)
+check("erste Meldung nennt das Modell", "qwen2.5-coder:7b" in ev["text"], ev)
 
 def ws_collect(payload, limit=10):
     """Liest bis zum done-Event. Ein Lesen darueber hinaus wuerde blockieren,

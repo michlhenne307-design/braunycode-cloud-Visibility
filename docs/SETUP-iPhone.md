@@ -53,7 +53,7 @@ Kapazität in den kostenlosen Regionen ist meist ausgebucht. Möglichkeiten:
   Ressourcen werden weiterhin als „Always Free" abgerechnet.
 
 Die kostenlosen AMD-Instanzen (1 GB RAM) sind **keine** Alternative: darauf
-läuft kein 8B-Modell.
+läuft das Modell nicht.
 
 ---
 
@@ -87,7 +87,7 @@ Der Installer läuft 10–20 Minuten und erledigt:
 1. Wartet cloud-init und den apt-Lock ab
 2. Systemupdate ohne interaktive Rückfragen
 3. Docker + `python:3.11-slim` als Sandbox-Image
-4. Ollama + Modell `llama3.1:8b` (mehrere GB)
+4. Ollama + Modell `qwen2.5-coder:7b` (~4,7 GB)
 5. Python-venv (nötig wegen PEP 668 auf Ubuntu 24.04)
 6. PWA-Icons, falls sie fehlen
 7. Zufälliges Zugangs-Token, systemd-Dienst
@@ -156,7 +156,7 @@ im Vollbild ohne Safari-Leiste. Das Token bleibt gespeichert.
 | Symptom | Ursache und Behebung |
 |---|---|
 | Safari: „Server nicht erreichbar" | Ingress-Regel aus Schritt 5 fehlt. Gegenprobe auf dem Server: `curl -s localhost:8000/healthz` — antwortet das, liegt es sicher an der Firewall. |
-| Meldung „model not found“ | Modell fehlt. `ollama pull llama3.1:8b`, dann `sudo systemctl restart braunycode` |
+| Meldung „model not found“ | Modell fehlt. `ollama pull qwen2.5-coder:7b`, dann `sudo systemctl restart braunycode` |
 | Meldung „permission denied … docker.sock“ | Docker-Gruppe. `sudo systemctl restart braunycode`, sonst einmal aus- und einloggen. |
 | Dienst startet nicht | `journalctl -u braunycode -n 50 --no-pager` |
 | „Versuch 2/3“ erscheint | Normal — der Agent hat einen Fehler erkannt und repariert den Code selbst. |

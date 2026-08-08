@@ -8,7 +8,7 @@
 set -euo pipefail
 
 BRAUNY_HOME="${BRAUNY_HOME:-$HOME/braunycode}"
-BRAUNY_MODEL="${BRAUNY_MODEL:-llama3.1:8b}"
+BRAUNY_MODEL="${BRAUNY_MODEL:-qwen2.5-coder:7b}"
 BRAUNY_PORT="${BRAUNY_PORT:-8000}"
 SANDBOX_IMAGE="${BRAUNY_SANDBOX_IMAGE:-python:3.11-slim}"
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
