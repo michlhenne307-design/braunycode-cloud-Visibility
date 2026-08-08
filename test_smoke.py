@@ -612,5 +612,108 @@ check("ohne Projektverzeichnis kein Schnellweg",
       asyncio.run(main.try_mechanical(lambda *a, **k: None, "benenne a in b um", None))
       is False)
 
+print("\n[20] Projekt-Index und Call-Graph")
+import codeindex  # noqa: E402
+
+iws = ws_mod.Workspace(tempfile.mkdtemp())
+iws.write("cart.py", '''
+class Cart:
+    """Ein Warenkorb."""
+    def add(self, item, qty=1):
+        """Legt einen Artikel hinein."""
+        return calculate_total(self.items)
+
+    def clear(self):
+        self.items = []
+
+def calculate_total(items):
+    """Berechnet die Gesamtsumme."""
+    return sum(items)
+''')
+iws.write("checkout.py", '''
+from cart import calculate_total
+
+def checkout(cart):
+    """Schliesst den Kauf ab."""
+    return apply_discount(calculate_total(cart.items))
+
+def apply_discount(total):
+    return total * 0.9
+''')
+iws.write("kaputt.py", "def f(:\n  pass\n")
+
+idx = codeindex.CodeIndex.build(iws)
+check("indiziert nur lesbare Dateien", idx.files == ["cart.py", "checkout.py"], idx.files)
+check("kaputte Datei wird übersprungen, nicht geworfen",
+      idx.skipped and idx.skipped[0][0] == "kaputt.py", idx.skipped)
+check("findet alle Symbole", len(idx.symbols) == 6, len(idx.symbols))
+
+names = {s.qualname for s in idx.symbols}
+check("Methoden mit Klassenpräfix", "Cart.add" in names, sorted(names))
+check("Modulfunktionen ohne Präfix", "calculate_total" in names)
+
+sym = idx.find("Cart.add")[0]
+check("Signatur erfasst", sym.signature == "add(self, item, qty=1)", sym.signature)
+check("Docstring-Zeile erfasst", sym.doc == "Legt einen Artikel hinein.", sym.doc)
+
+callers = {s.qualname for s in idx.callers("calculate_total")}
+check("Call-Graph findet beide Aufrufer",
+      callers == {"Cart.add", "checkout"}, callers)
+check("Klasse zählt NICHT als Aufrufer ihrer Methoden",
+      "Cart" not in callers, callers)
+
+impact = {s.qualname for s in idx.impact("calculate_total")}
+check("impact nennt betroffene Aufrufer", impact == {"Cart.add", "checkout"}, impact)
+check("callees kennt aufgerufene Symbole",
+      "calculate_total" in idx.callees("checkout"), idx.callees("checkout"))
+
+rel = [s.qualname for s in idx.relevant("ändere apply_discount im checkout")]
+check("Relevanz findet passende Symbole",
+      "apply_discount" in rel, rel)
+check("Relevanz bei leerer Aufgabe leer", idx.relevant("") == [])
+
+ov = idx.overview()
+check("Übersicht nennt Dateien und Symbole", "cart.py" in ov and "Cart.add" not in ov.split("checkout.py")[0].split("cart.py")[0], ov[:60])
+check("Übersicht enthält Signaturen", "add(self, item, qty=1)" in ov)
+
+ctx = idx.context_for("benenne calculate_total um")
+check("Kontext enthält Übersicht", "Projekt:" in ctx)
+check("Kontext enthält Quelltext der Fundstelle", "def calculate_total(items)" in ctx)
+check("Kontext nennt Aufrufer", "Aufrufer:" in ctx, ctx[-200:])
+check("Kontext bleibt kompakt (< 4000 Zeichen)", len(ctx) < 4000, len(ctx))
+
+check("leerer Index liefert leeren Kontext",
+      codeindex.CodeIndex().context_for("egal") == "")
+
+print("\n[21] Index im Agenten")
+
+events, calls, w = drive_mech(
+    "baue eine Rabattfunktion",
+    {"main.py": "def bestehende_funktion(x):\n    return x\n"},
+    replies=["PLAN", "```python\nprint('ok')\n```"], runs=[(0, "ok")])
+check("Agent meldet berücksichtigten Projektkontext",
+      any("Projektkontext" in e["text"] for e in events if e["type"] == "status"),
+      [e["text"] for e in events if e["type"] == "status"])
+
+# Rename in main.py, aber ein anderer Modulteil nutzt den Namen weiter
+events, calls, w = drive_mech(
+    "benenne alt_name in neu_name um",
+    {"main.py": "def alt_name(x):\n    return x\n",
+     "andere.py": "from main import alt_name\n\ndef nutzer():\n    return alt_name(1)\n"})
+check("Rename greift trotz zweiter Datei (main.py ist eindeutig)",
+      "def neu_name" in w.read("main.py"))
+check("warnt vor Aufrufern in anderen Dateien",
+      any("ACHTUNG" in e["text"] for e in events if e["type"] == "error"),
+      [e["text"] for e in events if e["type"] == "error"])
+check("Warnung nennt die betroffene Datei",
+      any("andere.py" in e["text"] for e in events if e["type"] == "error"))
+
+events, calls, w = drive_mech(
+    "benenne alt_name in neu_name um",
+    {"main.py": "def alt_name(x):\n    return alt_name(x)\n"})
+check("keine Warnung ohne fremde Aufrufer",
+      not any("ACHTUNG" in e["text"] for e in events if e["type"] == "error"),
+      [e["text"] for e in events if e["type"] == "error"])
+
 print(f"\n=== {ok} bestanden, {fail} fehlgeschlagen ===")
 sys.exit(1 if fail else 0)

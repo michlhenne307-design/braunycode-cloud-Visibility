@@ -15,6 +15,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+import codeindex
 import refactor
 import sandbox
 import workspace as ws_mod
@@ -48,7 +49,7 @@ AUTH_WINDOW = int(os.environ.get("BRAUNY_AUTH_WINDOW", "300"))
 # Projektverzeichnis, in dem der Agent arbeitet und seine Historie fuehrt.
 WORKSPACE_ROOT = os.environ.get("BRAUNY_WORKSPACE", str(BASE_DIR.parent / "workspace"))
 
-app = FastAPI(title="BraunyCode Cloud", version="1.4.0")
+app = FastAPI(title="BraunyCode Cloud", version="1.5.0")
 
 # Begrenzt die gleichzeitig laufenden Auftraege.
 run_slots = asyncio.Semaphore(MAX_CONCURRENT)
@@ -142,17 +143,21 @@ def clear_auth_fails(key: str) -> None:
 
 # ------------------------------------------------------------------ Prompts
 
-def plan_prompt(task: str) -> str:
+def plan_prompt(task: str, context: str = "") -> str:
+    # Der Projektkontext kommt VOR die Aufgabe: kleine Modelle gewichten den
+    # Anfang eines Prompts staerker.
+    head = f"Bestehendes Projekt:\n{context}\n\n" if context else ""
     return (
-        f"Du bist ein Software-Architekt. Aufgabe: {task}\n"
+        f"{head}Du bist ein Software-Architekt. Aufgabe: {task}\n"
         "Antworte kurz und ausschliesslich als JSON mit den Schluesseln "
         '"sprache", "dateien", "schritte".'
     )
 
 
-def code_prompt(task: str, plan: str) -> str:
+def code_prompt(task: str, plan: str, context: str = "") -> str:
+    head = f"Bestehendes Projekt:\n{context}\n\n" if context else ""
     return (
-        f"Plan:\n{plan}\n\nAufgabe: {task}\n\n"
+        f"{head}Plan:\n{plan}\n\nAufgabe: {task}\n\n"
         "Schreibe dazu eine einzelne, sofort lauffaehige Python-Datei main.py. "
         "Nur Standardbibliothek, keine externen Pakete, kein Netzwerkzugriff, "
         "keine Benutzereingabe (kein input()). Das Programm muss von selbst "
@@ -253,9 +258,23 @@ async def try_mechanical(send, task, ws) -> bool:
         return True
 
     ws.write(target, result.code)
+
+    # Umbenannt wird nur in der Zieldatei. Verweist eine andere Datei noch auf
+    # den alten Namen, bricht das Projekt - das muss gemeldet werden, statt es
+    # als sauberen Erfolg zu verkaufen.
+    warning = ""
+    if mech.kind == "rename":
+        index = await asyncio.to_thread(codeindex.CodeIndex.build, ws)
+        stale = [s for s in index.callers(mech.params["old"]) if s.path != target]
+        if stale:
+            places = ", ".join(sorted({f"{s.path}:{s.line}" for s in stale})[:5])
+            warning = (f" ACHTUNG: '{mech.params['old']}' wird noch verwendet in "
+                       f"{places} — dort nicht mit umbenannt.")
+            await send("error", warning.strip())
+
     sha = await asyncio.to_thread(ws.git_commit, f"{mech.label} ({target})")
     await send("code", result.code, lang="python", attempt=1, path=target)
-    await send("sandbox", result.summary)
+    await send("sandbox", result.summary + warning)
     note = f" Commit {sha}." if sha else ""
     await send("done", f"{result.summary}{note}", ok=True, exit=0, attempts=0,
                seconds=round(time.monotonic() - start, 1), mechanical=True)
@@ -279,12 +298,22 @@ async def run_agent(send, task, *, ask_fn, run_sandbox, workspace=None,
     if await try_mechanical(send, task, workspace):
         return
 
+    # Was das Modell nicht wissen kann: dieses Projekt. Nur die relevanten
+    # Stellen, nicht Dokumentation, die es ohnehin kennt.
+    context = ""
+    if workspace is not None:
+        index = await asyncio.to_thread(codeindex.CodeIndex.build, workspace)
+        context = index.context_for(task)
+        if context:
+            await send("status", f"Projektkontext: {len(index.symbols)} Symbol(e) "
+                                 f"aus {len(index.files)} Datei(en) berücksichtigt.")
+
     await send("status", "Plane Architektur …")
-    plan = await ask_fn(plan_prompt(task))
+    plan = await ask_fn(plan_prompt(task, context))
     await send("plan", plan)
 
     await send("status", "Schreibe Code …")
-    code = extract_code(await ask_fn(code_prompt(task, plan)))
+    code = extract_code(await ask_fn(code_prompt(task, plan, context)))
     if not code:
         await send("error", "Das Modell hat keinen Code geliefert.")
         await send("done", "Abgebrochen.", ok=False, exit=-1,

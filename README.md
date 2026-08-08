@@ -1,4 +1,4 @@
-# BraunyCode Cloud v1.4.0
+# BraunyCode Cloud v1.5.0
 
 Cloudbasierter KI-Coding-Agent, bedienbar vom iPhone. Läuft komplett auf einem
 eigenen Server — kein API-Key, keine laufenden Kosten.
@@ -25,6 +25,7 @@ Browser (iPhone) ──WebSocket──▶  FastAPI  ──▶  Ollama (qwen2.5-c
 | `app/sandbox.py` | Gehärtete Docker-Ausführung, Log-Streaming |
 | `app/refactor.py` | Deterministische Umbauten über den Syntaxbaum, ohne Modell |
 | `app/workspace.py` | Projektverzeichnis mit Pfadschutz und Git-Historie |
+| `app/codeindex.py` | Symbol-Index und Aufrufgraph über das Projekt |
 | `app/static/index.html` | PWA-Oberfläche, für iPhone optimiert |
 | `app/static/app.css` | Design-Tokens (shadcn-Schema) und Layout |
 | `app/static/app.js` | WebSocket-Client, Reiter, Verlauf, Service-Worker |
@@ -145,6 +146,49 @@ Die Erkennung ist bewusst konservativ: Sie ist ein Mustervergleich auf gängige
 Formulierungen, keine Absichtserkennung. Passt kein Muster, oder ist die
 Zieldatei nicht eindeutig, nimmt der Auftrag den normalen Weg. Ein falsch
 erkannter Umbau wäre schlimmer als ein verpasster.
+
+## Projektkontext statt Dokumentation
+
+Ein Sprachmodell kennt React, Python und Design Patterns auswendig — das steht
+in seinen Gewichten. Was es nicht kennen kann, ist **dieses** Projekt.
+
+Genau das liefert `codeindex.py`, deterministisch über den Syntaxbaum:
+
+- welche Funktionen, Klassen und Methoden es gibt, mit Signatur und Docstring
+- wer wen aufruft (Aufrufgraph)
+- was betroffen ist, wenn sich eine Signatur ändert
+
+Vor jedem Modellaufruf bekommt der Agent eine kompakte Projektübersicht plus
+den Quelltext der Stellen, um die es geht. Gemessen an einem Projekt mit
+15 Dateien und 150 Symbolen:
+
+| | |
+|---|---|
+| Index bauen | 7 ms |
+| Kontext auswählen | 1 ms |
+| Kontextgröße | ~820 Token |
+| Ganzes Projekt roh | ~2.970 Token |
+
+Das ist der Punkt: **nicht mehr Kontext, sondern der richtige.** Bei einem
+kleinen Modell auf CPU kostet jeder überflüssige Token Rechenzeit.
+
+Die Auswahl ist ein lexikalischer Abgleich zwischen Aufgabentext und
+Bezeichnern — nachvollziehbar, ohne Einbettungen, ohne Rechenkosten. Es ist
+keine Bedeutungserkennung, und das steht so auch im Code.
+
+Der Aufrufgraph wird über Namen gebildet, nicht über aufgelöste Typen: zwei
+gleichnamige Methoden in verschiedenen Klassen sind für den Index dasselbe
+Ziel. Für „wer könnte betroffen sein" reicht das, eine Typanalyse ist es nicht.
+
+### Warnung bei unvollständigem Umbenennen
+
+Ein Umbenennen ändert nur die Zieldatei. Verweist eine andere Datei noch auf
+den alten Namen, meldet der Agent das ausdrücklich, statt einen sauberen
+Erfolg zu behaupten:
+
+```
+ACHTUNG: 'alt_name' wird noch verwendet in andere.py:4 — dort nicht mit umbenannt.
+```
 
 ## Projektverzeichnis
 
