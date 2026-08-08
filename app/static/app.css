@@ -192,6 +192,8 @@ textarea:disabled { opacity: 0.55; }
 }
 .line.status  .tag { color: hsl(var(--info)); }
 .line.plan    .tag { color: hsl(var(--primary)); }
+.line.tool    .tag { color: hsl(var(--primary)); }
+.line.tool    { font-variant-numeric: tabular-nums; }
 .line.code    .tag { color: hsl(var(--warning)); }
 .line.sandbox .tag { color: hsl(var(--success)); }
 .line.error   { color: hsl(var(--destructive)); }

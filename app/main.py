@@ -10,12 +10,17 @@ import re
 import time
 from pathlib import Path
 
-import ollama
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+import agentloop
+import codeindex
+import provider
+import refactor
 import sandbox
+import tools
+import workspace as ws_mod
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("brauny")
@@ -43,11 +48,27 @@ ASK_TIMEOUT = int(os.environ.get("BRAUNY_ASK_TIMEOUT", "300"))
 # Zeitfensters wird die Adresse voruebergehend abgewiesen.
 AUTH_MAX_FAILS = max(1, int(os.environ.get("BRAUNY_AUTH_MAX_FAILS", "5")))
 AUTH_WINDOW = int(os.environ.get("BRAUNY_AUTH_WINDOW", "300"))
+# Projektverzeichnis, in dem der Agent arbeitet und seine Historie fuehrt.
+WORKSPACE_ROOT = os.environ.get("BRAUNY_WORKSPACE", str(BASE_DIR.parent / "workspace"))
+# Arbeitsweise: "auto"    - Werkzeugschleife, faellt bei Modellen ohne
+#                           Werkzeugunterstuetzung auf den einfachen Weg zurueck
+#               "tools"   - nur Werkzeugschleife
+#               "oneshot" - nur der alte Weg: planen, schreiben, ausfuehren
+AGENT_MODE = os.environ.get("BRAUNY_AGENT", "auto").strip().lower()
 
-app = FastAPI(title="BraunyCode Cloud", version="1.3.0")
+app = FastAPI(title="BraunyCode Cloud", version="1.6.0")
 
 # Begrenzt die gleichzeitig laufenden Auftraege.
 run_slots = asyncio.Semaphore(MAX_CONCURRENT)
+
+# Projekt, an dem gearbeitet wird. Faellt auf None zurueck, wenn das
+# Verzeichnis nicht angelegt werden kann - der Agent laeuft dann wie bisher
+# ohne Historie weiter.
+try:
+    WORKSPACE = ws_mod.Workspace(WORKSPACE_ROOT)
+except OSError as exc:
+    logging.getLogger("brauny").warning("Kein Projektverzeichnis: %s", exc)
+    WORKSPACE = None
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 CODE_FENCE = re.compile(r"```(?:python|py)?\s*\n(.*?)```", re.S)
@@ -65,34 +86,27 @@ def extract_code(text: str) -> str:
     return text.strip()
 
 
-def message_content(response) -> str:
-    """Liest den Text aus einer ollama-Antwort, egal welche Client-Version."""
-    try:
-        return response["message"]["content"]
-    except (TypeError, KeyError):
-        return response.message.content
-
-
-async def ask(prompt: str) -> str:
-    """Fragt das Modell mit Zeitlimit.
+async def model_chat(messages, schema=None):
+    """Ein Modellaufruf mit Zeitlimit, egal ob lokal oder ueber eine API.
 
     wait_for beendet den Hintergrund-Thread nicht - der laeuft aus. Es loest
     aber die Verbindung, statt sie unbegrenzt haengen zu lassen.
     """
     try:
-        response = await asyncio.wait_for(
-            asyncio.to_thread(
-                ollama.chat,
-                model=MODEL,
-                messages=[{"role": "user", "content": prompt}],
-            ),
+        return await asyncio.wait_for(
+            asyncio.to_thread(provider.chat, messages, schema),
             timeout=ASK_TIMEOUT,
         )
     except asyncio.TimeoutError:
         raise TimeoutError(
             f"Das Modell hat nach {ASK_TIMEOUT}s nicht geantwortet."
         ) from None
-    return message_content(response)
+
+
+async def ask(prompt: str) -> str:
+    """Einzelfrage ohne Werkzeuge - der einfache Weg."""
+    reply = await model_chat([{"role": "user", "content": prompt}])
+    return reply.text
 
 
 # ------------------------------------------------------------------ Auth-Bremse
@@ -129,17 +143,21 @@ def clear_auth_fails(key: str) -> None:
 
 # ------------------------------------------------------------------ Prompts
 
-def plan_prompt(task: str) -> str:
+def plan_prompt(task: str, context: str = "") -> str:
+    # Der Projektkontext kommt VOR die Aufgabe: kleine Modelle gewichten den
+    # Anfang eines Prompts staerker.
+    head = f"Bestehendes Projekt:\n{context}\n\n" if context else ""
     return (
-        f"Du bist ein Software-Architekt. Aufgabe: {task}\n"
+        f"{head}Du bist ein Software-Architekt. Aufgabe: {task}\n"
         "Antworte kurz und ausschliesslich als JSON mit den Schluesseln "
         '"sprache", "dateien", "schritte".'
     )
 
 
-def code_prompt(task: str, plan: str) -> str:
+def code_prompt(task: str, plan: str, context: str = "") -> str:
+    head = f"Bestehendes Projekt:\n{context}\n\n" if context else ""
     return (
-        f"Plan:\n{plan}\n\nAufgabe: {task}\n\n"
+        f"{head}Plan:\n{plan}\n\nAufgabe: {task}\n\n"
         "Schreibe dazu eine einzelne, sofort lauffaehige Python-Datei main.py. "
         "Nur Standardbibliothek, keine externen Pakete, kein Netzwerkzugriff, "
         "keine Benutzereingabe (kein input()). Das Programm muss von selbst "
@@ -192,7 +210,79 @@ def syntax_error(code: str):
 
 # ------------------------------------------------------------------ Agentenlogik
 
-async def run_agent(send, task, *, ask_fn, run_sandbox, max_attempts=MAX_ATTEMPTS):
+def pick_target(ws) -> str | None:
+    """Waehlt die Datei, auf die sich ein mechanischer Auftrag bezieht.
+
+    Bewusst eng: nur bei main.py oder genau einer Python-Datei. Bei mehreren
+    Kandidaten ist die Zuordnung nicht eindeutig - dann lieber nichts anfassen.
+    """
+    files = [f for f in ws.list_files() if f.endswith(".py")]
+    if "main.py" in files:
+        return "main.py"
+    return files[0] if len(files) == 1 else None
+
+
+async def try_mechanical(send, task, ws) -> bool:
+    """Deterministischer Schnellweg. True, wenn der Auftrag erledigt wurde.
+
+    Mechanische Aenderungen - umbenennen, Docstrings, tote Importe - laufen
+    ueber den Syntaxbaum statt ueber das Modell: in Millisekunden, ohne
+    Rechenlast, mit reproduzierbarem Ergebnis.
+    """
+    if ws is None:
+        return False
+    mech = refactor.classify(task)
+    if mech is None:
+        return False
+
+    target = pick_target(ws)
+    if target is None:
+        await send("status", f"Mechanischer Auftrag erkannt ({mech.label}), aber "
+                             "keine eindeutige Zieldatei — gehe den normalen Weg.")
+        return False
+
+    await send("status", f"Mechanischer Auftrag erkannt: {mech.label}. "
+                         "Kein Modell nötig.")
+    start = time.monotonic()
+    try:
+        before = ws.read(target)
+    except Exception as exc:
+        await send("status", f"Konnte {target} nicht lesen ({exc}) — normaler Weg.")
+        return False
+
+    result = await asyncio.to_thread(refactor.apply, mech, before)
+    if not result.changed:
+        await send("status", f"{result.summary} Nichts zu ändern.")
+        await send("done", result.summary, ok=True, exit=0, attempts=0,
+                   seconds=round(time.monotonic() - start, 1), mechanical=True)
+        return True
+
+    ws.write(target, result.code)
+
+    # Umbenannt wird nur in der Zieldatei. Verweist eine andere Datei noch auf
+    # den alten Namen, bricht das Projekt - das muss gemeldet werden, statt es
+    # als sauberen Erfolg zu verkaufen.
+    warning = ""
+    if mech.kind == "rename":
+        index = await asyncio.to_thread(codeindex.CodeIndex.build, ws)
+        stale = [s for s in index.callers(mech.params["old"]) if s.path != target]
+        if stale:
+            places = ", ".join(sorted({f"{s.path}:{s.line}" for s in stale})[:5])
+            warning = (f" ACHTUNG: '{mech.params['old']}' wird noch verwendet in "
+                       f"{places} — dort nicht mit umbenannt.")
+            await send("error", warning.strip())
+
+    sha = await asyncio.to_thread(ws.git_commit, f"{mech.label} ({target})")
+    await send("code", result.code, lang="python", attempt=1, path=target)
+    await send("sandbox", result.summary + warning)
+    note = f" Commit {sha}." if sha else ""
+    await send("done", f"{result.summary}{note}", ok=True, exit=0, attempts=0,
+               seconds=round(time.monotonic() - start, 1), mechanical=True)
+    return True
+
+
+async def run_agent(send, task, *, ask_fn, run_sandbox, workspace=None,
+                    max_attempts=MAX_ATTEMPTS, skip_mechanical=False):
     """Plant, generiert und repariert Code, bis er laeuft oder die Versuche aus sind.
 
     ask_fn und run_sandbox sind hineingereicht, damit die Schleife ohne echtes
@@ -204,12 +294,28 @@ async def run_agent(send, task, *, ask_fn, run_sandbox, max_attempts=MAX_ATTEMPT
     def elapsed():
         return round(time.monotonic() - start, 1)
 
+    # Erst der deterministische Weg - er kostet nichts und ist exakt.
+    # dispatch() hat ihn ggf. schon probiert und setzt dann skip_mechanical,
+    # damit die Meldungen nicht doppelt erscheinen.
+    if not skip_mechanical and await try_mechanical(send, task, workspace):
+        return
+
+    # Was das Modell nicht wissen kann: dieses Projekt. Nur die relevanten
+    # Stellen, nicht Dokumentation, die es ohnehin kennt.
+    context = ""
+    if workspace is not None:
+        index = await asyncio.to_thread(codeindex.CodeIndex.build, workspace)
+        context = index.context_for(task)
+        if context:
+            await send("status", f"Projektkontext: {len(index.symbols)} Symbol(e) "
+                                 f"aus {len(index.files)} Datei(en) berücksichtigt.")
+
     await send("status", "Plane Architektur …")
-    plan = await ask_fn(plan_prompt(task))
+    plan = await ask_fn(plan_prompt(task, context))
     await send("plan", plan)
 
     await send("status", "Schreibe Code …")
-    code = extract_code(await ask_fn(code_prompt(task, plan)))
+    code = extract_code(await ask_fn(code_prompt(task, plan, context)))
     if not code:
         await send("error", "Das Modell hat keinen Code geliefert.")
         await send("done", "Abgebrochen.", ok=False, exit=-1,
@@ -242,7 +348,15 @@ async def run_agent(send, task, *, ask_fn, run_sandbox, max_attempts=MAX_ATTEMPT
 
         if not failed:
             note = "" if attempt == 1 else f" (nach {attempt} Versuchen)"
-            await send("done", f"Sauber beendet in {elapsed()}s{note}.",
+            commit = ""
+            if workspace is not None:
+                # Erst wenn der Code nachweislich laeuft, landet er im Projekt.
+                workspace.write("main.py", code)
+                sha = await asyncio.to_thread(
+                    workspace.git_commit, f"Agent: {task[:60]}")
+                if sha:
+                    commit = f" Commit {sha}."
+            await send("done", f"Sauber beendet in {elapsed()}s{note}.{commit}",
                        ok=True, exit=0, attempts=attempt, seconds=elapsed())
             return
 
@@ -257,6 +371,55 @@ async def run_agent(send, task, *, ask_fn, run_sandbox, max_attempts=MAX_ATTEMPT
     await send("done", f"Nach {max_attempts} Versuchen nicht lauffaehig "
                        f"(Exit {last_exit}).",
                ok=False, exit=last_exit, attempts=max_attempts, seconds=elapsed())
+
+
+async def dispatch(send, task, *, ask_fn, chat_fn, run_sandbox, workspace=None,
+                   mode=None):
+    """Waehlt den Weg, der zur Aufgabe und zum Modell passt.
+
+    Drei Wege, vom billigsten zum teuersten:
+
+    1. Mechanisch  - Umbenennen, Docstrings, tote Importe. Ueber den
+       Syntaxbaum, in Millisekunden, ohne Modell.
+    2. Werkzeuge   - das Modell arbeitet Schritt fuer Schritt am Projekt.
+       So arbeiten die grossen Agenten, und nur so werden mehrere Dateien
+       und mehrere Runden ueberhaupt moeglich.
+    3. Einmalwurf  - planen, Code schreiben, ausfuehren, reparieren. Der
+       Rueckfallweg fuer Modelle, die keine Werkzeuge koennen.
+    """
+    mode = (mode or AGENT_MODE)
+
+    if await try_mechanical(send, task, workspace):
+        return "mechanical"
+
+    if mode in ("auto", "tools") and workspace is not None:
+        # Nur die Uebersicht als Startpunkt. Den Rest holt sich der Agent
+        # selbst mit read_file - das ist genauer als vorab zu raten, was er
+        # braucht, und haelt den ersten Prompt klein.
+        index = await asyncio.to_thread(codeindex.CodeIndex.build, workspace)
+        context = index.overview()
+
+        toolbox = tools.Toolbox(workspace, run_sandbox=run_sandbox,
+                                index_builder=codeindex.CodeIndex.build)
+        await send("status", f"Werkzeugmodus: bis zu {agentloop.MAX_STEPS} "
+                             "Schritte am Projekt.")
+        outcome = await agentloop.run_tool_agent(
+            send, task, chat_fn=chat_fn, toolbox=toolbox, context=context)
+        if outcome != "no-tools":
+            return outcome
+        if mode == "tools":
+            # Ausdruecklich nur Werkzeuge gewuenscht - dann kein stiller
+            # Wechsel, sondern eine klare Meldung.
+            await send("done", "Das Modell unterstützt keine Werkzeugaufrufe. "
+                               "BRAUNY_AGENT=auto setzen für den Rückfallweg.",
+                       ok=False, exit=-1, attempts=1, seconds=0)
+            return "failed"
+        await send("status", "Modell ohne Werkzeugunterstützung — "
+                             "wechsle auf den einfachen Weg.")
+
+    await run_agent(send, task, ask_fn=ask_fn, run_sandbox=run_sandbox,
+                    workspace=workspace, skip_mechanical=True)
+    return "oneshot"
 
 
 # ------------------------------------------------------------------ Start
@@ -313,18 +476,20 @@ async def icon(name: str):
 
 @app.get("/healthz")
 async def healthz():
-    status = {"model": MODEL, "auth": bool(TOKEN), "version": app.version}
-    try:
-        await asyncio.to_thread(ollama.list)
-        status["ollama"] = "ok"
-    except Exception as exc:
-        status["ollama"] = f"fehler: {exc}"
+    status = {"model": MODEL, "auth": bool(TOKEN), "version": app.version,
+              "modus": AGENT_MODE, "provider": provider.describe()}
+    if WORKSPACE is not None:
+        status["workspace"] = {"pfad": str(WORKSPACE.root),
+                               "dateien": len(WORKSPACE.list_files()),
+                               "historie": WORKSPACE.git_log(3)}
+    model_ok, model_note = await asyncio.to_thread(provider.health)
+    status["modell_backend"] = model_note
     try:
         await asyncio.to_thread(sandbox.client().ping)
         status["docker"] = "ok"
     except Exception as exc:
         status["docker"] = f"fehler: {exc}"
-    healthy = status.get("ollama") == "ok" and status.get("docker") == "ok"
+    healthy = model_ok and status.get("docker") == "ok"
     return JSONResponse(status, status_code=200 if healthy else 503)
 
 
@@ -412,13 +577,14 @@ async def agent(ws: WebSocket):
 
         try:
             log.info("Auftrag von %s: %s", peer, prompt[:120])
-            await send("status", f"Modell {MODEL} — Auftrag angenommen "
-                                 f"(bis zu {MAX_ATTEMPTS} Versuche).")
+            await send("status", f"Modell {MODEL} über {provider.PROVIDER} — "
+                                 "Auftrag angenommen.")
 
             async def run_sandbox(code):
                 return await sandbox_runner(send, code)
 
-            await run_agent(send, prompt, ask_fn=ask, run_sandbox=run_sandbox)
+            await dispatch(send, prompt, ask_fn=ask, chat_fn=model_chat,
+                           run_sandbox=run_sandbox, workspace=WORKSPACE)
         finally:
             run_slots.release()
 

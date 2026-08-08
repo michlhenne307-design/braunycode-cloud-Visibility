@@ -11,6 +11,7 @@ const HIST_MAX = 20;
 const TAGS = {
   status:  'System',
   plan:    'Plan',
+  tool:    'Werkzeug',
   code:    'Code',
   sandbox: 'Sandbox',
   error:   'Fehler',
@@ -105,8 +106,13 @@ async function checkHealth() {
     if (res.ok) {
       setHealth('ok', 'Bereit · ' + data.model);
     } else {
-      const broken = ['ollama', 'docker'].filter(k => data[k] !== 'ok');
-      setHealth('bad', 'Problem: ' + broken.join(', '));
+      // Auf "fehler:" prüfen statt auf "ok": eine konfigurierte API meldet
+      // "konfiguriert (nicht angefragt)" und ist damit nicht kaputt.
+      const labels = { modell_backend: 'Modell', docker: 'Docker' };
+      const broken = Object.keys(labels)
+        .filter(k => String(data[k] || '').startsWith('fehler'))
+        .map(k => labels[k]);
+      setHealth('bad', 'Problem: ' + (broken.join(', ') || 'unbekannt'));
     }
   } catch {
     setHealth('bad', 'Server nicht erreichbar');

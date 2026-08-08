@@ -40,12 +40,39 @@ check("gibt rohen Text zurueck ohne Zaeune",
 check("laesst keine Backticks uebrig",
       "```" not in main.extract_code("```python\nprint(1)\n```"))
 
-print("\n[2] message_content (beide ollama-Client-Formen)")
+print("\n[2] Anbieter liest beide ollama-Client-Formen")
+import provider  # noqa: E402
+
+class FakeFunction:
+    name = "read_file"
+    arguments = '{"path": "main.py"}'
+class FakeCall:
+    function = FakeFunction()
 class AttrResp:
     class message:
         content = "attr-stil"
-check("dict-Zugriff", main.message_content({"message": {"content": "dict-stil"}}) == "dict-stil")
-check("attribut-Zugriff", main.message_content(AttrResp()) == "attr-stil")
+        tool_calls = [FakeCall()]
+
+def fake_ollama_chat(response):
+    """Setzt ollama.chat voruebergehend auf eine feste Antwort."""
+    import ollama
+    orig = ollama.chat
+    ollama.chat = lambda **kw: response
+    try:
+        return provider._chat_ollama([{"role": "user", "content": "x"}], None)
+    finally:
+        ollama.chat = orig
+
+r = fake_ollama_chat({"message": {"content": "dict-stil"}})
+check("dict-Zugriff", r.text == "dict-stil", r)
+check("dict ohne tool_calls", r.tool_calls == [])
+
+r = fake_ollama_chat(AttrResp())
+check("attribut-Zugriff", r.text == "attr-stil", r)
+check("Werkzeugaufruf erkannt", len(r.tool_calls) == 1 and
+      r.tool_calls[0].name == "read_file", r.tool_calls)
+check("JSON-Argumente geparst",
+      r.tool_calls[0].arguments == {"path": "main.py"}, r.tool_calls[0].arguments)
 
 print("\n[3] make_project_dir")
 d = sandbox.make_project_dir({"main.py": "print('x')"})
@@ -96,7 +123,17 @@ check("GET /static/app.css", client.get("/static/app.css").status_code == 200)
 check("GET /static/app.js", client.get("/static/app.js").status_code == 200)
 r = client.get("/healthz")
 check("healthz meldet 503 ohne Backends", r.status_code == 503, r.status_code)
-check("healthz nennt Modell", r.json().get("model") == "qwen2.5-coder:7b")
+health = r.json()
+check("healthz nennt Modell", health.get("model") == "qwen2.5-coder:7b")
+check("healthz nennt den Anbieter", health.get("provider", {}).get("anbieter") == "ollama")
+check("healthz nennt den Modus", health.get("modus") in ("auto", "tools", "oneshot"))
+check("healthz verrät keinen Schlüssel", "api_key" not in r.text.lower())
+# Die Oberfaeche liest genau diese Schluessel - Umbenennen ohne Nachziehen
+# haette die Statusanzeige stumm kaputtgemacht.
+_js = (main.STATIC_DIR / "app.js").read_text()
+for key in ("modell_backend", "docker"):
+    check(f"healthz liefert '{key}', wie die Oberfläche es erwartet",
+          key in health and key in _js, (key in health, key in _js))
 
 print("\n[6] PWA")
 r = client.get("/manifest.json")
@@ -462,6 +499,637 @@ check("Manifest hat start_url und scope",
 html = (main.STATIC_DIR / "index.html").read_text()
 check("index.html traegt sowohl Apple- als auch Standard-Metatag",
       'apple-mobile-web-app-capable' in html and 'name="mobile-web-app-capable"' in html)
+
+print("\n[17] Deterministische Umbauten (refactor)")
+import refactor  # noqa: E402
+import tempfile  # noqa: E402
+import workspace as ws_mod  # noqa: E402
+
+SRC = '''import os
+import json
+
+# Kommentar
+def calculate_total(items):
+    return sum(items)
+
+data = {"calculate_total": "string"}
+obj.calculate_total()
+f(calculate_total=1)
+print(calculate_total([1]), json.dumps(data))
+'''
+
+res = refactor.rename_symbol(SRC, "calculate_total", "sum_items")
+check("rename ändert Definition und Aufruf", res.changed and "def sum_items" in res.code)
+check("rename lässt Strings in Ruhe", '"calculate_total"' in res.code)
+check("rename lässt Attribute in Ruhe", "obj.calculate_total()" in res.code)
+check("rename lässt Schlüsselwort-Argumente in Ruhe", "f(calculate_total=1)" in res.code)
+check("rename zählt korrekt", "2 Vorkommen" in res.summary, res.summary)
+check("rename erhält Kommentare", "# Kommentar" in res.code)
+check("rename meldet, wenn nichts passt",
+      not refactor.rename_symbol(SRC, "gibtsnicht", "x").changed)
+
+res = refactor.add_docstrings(SRC)
+check("docstrings werden ergänzt", res.changed and '"""Calculate total."""' in res.code)
+check("docstrings nicht doppelt", not refactor.add_docstrings(res.code).changed)
+check("einzeiliges def wird ausgelassen",
+      not refactor.add_docstrings("def f(): pass\n").changed)
+
+res = refactor.remove_unused_imports(SRC)
+check("toter Import entfernt", "import os" not in res.code, res.code[:40])
+check("genutzter Import bleibt", "import json" in res.code)
+check("Stern-Import wird nicht angefasst",
+      not refactor.remove_unused_imports("from x import *\n").changed)
+check("__all__ wird nicht angefasst",
+      not refactor.remove_unused_imports('import os\n__all__ = ["a"]\n').changed)
+
+check("kaputter Quelltext wird gemeldet",
+      "nicht parsebar" in refactor.apply(
+          refactor.MechanicalTask("docstrings"), "def f(:\n").summary)
+
+for text, kind in [("benenne foo in bar um", "rename"),
+                   ("rename alpha to beta", "rename"),
+                   ("füge Docstrings hinzu", "docstrings"),
+                   ("entferne ungenutzte Imports", "unused_imports"),
+                   ("remove unused imports", "unused_imports")]:
+    task = refactor.classify(text)
+    check(f"classify: {text!r} -> {kind}", task and task.kind == kind, task)
+for text in ["baue mir eine Todo-App", "benenne foo in foo um", "", "   "]:
+    check(f"classify: {text!r} -> kein Schnellweg", refactor.classify(text) is None)
+
+print("\n[18] Projektverzeichnis (workspace)")
+ws = ws_mod.Workspace(tempfile.mkdtemp())
+ws.write("src/main.py", "print(1)\n")
+check("schreibt und liest", ws.read("src/main.py") == "print(1)\n")
+check("listet Dateien", ws.list_files() == ["src/main.py"], ws.list_files())
+check("exists", ws.exists("src/main.py") and not ws.exists("weg.py"))
+
+for bad in ["../../etc/passwd", "/etc/passwd", "src/../../../tmp/x", "", "   "]:
+    try:
+        ws.resolve(bad)
+        check(f"blockiert {bad!r}", False, "durchgelassen")
+    except ws_mod.WorkspaceError:
+        check(f"blockiert {bad!r}", True)
+
+outside = tempfile.mkdtemp()
+open(os.path.join(outside, "secret.txt"), "w").write("geheim")
+os.symlink(outside, os.path.join(ws.root, "link"))
+try:
+    ws.read("link/secret.txt")
+    check("Symlink nach draußen blockiert", False, "durchgelassen")
+except ws_mod.WorkspaceError:
+    check("Symlink nach draußen blockiert", True)
+
+check("git init", ws.git_ready())
+sha = ws.git_commit("Erster Stand")
+check("erster Commit", bool(sha), sha)
+ws.write("src/main.py", "print(2)\n")
+check("zweiter Commit", bool(ws.git_commit("Änderung")))
+check("kein Leer-Commit", ws.git_commit("nichts") is None)
+check("Historie lesbar", len(ws.git_log()) == 2, ws.git_log())
+
+print("\n[19] Mechanischer Schnellweg im Agenten")
+
+def drive_mech(intent, files, replies=None, runs=None):
+    """Laesst run_agent auf einem echten Projektverzeichnis laufen."""
+    w = ws_mod.Workspace(tempfile.mkdtemp())
+    for name, body in files.items():
+        w.write(name, body)
+    w.git_commit("Start")
+    events = []
+    reply_iter = iter(replies or [])
+    run_iter = iter(runs or [])
+    calls = {"ask": 0, "sandbox": 0}
+
+    async def send(t, text="", **extra):
+        events.append({"type": t, "text": text, **extra})
+
+    async def ask_fn(_p):
+        calls["ask"] += 1
+        return next(reply_iter)
+
+    async def run_sandbox(code):
+        calls["sandbox"] += 1
+        return next(run_iter)
+
+    asyncio.run(main.run_agent(send, intent, ask_fn=ask_fn,
+                               run_sandbox=run_sandbox, workspace=w))
+    return events, calls, w
+
+events, calls, w = drive_mech("benenne calculate_total in sum_items um",
+                              {"main.py": SRC})
+done = next(e for e in events if e["type"] == "done")
+check("Schnellweg meldet Erfolg", done["ok"] is True and done.get("mechanical") is True, done)
+check("Schnellweg ruft KEIN Modell", calls["ask"] == 0, calls)
+check("Schnellweg startet KEINE Sandbox", calls["sandbox"] == 0, calls)
+check("Datei im Projekt geändert", "def sum_items" in w.read("main.py"))
+check("Änderung wurde committet", len(w.git_log()) == 2, w.git_log())
+
+events, calls, w = drive_mech("entferne ungenutzte Imports", {"main.py": SRC})
+check("Importe deterministisch entfernt", "import os" not in w.read("main.py"))
+check("dabei kein Modellaufruf", calls["ask"] == 0)
+
+# Kreativer Auftrag: Schnellweg darf NICHT greifen
+events, calls, w = drive_mech("baue eine Todo-Liste", {"main.py": SRC},
+                              replies=["PLAN", "```python\nprint('ok')\n```"],
+                              runs=[(0, "ok")])
+check("kreativer Auftrag geht ans Modell", calls["ask"] == 2, calls)
+check("kreativer Auftrag nutzt die Sandbox", calls["sandbox"] == 1, calls)
+check("gelungener Code landet im Projekt", "print('ok')" in w.read("main.py"))
+
+# Mehrere .py-Dateien: keine eindeutige Zieldatei -> normaler Weg
+events, calls, w = drive_mech("benenne a in b um",
+                              {"x.py": "a = 1\n", "y.py": "a = 2\n"},
+                              replies=["PLAN", "```python\nprint('ok')\n```"],
+                              runs=[(0, "ok")])
+check("mehrdeutiges Ziel -> Modellweg", calls["ask"] == 2, calls)
+check("Hinweis auf Mehrdeutigkeit",
+      any("eindeutige Zieldatei" in e["text"] for e in events if e["type"] == "status"))
+
+check("ohne Projektverzeichnis kein Schnellweg",
+      asyncio.run(main.try_mechanical(lambda *a, **k: None, "benenne a in b um", None))
+      is False)
+
+print("\n[20] Projekt-Index und Call-Graph")
+import codeindex  # noqa: E402
+
+iws = ws_mod.Workspace(tempfile.mkdtemp())
+iws.write("cart.py", '''
+class Cart:
+    """Ein Warenkorb."""
+    def add(self, item, qty=1):
+        """Legt einen Artikel hinein."""
+        return calculate_total(self.items)
+
+    def clear(self):
+        self.items = []
+
+def calculate_total(items):
+    """Berechnet die Gesamtsumme."""
+    return sum(items)
+''')
+iws.write("checkout.py", '''
+from cart import calculate_total
+
+def checkout(cart):
+    """Schliesst den Kauf ab."""
+    return apply_discount(calculate_total(cart.items))
+
+def apply_discount(total):
+    return total * 0.9
+''')
+iws.write("kaputt.py", "def f(:\n  pass\n")
+
+idx = codeindex.CodeIndex.build(iws)
+check("indiziert nur lesbare Dateien", idx.files == ["cart.py", "checkout.py"], idx.files)
+check("kaputte Datei wird übersprungen, nicht geworfen",
+      idx.skipped and idx.skipped[0][0] == "kaputt.py", idx.skipped)
+check("findet alle Symbole", len(idx.symbols) == 6, len(idx.symbols))
+
+names = {s.qualname for s in idx.symbols}
+check("Methoden mit Klassenpräfix", "Cart.add" in names, sorted(names))
+check("Modulfunktionen ohne Präfix", "calculate_total" in names)
+
+sym = idx.find("Cart.add")[0]
+check("Signatur erfasst", sym.signature == "add(self, item, qty=1)", sym.signature)
+check("Docstring-Zeile erfasst", sym.doc == "Legt einen Artikel hinein.", sym.doc)
+
+callers = {s.qualname for s in idx.callers("calculate_total")}
+check("Call-Graph findet beide Aufrufer",
+      callers == {"Cart.add", "checkout"}, callers)
+check("Klasse zählt NICHT als Aufrufer ihrer Methoden",
+      "Cart" not in callers, callers)
+
+impact = {s.qualname for s in idx.impact("calculate_total")}
+check("impact nennt betroffene Aufrufer", impact == {"Cart.add", "checkout"}, impact)
+check("callees kennt aufgerufene Symbole",
+      "calculate_total" in idx.callees("checkout"), idx.callees("checkout"))
+
+rel = [s.qualname for s in idx.relevant("ändere apply_discount im checkout")]
+check("Relevanz findet passende Symbole",
+      "apply_discount" in rel, rel)
+check("Relevanz bei leerer Aufgabe leer", idx.relevant("") == [])
+
+ov = idx.overview()
+check("Übersicht nennt Dateien und Symbole", "cart.py" in ov and "Cart.add" not in ov.split("checkout.py")[0].split("cart.py")[0], ov[:60])
+check("Übersicht enthält Signaturen", "add(self, item, qty=1)" in ov)
+
+ctx = idx.context_for("benenne calculate_total um")
+check("Kontext enthält Übersicht", "Projekt:" in ctx)
+check("Kontext enthält Quelltext der Fundstelle", "def calculate_total(items)" in ctx)
+check("Kontext nennt Aufrufer", "Aufrufer:" in ctx, ctx[-200:])
+check("Kontext bleibt kompakt (< 4000 Zeichen)", len(ctx) < 4000, len(ctx))
+
+check("leerer Index liefert leeren Kontext",
+      codeindex.CodeIndex().context_for("egal") == "")
+
+print("\n[21] Index im Agenten")
+
+events, calls, w = drive_mech(
+    "baue eine Rabattfunktion",
+    {"main.py": "def bestehende_funktion(x):\n    return x\n"},
+    replies=["PLAN", "```python\nprint('ok')\n```"], runs=[(0, "ok")])
+check("Agent meldet berücksichtigten Projektkontext",
+      any("Projektkontext" in e["text"] for e in events if e["type"] == "status"),
+      [e["text"] for e in events if e["type"] == "status"])
+
+# Rename in main.py, aber ein anderer Modulteil nutzt den Namen weiter
+events, calls, w = drive_mech(
+    "benenne alt_name in neu_name um",
+    {"main.py": "def alt_name(x):\n    return x\n",
+     "andere.py": "from main import alt_name\n\ndef nutzer():\n    return alt_name(1)\n"})
+check("Rename greift trotz zweiter Datei (main.py ist eindeutig)",
+      "def neu_name" in w.read("main.py"))
+check("warnt vor Aufrufern in anderen Dateien",
+      any("ACHTUNG" in e["text"] for e in events if e["type"] == "error"),
+      [e["text"] for e in events if e["type"] == "error"])
+check("Warnung nennt die betroffene Datei",
+      any("andere.py" in e["text"] for e in events if e["type"] == "error"))
+
+events, calls, w = drive_mech(
+    "benenne alt_name in neu_name um",
+    {"main.py": "def alt_name(x):\n    return alt_name(x)\n"})
+check("keine Warnung ohne fremde Aufrufer",
+      not any("ACHTUNG" in e["text"] for e in events if e["type"] == "error"),
+      [e["text"] for e in events if e["type"] == "error"])
+
+print("\n[22] Werkzeugkasten")
+import tools  # noqa: E402
+
+sch = tools.schema()
+check("sieben Werkzeuge", len(sch) == 7, len(sch))
+check("OpenAI-Format", all(t["type"] == "function" and "name" in t["function"]
+                          and "parameters" in t["function"] for t in sch))
+check("Pflichtfelder deklariert",
+      {t["function"]["name"]: t["function"]["parameters"]["required"]
+       for t in sch}["write_file"] == ["path", "content"])
+
+tws = ws_mod.Workspace(tempfile.mkdtemp())
+tws.write("main.py", "def gruss():\n    return 'hallo'\n")
+tws.write("hilfe.py", "WERT = 42\n")
+
+sandbox_calls = []
+async def fake_sandbox(code):
+    sandbox_calls.append(code)
+    return (0, "hallo")
+
+box = tools.Toolbox(tws, run_sandbox=fake_sandbox,
+                    index_builder=codeindex.CodeIndex.build)
+
+def call(name, **args):
+    return asyncio.run(box.call(name, args))
+
+check("list_files nennt beide Dateien",
+      set(call("list_files").split()) == {"hilfe.py", "main.py"}, call("list_files"))
+check("read_file mit Zeilennummern", call("read_file", path="hilfe.py").strip()
+      .startswith("1 | WERT = 42"), call("read_file", path="hilfe.py"))
+check("write_file schreibt", "Geschrieben" in call("write_file", path="neu.py",
+                                                   content="X = 1\n"))
+check("write_file merkt sich die Datei", "neu.py" in box.written, box.written)
+check("Datei liegt wirklich im Projekt", tws.read("neu.py") == "X = 1\n")
+check("write_file ohne content meldet Fehler",
+      call("write_file", path="a.py").startswith("FEHLER"))
+
+check("fehlende Datei -> Fehlertext statt Absturz",
+      call("read_file", path="gibtsnicht.py").startswith("FEHLER"),
+      call("read_file", path="gibtsnicht.py"))
+check("Pfadausbruch blockiert",
+      call("read_file", path="../../etc/passwd").startswith("FEHLER"))
+check("absoluter Pfad blockiert",
+      call("write_file", path="/etc/passwd", content="x").startswith("FEHLER"))
+check("unbekanntes Werkzeug -> Fehlertext",
+      call("nicht_vorhanden").startswith("FEHLER: Unbekanntes Werkzeug"))
+
+check("search findet Treffer", "main.py:1" in call("search", query="gruss"),
+      call("search", query="gruss"))
+check("search ohne Treffer meldet das",
+      "Keine Treffer" in call("search", query="zzz-gibt-es-nicht"))
+check("search ohne query meldet Fehler", call("search").startswith("FEHLER"))
+check("outline nennt Symbole", "gruss" in call("outline"), call("outline"))
+check("outline ohne Index",
+      asyncio.run(tools.Toolbox(tws).call("outline", {})) == "Kein Index verfügbar.")
+
+out = call("run_python", path="main.py")
+check("run_python nutzt die Sandbox", len(sandbox_calls) == 1, sandbox_calls)
+check("run_python meldet Erfolg", out.startswith("Lauf erfolgreich"), out)
+check("run_python ohne Sandbox meldet Fehler",
+      asyncio.run(tools.Toolbox(tws).call("run_python", {"path": "main.py"}))
+      .startswith("FEHLER"))
+
+check("finish setzt die Zusammenfassung",
+      call("finish", summary="alles gut") == "alles gut" and box.finished == "alles gut")
+
+lang = tools.Toolbox(tws)
+tws.write("gross.py", "x = 1\n" * 4000)
+check("langes Ergebnis wird gekürzt",
+      len(asyncio.run(lang.call("read_file", {"path": "gross.py"})))
+      < tools.MAX_OUTPUT + 200)
+
+check("format_result ohne ID",
+      "tool_call_id" not in tools.format_result("read_file", "text"))
+check("format_result mit ID",
+      tools.format_result("read_file", "text", "c1")["tool_call_id"] == "c1")
+
+check("Notnagel liest JSON-Aufruf",
+      tools.parse_fallback_call('Ich mache: {"tool": "read_file", '
+                                '"arguments": {"path": "main.py"}}')
+      == ("read_file", {"path": "main.py"}))
+check("Notnagel akzeptiert 'args'",
+      tools.parse_fallback_call('{"tool": "list_files", "args": {}}')
+      == ("list_files", {}))
+check("Notnagel lehnt unbekanntes Werkzeug ab",
+      tools.parse_fallback_call('{"tool": "rm_rf", "arguments": {}}') is None)
+check("Notnagel bei Fliesstext", tools.parse_fallback_call("nur Text") is None)
+check("Notnagel bei kaputtem JSON",
+      tools.parse_fallback_call('{"tool": "read_file", }') is None)
+
+print("\n[23] Agentenschleife")
+import agentloop  # noqa: E402
+
+def reply(text="", calls=()):
+    return provider.Reply(text=text, tool_calls=[
+        provider.ToolCall(name=n, arguments=a) for n, a in calls])
+
+def drive_loop(script, files=None, sandbox_result=(0, "ok"), max_steps=12):
+    """Laesst die Werkzeugschleife mit gescripteten Modellantworten laufen."""
+    w = ws_mod.Workspace(tempfile.mkdtemp())
+    for name, body in (files or {"main.py": "print('alt')\n"}).items():
+        w.write(name, body)
+    w.git_commit("Start")
+    events, seen = [], []
+
+    async def send(t, text="", **extra):
+        events.append({"type": t, "text": text, **extra})
+
+    async def run_sandbox(_code):
+        return sandbox_result
+
+    steps = iter(script)
+    async def chat_fn(messages, schema):
+        seen.append(list(messages))
+        try:
+            return next(steps)
+        except StopIteration:
+            return reply("keine Antwort mehr")
+
+    box = tools.Toolbox(w, run_sandbox=run_sandbox,
+                        index_builder=codeindex.CodeIndex.build)
+    outcome = asyncio.run(agentloop.run_tool_agent(
+        send, "aufgabe", chat_fn=chat_fn, toolbox=box, max_steps=max_steps))
+    return outcome, events, w, seen
+
+GUT = "```\n```"  # nur Platzhalter, write_file bekommt echten Inhalt
+
+outcome, events, w, seen = drive_loop([
+    reply(calls=[("list_files", {})]),
+    reply(calls=[("read_file", {"path": "main.py"})]),
+    reply(calls=[("write_file", {"path": "main.py", "content": "print('neu')\n"})]),
+    reply(calls=[("run_python", {"path": "main.py"})]),
+    reply(calls=[("finish", {"summary": "Datei ersetzt und ausgeführt."})]),
+])
+types = [e["type"] for e in events]
+check("Schleife meldet Erfolg", outcome == "ok", outcome)
+check("jeder Werkzeugaufruf wird gemeldet", types.count("tool") == 5, types)
+check("Werkzeugmeldung nennt Argumente",
+      any("path=main.py" in e["text"] for e in events if e["type"] == "tool"))
+check("geschriebene Datei erscheint im Code-Reiter",
+      any(e["type"] == "code" and "print('neu')" in e["text"] for e in events))
+check("Sandbox-Ausgabe erscheint",
+      any(e["type"] == "sandbox" for e in events), types)
+check("Datei wurde wirklich geändert", w.read("main.py") == "print('neu')\n")
+check("Änderung wurde committet", len(w.git_log()) == 2, w.git_log())
+done = next(e for e in events if e["type"] == "done")
+check("done trägt die Zusammenfassung", "Datei ersetzt" in done["text"], done)
+check("done ist als ausgeführt markiert", done.get("verified") is True, done)
+check("genau ein done", types.count("done") == 1, types)
+check("Verlauf enthält Werkzeugergebnisse",
+      any(m.get("role") == "tool" for m in seen[-1]), seen[-1][-3:])
+check("Verlauf beginnt mit Systemanweisung", seen[0][0]["role"] == "system")
+
+# Aufruf und Ergebnis muessen im Verlauf zusammenpassen
+verlauf = seen[-1]
+paare = [(verlauf[i], verlauf[i + 1]) for i in range(len(verlauf) - 1)
+         if verlauf[i + 1].get("role") == "tool"]
+check("jedes Ergebnis folgt auf seinen Aufruf",
+      all(a.get("role") == "assistant" and
+          a["tool_calls"][0]["id"] == t["tool_call_id"] for a, t in paare),
+      paare[:1])
+
+# finish ohne Ausfuehrung: das muss ausdruecklich dazugesagt werden
+outcome, events, w, _ = drive_loop([
+    reply(calls=[("write_file", {"path": "main.py", "content": "print(1)\n"})]),
+    reply(calls=[("finish", {"summary": "Fertig."})]),
+])
+done = next(e for e in events if e["type"] == "done")
+check("ohne Ausführung nicht als geprüft markiert", done.get("verified") is False, done)
+check("Hinweis auf fehlende Ausführung",
+      any("nicht ausgeführt" in e["text"] for e in events if e["type"] == "error"),
+      [e["text"] for e in events if e["type"] == "error"])
+
+# Schrittgrenze
+outcome, events, w, _ = drive_loop(
+    [reply(calls=[("list_files", {})]) for _ in range(10)], max_steps=3)
+done = next(e for e in events if e["type"] == "done")
+check("Schrittgrenze beendet die Schleife", outcome == "failed", outcome)
+check("Schrittgrenze wird benannt", "Schrittgrenze" in done["text"], done["text"])
+check("Schrittgrenze meldet Misserfolg", done["ok"] is False)
+
+# Wiederholungsbremse
+outcome, events, w, seen = drive_loop(
+    [reply(calls=[("list_files", {})]) for _ in range(6)], max_steps=6)
+check("Stupser nach mehrfach gleichem Aufruf",
+      any(m.get("role") == "user" and "denselben Argumenten" in m.get("content", "")
+          for m in seen[-1]), [m for m in seen[-1] if m.get("role") == "user"])
+
+# Unbekanntes Werkzeug bricht nicht ab
+outcome, events, w, _ = drive_loop([
+    reply(calls=[("gibt_es_nicht", {})]),
+    reply(calls=[("finish", {"summary": "trotzdem fertig"})]),
+])
+check("unbekanntes Werkzeug bricht nicht ab", outcome == "ok", outcome)
+check("Fehler wird gemeldet",
+      any("Unbekanntes Werkzeug" in e["text"] for e in events if e["type"] == "error"))
+
+# Modell ohne Werkzeugunterstuetzung
+outcome, events, w, _ = drive_loop([reply("Ich wuerde folgendes tun: ...")])
+check("Modell ohne Werkzeuge wird erkannt", outcome == "no-tools", outcome)
+check("dabei KEIN done gesendet",
+      not any(e["type"] == "done" for e in events),
+      [e["type"] for e in events])
+
+# Erst reden, dann doch ein Werkzeug: der Stupser wirkt
+outcome, events, w, seen = drive_loop([
+    reply(calls=[("list_files", {})]),
+    reply("Ich denke nach."),
+    reply(calls=[("finish", {"summary": "doch noch"})]),
+])
+check("Stupser holt das Modell zurück", outcome == "ok", outcome)
+check("Stupser steht im Verlauf",
+      any(agentloop.NUDGE == m.get("content") for m in seen[-1]))
+
+# Zweimal hintereinander nur Text -> Abbruch
+outcome, events, w, _ = drive_loop([
+    reply(calls=[("list_files", {})]),
+    reply("Text eins."),
+    reply("Text zwei."),
+])
+check("zweimal nur Text beendet den Lauf", outcome == "failed", outcome)
+check("Abbruch nennt den Modelltext",
+      "Text zwei" in next(e for e in events if e["type"] == "done")["text"])
+
+# Notnagel: JSON statt echtem Werkzeugaufruf
+outcome, events, w, _ = drive_loop([
+    reply('{"tool": "write_file", "arguments": {"path": "main.py", '
+          '"content": "print(7)\\n"}}'),
+    reply(calls=[("finish", {"summary": "über JSON geschrieben"})]),
+])
+check("JSON-Aufruf wird ausgeführt", w.read("main.py") == "print(7)\n", w.read("main.py"))
+check("JSON-Weg endet sauber", outcome == "ok", outcome)
+
+# Modellfehler beendet sauber statt die Verbindung zu sprengen
+def boom_loop():
+    w = ws_mod.Workspace(tempfile.mkdtemp())
+    events = []
+    async def send(t, text="", **extra):
+        events.append({"type": t, "text": text, **extra})
+    async def chat_fn(_m, _s):
+        raise RuntimeError("Modell weg")
+    box = tools.Toolbox(w)
+    outcome = asyncio.run(agentloop.run_tool_agent(
+        send, "aufgabe", chat_fn=chat_fn, toolbox=box))
+    return outcome, events
+
+outcome, events = boom_loop()
+check("Modellfehler wird gefangen", outcome == "failed", outcome)
+check("Modellfehler meldet done",
+      any(e["type"] == "done" and e["ok"] is False for e in events))
+check("Modellfehler nennt die Ursache",
+      any("Modell weg" in e["text"] for e in events if e["type"] == "error"))
+
+# Verlaufskuerzung darf Aufruf und Ergebnis nicht trennen
+lang_verlauf = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
+for i in range(20):
+    lang_verlauf.append({"role": "assistant", "content": "",
+                         "tool_calls": [{"id": f"c{i}"}]})
+    lang_verlauf.append({"role": "tool", "name": "x", "tool_call_id": f"c{i}"})
+kurz = agentloop.trim(lang_verlauf, limit=10)
+check("Kürzung hält die Grenze ein", len(kurz) <= 12, len(kurz))
+check("Systemanweisung bleibt", kurz[0]["role"] == "system" and kurz[1]["role"] == "user")
+check("kein verwaistes Werkzeugergebnis", kurz[2]["role"] == "assistant", kurz[2])
+check("kurzer Verlauf bleibt unverändert",
+      agentloop.trim(lang_verlauf[:6], limit=10) == lang_verlauf[:6])
+
+print("\n[24] Anbieter und Wegwahl")
+
+def describe_with_key():
+    orig = provider.API_KEY
+    provider.API_KEY = "sk-darf-nicht-auftauchen"
+    try:
+        return str(provider.describe())
+    finally:
+        provider.API_KEY = orig
+
+beschreibung = describe_with_key()
+check("describe meldet nur, DASS ein Schlüssel gesetzt ist",
+      "'schluessel_gesetzt': True" in beschreibung, beschreibung)
+check("describe verrät den Schlüssel nicht",
+      "sk-darf-nicht-auftauchen" not in beschreibung, beschreibung)
+check("health kennt den Anbieter", isinstance(provider.health(), tuple))
+
+# API-Fehler darf den Schluessel nicht in die Meldung nehmen
+def api_error_message():
+    import httpx
+    orig_provider, orig_base, orig_key = provider.PROVIDER, provider.API_BASE, provider.API_KEY
+    provider.PROVIDER, provider.API_BASE = "openai", "https://example.invalid/v1"
+    provider.API_KEY = "sk-streng-geheim-4711"
+    orig_client = httpx.Client
+
+    class FakeResponse:
+        status_code = 401
+        text = "Unauthorized"
+    class FakeClient:
+        def __init__(self, **_): pass
+        def __enter__(self): return self
+        def __exit__(self, *_): return False
+        def post(self, *_a, **_kw): return FakeResponse()
+
+    httpx.Client = FakeClient
+    try:
+        provider.chat([{"role": "user", "content": "x"}])
+        return "kein Fehler"
+    except provider.ProviderError as exc:
+        return str(exc)
+    finally:
+        httpx.Client = orig_client
+        provider.PROVIDER, provider.API_BASE, provider.API_KEY = \
+            orig_provider, orig_base, orig_key
+
+msg = api_error_message()
+check("API-Fehler nennt den Status", "401" in msg, msg)
+check("API-Fehler enthält NICHT den Schlüssel", "sk-streng-geheim" not in msg, msg)
+
+def drive_dispatch(intent, script, mode, files=None):
+    """Laesst dispatch() laufen und zaehlt, welcher Weg genommen wurde."""
+    w = ws_mod.Workspace(tempfile.mkdtemp())
+    for name, body in (files or {"main.py": SRC}).items():
+        w.write(name, body)
+    w.git_commit("Start")
+    events = []
+    counts = {"ask": 0, "chat": 0, "sandbox": 0}
+
+    async def send(t, text="", **extra):
+        events.append({"type": t, "text": text, **extra})
+
+    async def ask_fn(_p):
+        counts["ask"] += 1
+        return "```python\nprint('einmalwurf')\n```"
+
+    steps = iter(script)
+    async def chat_fn(_m, _s):
+        counts["chat"] += 1
+        return next(steps, reply("nichts mehr"))
+
+    async def run_sandbox(_c):
+        counts["sandbox"] += 1
+        return (0, "ok")
+
+    outcome = asyncio.run(main.dispatch(send, intent, ask_fn=ask_fn, chat_fn=chat_fn,
+                                        run_sandbox=run_sandbox, workspace=w, mode=mode))
+    return outcome, events, counts, w
+
+outcome, events, counts, w = drive_dispatch(
+    "benenne calculate_total in sum_items um", [], "auto")
+check("mechanischer Weg schlägt alles", outcome == "mechanical", outcome)
+check("mechanisch ohne Modellaufruf", counts["chat"] == 0 and counts["ask"] == 0, counts)
+
+outcome, events, counts, w = drive_dispatch("baue etwas Neues", [
+    reply(calls=[("write_file", {"path": "neu.py", "content": "print('x')\n"})]),
+    reply(calls=[("finish", {"summary": "gebaut"})]),
+], "auto")
+check("kreativer Auftrag geht in die Werkzeugschleife", outcome == "ok", outcome)
+check("dabei kein Einmalwurf", counts["ask"] == 0, counts)
+check("Werkzeugschleife hat geschrieben", w.exists("neu.py"))
+
+outcome, events, counts, w = drive_dispatch(
+    "baue etwas Neues", [reply("nur Text")], "auto")
+check("ohne Werkzeuge fällt auto auf den Einmalwurf zurück",
+      outcome == "oneshot", outcome)
+check("Einmalwurf nutzt ask_fn", counts["ask"] >= 2, counts)
+check("Wechsel wird gemeldet",
+      any("einfachen Weg" in e["text"] for e in events if e["type"] == "status"))
+check("genau ein done trotz Wegwechsel",
+      [e["type"] for e in events].count("done") == 1,
+      [e["type"] for e in events])
+
+outcome, events, counts, w = drive_dispatch(
+    "baue etwas Neues", [reply("nur Text")], "tools")
+check("Modus 'tools' wechselt NICHT", outcome == "failed", outcome)
+check("Modus 'tools' erklärt den Ausweg",
+      any("BRAUNY_AGENT=auto" in e["text"] for e in events if e["type"] == "done"))
+
+outcome, events, counts, w = drive_dispatch(
+    "baue etwas Neues", [reply(calls=[("finish", {"summary": "x"})])], "oneshot")
+check("Modus 'oneshot' ruft die Werkzeugschleife nicht auf",
+      outcome == "oneshot" and counts["chat"] == 0, (outcome, counts))
 
 print(f"\n=== {ok} bestanden, {fail} fehlgeschlagen ===")
 sys.exit(1 if fail else 0)

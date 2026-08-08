@@ -106,6 +106,24 @@ BRAUNY_SANDBOX_TIMEOUT=60
 BRAUNY_MAX_ATTEMPTS=3
 BRAUNY_MAX_CONCURRENT=2
 BRAUNY_ASK_TIMEOUT=300
+BRAUNY_WORKSPACE=$BRAUNY_HOME/workspace
+
+# Arbeitsweise: auto = Werkzeugschleife mit Rueckfall auf den einfachen Weg,
+# tools = nur Werkzeuge, oneshot = nur planen/schreiben/ausfuehren.
+BRAUNY_AGENT=auto
+BRAUNY_MAX_STEPS=12
+
+# Modellquelle. ollama = lokal und kostenlos.
+# Fuer ein staerkeres Modell ueber eine OpenAI-kompatible API:
+#   BRAUNY_PROVIDER=openai
+#   BRAUNY_API_BASE=https://<anbieter>/v1
+#   BRAUNY_API_KEY=<schluessel>
+#   BRAUNY_MODEL=<modellname des anbieters>
+# Diese Datei hat Rechte 600 - der Schluessel bleibt lokal. Nach Aenderungen:
+#   sudo systemctl restart braunycode
+BRAUNY_PROVIDER=ollama
+BRAUNY_API_BASE=
+BRAUNY_API_KEY=
 EOF
 fi
 chmod 600 "$ENV_FILE"
@@ -166,6 +184,7 @@ cat <<EOF
   Adresse   http://$IP:$BRAUNY_PORT
   Token     $BRAUNY_TOKEN
   Modell    $BRAUNY_MODEL
+  Projekt   $BRAUNY_HOME/workspace
 
   NOCH ZU TUN in der Oracle Console:
     Networking > Virtual Cloud Networks > dein VCN

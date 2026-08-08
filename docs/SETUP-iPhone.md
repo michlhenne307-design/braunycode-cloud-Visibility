@@ -169,7 +169,7 @@ gespeichert.
 | „Versuch 2/3“ erscheint | Normal — der Agent hat einen Fehler erkannt und repariert den Code selbst. |
 | Antworten sehr langsam | Normal. Ohne GPU rechnet das Modell auf der CPU, ein Lauf dauert Minuten. |
 | `externally-managed-environment` | Es wurde `pip3 install` ohne venv benutzt. Der Installer macht das richtig — nutze ihn statt manueller Installation. |
-| Statuspunkt oben ist rot | `curl -s localhost:8000/healthz` nennt Ollama bzw. Docker im Klartext. |
+| Statuspunkt oben ist rot | `curl -s localhost:8000/healthz` nennt unter `modell_backend` bzw. `docker` die Ursache im Klartext. |
 | Kopieren-Knopf tut nichts | Braucht HTTPS — gilt in jedem Browser. Über den SSH-Tunnel (`http://localhost:8000`) geht es, weil localhost als sicher zählt. |
 | App-Icon fehlt nach dem Hinzufügen | Seite neu laden und erneut hinzufügen; der Browser holt das Manifest sonst aus dem Cache. |
 | „Server ausgelastet" | Es laufen schon 2 Aufträge. Kurz warten — schützt die Maschine vor Überlastung. |
