@@ -8,6 +8,9 @@ import tempfile
 
 import docker
 
+LABEL_KEY = "brauny.sandbox"
+LABEL_VALUE = "1"
+
 IMAGE = os.environ.get("BRAUNY_SANDBOX_IMAGE", "python:3.11-slim")
 MEM_LIMIT = os.environ.get("BRAUNY_SANDBOX_MEM", "512m")
 CPUS = float(os.environ.get("BRAUNY_SANDBOX_CPUS", "1.0"))
@@ -62,7 +65,28 @@ def start(project_dir: str, command=None):
         security_opt=["no-new-privileges:true"],
         tmpfs={"/tmp": "rw,size=64m"},
         environment={"HOME": "/tmp", "PYTHONDONTWRITEBYTECODE": "1"},
+        # Label, damit verwaiste Container nach einem Absturz wiederfindbar sind
+        labels={LABEL_KEY: LABEL_VALUE},
     )
+
+
+def reap_orphans() -> int:
+    """Entfernt Container aus frueheren Laeufen.
+
+    Stirbt der Dienst mitten in einem Lauf, bleibt sein Container liegen und
+    haelt Speicher belegt. Beim Start wird deshalb alles mit unserem Label
+    weggeraeumt. Gibt die Anzahl entfernter Container zurueck.
+    """
+    removed = 0
+    for container in client().containers.list(
+        all=True, filters={"label": f"{LABEL_KEY}={LABEL_VALUE}"}
+    ):
+        try:
+            container.remove(force=True)
+            removed += 1
+        except Exception:
+            pass
+    return removed
 
 
 async def stream_logs(container, timeout: int = TIMEOUT):

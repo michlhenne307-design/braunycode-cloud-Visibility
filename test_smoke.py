@@ -294,5 +294,146 @@ sandbox_events = [e for e in events if e["type"] == "sandbox"]
 check("Syntaxfehler taucht in der Ausgabe auf",
       any("SyntaxError" in e["text"] for e in sandbox_events), sandbox_events)
 
+print("\n[11] Auth-Bremse gegen Token-Raten")
+main._auth_fails.clear()
+check("frische Adresse ist nicht gesperrt", not main.auth_blocked("1.2.3.4"))
+for _ in range(main.AUTH_MAX_FAILS - 1):
+    main.record_auth_fail("1.2.3.4")
+check("unterhalb der Grenze noch frei", not main.auth_blocked("1.2.3.4"))
+main.record_auth_fail("1.2.3.4")
+check("ab der Grenze gesperrt", main.auth_blocked("1.2.3.4"))
+check("andere Adresse bleibt frei", not main.auth_blocked("9.9.9.9"))
+main.clear_auth_fails("1.2.3.4")
+check("nach Erfolg wieder frei", not main.auth_blocked("1.2.3.4"))
+
+# Alte Fehlversuche fallen aus dem Zeitfenster
+main._auth_fails.clear()
+past = 1000.0
+for _ in range(main.AUTH_MAX_FAILS):
+    main.record_auth_fail("5.5.5.5", now=past)
+check("im Zeitfenster gesperrt", main.auth_blocked("5.5.5.5", now=past + 1))
+check("nach Ablauf des Fensters wieder frei",
+      not main.auth_blocked("5.5.5.5", now=past + main.AUTH_WINDOW + 1))
+
+main._auth_fails.clear()
+for _ in range(main.AUTH_MAX_FAILS * 5):
+    main.record_auth_fail("7.7.7.7")
+check("Speicher waechst nicht unbegrenzt",
+      len(main._auth_fails["7.7.7.7"]) <= main.AUTH_MAX_FAILS,
+      len(main._auth_fails["7.7.7.7"]))
+main._auth_fails.clear()
+
+print("\n[12] Auth-Bremse ueber den WebSocket")
+main._auth_fails.clear()
+for i in range(main.AUTH_MAX_FAILS):
+    ev = ws_exchange({"token": "falsch", "prompt": "x"})
+    if i == 0:
+        check("erster Fehlversuch: Token abgelehnt", "abgelehnt" in ev["text"], ev)
+ev = ws_exchange({"token": "falsch", "prompt": "x"})
+check("nach zu vielen Fehlversuchen gesperrt",
+      "Fehlversuche" in ev["text"] and ev.get("code") == "auth", ev)
+# Auch mit richtigem Token bleibt die Adresse in der Sperre
+ev = ws_exchange({"token": "geheim-test-token", "prompt": "x"})
+check("Sperre gilt auch fuer korrektes Token",
+      "Fehlversuche" in ev["text"], ev)
+main._auth_fails.clear()
+ev = ws_exchange({"token": "geheim-test-token", "prompt": "baue etwas"})
+check("nach Zuruecksetzen wieder Zugang", ev["type"] == "status", ev)
+
+print("\n[13] Begrenzung gleichzeitiger Laeufe")
+check("Semaphore auf konfigurierten Wert gesetzt",
+      main.MAX_CONCURRENT >= 1 and main.run_slots._value <= main.MAX_CONCURRENT,
+      (main.MAX_CONCURRENT, main.run_slots._value))
+check("Kontingent nach den Laeufen wieder frei",
+      main.run_slots._value == main.MAX_CONCURRENT,
+      main.run_slots._value)
+
+async def exhaust_slots():
+    """Alle Plaetze belegen, dann muss ein weiterer Auftrag abgewiesen werden."""
+    for _ in range(main.MAX_CONCURRENT):
+        await main.run_slots.acquire()
+    try:
+        main._auth_fails.clear()
+        events = ws_collect({"token": "geheim-test-token", "prompt": "baue etwas"})
+        return events
+    finally:
+        for _ in range(main.MAX_CONCURRENT):
+            main.run_slots.release()
+
+events = asyncio.run(exhaust_slots())
+check("weist bei vollem Kontingent ab",
+      any(e["type"] == "error" and e.get("code") == "busy" for e in events), events)
+check("Abweisung endet mit done(ok=False)",
+      any(e["type"] == "done" and e["ok"] is False for e in events), events)
+check("Kontingent danach wieder vollstaendig frei",
+      main.run_slots._value == main.MAX_CONCURRENT, main.run_slots._value)
+
+print("\n[14] Verwaiste Container aufraeumen")
+class FakeContainerObj:
+    def __init__(self, name, boom=False):
+        self.name, self.boom, self.removed = name, boom, False
+    def remove(self, force=False):
+        if self.boom:
+            raise RuntimeError("weg")
+        self.removed = True
+
+class FakeDocker:
+    def __init__(self, containers):
+        self._containers = containers
+        self.filters_used = None
+    def containers_list(self, all=False, filters=None):
+        self.filters_used = filters
+        return self._containers
+
+leftovers = [FakeContainerObj("a"), FakeContainerObj("b")]
+fake = FakeDocker(leftovers)
+class Shim:
+    containers = type("C", (), {"list": staticmethod(fake.containers_list)})()
+orig_client = sandbox.client
+sandbox.client = lambda: Shim()
+removed = sandbox.reap_orphans()
+check("entfernt alle verwaisten Container", removed == 2, removed)
+check("alle als entfernt markiert", all(c.removed for c in leftovers))
+check("filtert nach unserem Label",
+      fake.filters_used == {"label": f"{sandbox.LABEL_KEY}={sandbox.LABEL_VALUE}"},
+      fake.filters_used)
+
+# Ein sperriger Container darf die anderen nicht blockieren
+mixed = [FakeContainerObj("gut"), FakeContainerObj("boese", boom=True),
+         FakeContainerObj("auch-gut")]
+fake2 = FakeDocker(mixed)
+class Shim2:
+    containers = type("C", (), {"list": staticmethod(fake2.containers_list)})()
+sandbox.client = lambda: Shim2()
+removed = sandbox.reap_orphans()
+check("zaehlt nur erfolgreich entfernte", removed == 2, removed)
+check("macht trotz Fehler weiter", mixed[2].removed)
+sandbox.client = orig_client
+
+print("\n[15] Zeitlimit fuer Modellaufrufe")
+check("ASK_TIMEOUT ist gesetzt", main.ASK_TIMEOUT > 0, main.ASK_TIMEOUT)
+
+async def slow_ask():
+    """ask() muss abbrechen statt endlos zu warten."""
+    orig_to_thread = asyncio.to_thread
+    async def hang(*a, **kw):
+        await asyncio.sleep(10)
+    asyncio.to_thread = hang
+    orig_timeout = main.ASK_TIMEOUT
+    main.ASK_TIMEOUT = 1
+    try:
+        await main.ask("egal")
+        return "kein Fehler"
+    except TimeoutError as exc:
+        return str(exc)
+    except Exception as exc:
+        return f"falscher Fehler: {type(exc).__name__}"
+    finally:
+        asyncio.to_thread = orig_to_thread
+        main.ASK_TIMEOUT = orig_timeout
+
+msg = asyncio.run(slow_ask())
+check("bricht haengenden Modellaufruf ab", "nicht geantwortet" in msg, msg)
+
 print(f"\n=== {ok} bestanden, {fail} fehlgeschlagen ===")
 sys.exit(1 if fail else 0)

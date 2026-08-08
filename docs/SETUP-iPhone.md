@@ -165,6 +165,8 @@ im Vollbild ohne Safari-Leiste. Das Token bleibt gespeichert.
 | Statuspunkt oben ist rot | `curl -s localhost:8000/healthz` nennt Ollama bzw. Docker im Klartext. |
 | Kopieren-Knopf tut nichts | Braucht HTTPS. Über den SSH-Tunnel (`http://localhost:8000`) geht es, weil localhost als sicher gilt. |
 | App-Icon fehlt nach dem Hinzufügen | Seite neu laden und erneut hinzufügen; Safari holt das Manifest sonst aus dem Cache. |
+| „Server ausgelastet" | Es laufen schon 2 Aufträge. Kurz warten — schützt die Maschine vor Überlastung. |
+| „Zu viele Fehlversuche" | Token mehrfach falsch eingegeben. Nach 5 Minuten geht es wieder; mit richtigem Token sofort. |
 | Alles neu aufsetzen | `bash install.sh` erneut ausführen. Bestehendes Token bleibt erhalten. |
 
 ### Sicherer Zugriff ohne offenen Port

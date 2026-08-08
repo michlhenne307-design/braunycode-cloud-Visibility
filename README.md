@@ -1,4 +1,4 @@
-# BraunyCode Cloud v1.2.0
+# BraunyCode Cloud v1.3.0
 
 Cloudbasierter KI-Coding-Agent, bedienbar vom iPhone. Läuft komplett auf einem
 eigenen Server — kein API-Key, keine laufenden Kosten.
@@ -65,6 +65,10 @@ Der Installer schreibt `~/braunycode/brauny.env` (Modus 600, nicht im Repo):
 | `BRAUNY_TOKEN` | zufällig erzeugt | Zugangs-Token für die Oberfläche |
 | `BRAUNY_MODEL` | `qwen2.5-coder:7b` | Ollama-Modell |
 | `BRAUNY_MAX_ATTEMPTS` | `3` | Versuche inkl. erstem Wurf; `1` schaltet die Selbstkorrektur ab |
+| `BRAUNY_MAX_CONCURRENT` | `2` | gleichzeitig laufende Aufträge |
+| `BRAUNY_ASK_TIMEOUT` | `300` | Sekunden, die ein Modellaufruf höchstens dauern darf |
+| `BRAUNY_AUTH_MAX_FAILS` | `5` | Fehlversuche bis zur Sperre |
+| `BRAUNY_AUTH_WINDOW` | `300` | Sekunden, über die Fehlversuche gezählt werden |
 | `BRAUNY_SANDBOX_TIMEOUT` | `60` | Sekunden bis zum Abbruch |
 | `BRAUNY_SANDBOX_MEM` | `512m` | RAM-Limit der Sandbox |
 | `BRAUNY_SANDBOX_CPUS` | `1.0` | CPU-Limit der Sandbox |
@@ -133,6 +137,16 @@ Das System führt vom Modell generierten Code aus. Die Absicherung:
   (uid 65534), alle Capabilities entfernt, `no-new-privileges`, RAM-, CPU-
   und PID-Limit, Timeout, danach zwangsweise entfernt.
 - **Keine Secrets im Repo** — das Token wird auf dem Server erzeugt.
+- **Bremse gegen Token-Raten** — nach `BRAUNY_AUTH_MAX_FAILS` Fehlversuchen
+  innerhalb von `BRAUNY_AUTH_WINDOW` Sekunden wird die Adresse abgewiesen.
+  Ein erfolgreicher Login setzt den Zähler zurück.
+- **Deckel auf gleichzeitige Läufe** — höchstens `BRAUNY_MAX_CONCURRENT`
+  Aufträge gleichzeitig. Weitere werden sofort und verständlich abgewiesen,
+  statt die Maschine mit Containern zu überladen.
+- **Zeitlimit für Modellaufrufe** — ein hängendes Ollama blockiert die
+  Verbindung nicht endlos (`BRAUNY_ASK_TIMEOUT`).
+- **Aufräumen beim Start** — Sandbox-Container tragen ein Label; nach einem
+  Absturz liegen gebliebene Container werden beim Dienststart entfernt.
 
 Verbleibende Einschränkungen, die man kennen sollte:
 
@@ -154,9 +168,12 @@ venv/bin/python test_smoke.py
 
 Deckt Code-Extraktion, ollama-Antwortformate, Sandbox-Verzeichnisse,
 Log-Streaming samt Timeout, HTTP-Routen, PWA-Auslieferung, Frontend-Verdrahtung,
-das WebSocket-Protokoll und die komplette Selbstkorrektur-Schleife ab (Erfolg
-im ersten Anlauf, Reparatur nach Fehler, Aufgabe nach erschöpften Versuchen,
-Traceback-Erkennung bei Exit 0). Docker und Ollama werden dafür nicht benötigt.
+das WebSocket-Protokoll, die komplette Selbstkorrektur-Schleife (Erfolg im
+ersten Anlauf, Reparatur nach Fehler, Aufgabe nach erschöpften Versuchen,
+Traceback-Erkennung bei Exit 0) sowie die Härtung ab: Auth-Bremse mit
+Zeitfenster, Abweisung bei vollem Kontingent, Aufräumen verwaister Container
+und das Zeitlimit für Modellaufrufe. Docker und Ollama werden dafür nicht
+benötigt.
 
 ## Was das System leistet — und was nicht
 
