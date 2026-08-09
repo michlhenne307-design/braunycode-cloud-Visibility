@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import struct
+import shutil
 import subprocess
 import sys
 
@@ -247,7 +248,7 @@ def drive_agent(*, replies, runs, max_attempts=3):
     async def ask_fn(_prompt):
         return next(reply_iter)
 
-    async def run_sandbox(code):
+    async def run_sandbox(files, entry="main.py"):
         sandbox_calls["n"] += 1
         return next(run_iter)
 
@@ -608,7 +609,7 @@ def drive_mech(intent, files, replies=None, runs=None):
         calls["ask"] += 1
         return next(reply_iter)
 
-    async def run_sandbox(code):
+    async def run_sandbox(files, entry="main.py"):
         calls["sandbox"] += 1
         return next(run_iter)
 
@@ -769,8 +770,8 @@ tws.write("main.py", "def gruss():\n    return 'hallo'\n")
 tws.write("hilfe.py", "WERT = 42\n")
 
 sandbox_calls = []
-async def fake_sandbox(code):
-    sandbox_calls.append(code)
+async def fake_sandbox(files, entry="main.py"):
+    sandbox_calls.append((files, entry))
     return (0, "hallo")
 
 box = tools.Toolbox(tws, run_sandbox=fake_sandbox,
@@ -861,7 +862,7 @@ def drive_loop(script, files=None, sandbox_result=(0, "ok"), max_steps=12):
     async def send(t, text="", **extra):
         events.append({"type": t, "text": text, **extra})
 
-    async def run_sandbox(_code):
+    async def run_sandbox(_files, _entry="main.py"):
         return sandbox_result
 
     steps = iter(script)
@@ -1089,7 +1090,7 @@ def drive_dispatch(intent, script, mode, files=None):
         counts["chat"] += 1
         return next(steps, reply("nichts mehr"))
 
-    async def run_sandbox(_c):
+    async def run_sandbox(_files, _entry="main.py"):
         counts["sandbox"] += 1
         return (0, "ok")
 
@@ -1397,7 +1398,7 @@ def drive_skill(script, skill, files=None):
     async def send(t, text="", **extra):
         events.append({"type": t, "text": text, **extra})
 
-    async def run_sandbox(_c):
+    async def run_sandbox(_files, _entry="main.py"):
         return (0, "ok")
 
     steps = iter(script)
@@ -1547,6 +1548,111 @@ check("Installer lehnt zu kurze Token ab",
       '"${#TOKEN}" -ge 12' in installer, )
 check("Installer läuft weiterhin nicht als root",
       '[ "$(id -u)" -ne 0 ]' in installer)
+
+print("\n[30] Mehrdateiige Projekte in der Sandbox")
+
+# Der Kern: frueher ging nur EINE Datei in den Container und es lief immer
+# fest /app/main.py. Ein Projekt aus mehreren Modulen war damit nicht
+# ausfuehrbar - obwohl genau das das Versprechen der Werkzeugschleife ist.
+
+check("safe_relpath behält Unterverzeichnisse",
+      sandbox.safe_relpath("pkg/mod.py") == os.path.join("pkg", "mod.py"),
+      sandbox.safe_relpath("pkg/mod.py"))
+check("safe_relpath wirft '..' weg",
+      sandbox.safe_relpath("../../evil.py") == "evil.py")
+# Ein absoluter Pfad faellt bewusst auf den blossen Dateinamen zurueck,
+# statt eine etc/-Struktur im Projekt nachzubauen.
+check("absoluter Pfad wird auf den Dateinamen reduziert",
+      sandbox.safe_relpath("/etc/passwd") == "passwd",
+      sandbox.safe_relpath("/etc/passwd"))
+check("safe_relpath verträgt Backslashes",
+      sandbox.safe_relpath("pkg\\mod.py") == os.path.join("pkg", "mod.py"))
+check("safe_relpath nie leer", sandbox.safe_relpath("") == "datei.py")
+
+md = sandbox.make_project_dir({
+    "main.py": "from pkg.helfer import wert\nprint(wert)\n",
+    "pkg/helfer.py": "wert = 7\n",
+    "pkg/__init__.py": "",
+})
+check("Unterverzeichnis wird angelegt",
+      os.path.isfile(os.path.join(md, "pkg", "helfer.py")))
+check("Hauptdatei liegt richtig", os.path.isfile(os.path.join(md, "main.py")))
+check("Unterverzeichnis ist für den Sandbox-User betretbar",
+      os.stat(os.path.join(md, "pkg")).st_mode & 0o001 != 0,
+      oct(os.stat(os.path.join(md, "pkg")).st_mode))
+shutil.rmtree(md, ignore_errors=True)
+
+check("entry_command startet die gewünschte Datei",
+      sandbox.entry_command("pkg/start.py")[-1] == "/app/pkg/start.py",
+      sandbox.entry_command("pkg/start.py"))
+check("entry_command ohne Angabe nimmt main.py",
+      sandbox.entry_command()[-1] == "/app/main.py")
+check("entry_command lässt sich nicht aus /app herauslocken",
+      sandbox.entry_command("../../etc/passwd")[-1] == "/app/passwd",
+      sandbox.entry_command("../../etc/passwd"))
+
+# Und jetzt der eigentliche Regressionstest: ein Projekt, dessen Hauptdatei
+# ein zweites Modul importiert.
+mws = ws_mod.Workspace(tempfile.mkdtemp())
+mws.write("main.py", "from helfer import wert\nprint(wert)\n")
+mws.write("helfer.py", "wert = 7\n")
+mws.write("notizen.txt", "kein Code\n")
+
+uebergeben = {}
+async def merk_sandbox(files, entry="main.py"):
+    uebergeben["files"] = files
+    uebergeben["entry"] = entry
+    return (0, "7")
+
+mbox = tools.Toolbox(mws, run_sandbox=merk_sandbox)
+ergebnis = asyncio.run(mbox.call("run_python", {"path": "main.py"}))
+check("run_python meldet Erfolg", ergebnis.startswith("Lauf erfolgreich"), ergebnis)
+check("importiertes Modul geht mit in den Container",
+      "helfer.py" in uebergeben["files"], sorted(uebergeben.get("files", {})))
+check("Hauptdatei geht mit", "main.py" in uebergeben["files"])
+check("Einstiegspunkt ist die angeforderte Datei",
+      uebergeben["entry"] == "main.py", uebergeben.get("entry"))
+check("Ergebnis nennt die Dateianzahl",
+      "Datei(en) im Container" in ergebnis, ergebnis)
+
+# Eine andere Datei starten als main.py - frueher unmoeglich.
+asyncio.run(mbox.call("run_python", {"path": "helfer.py"}))
+check("beliebige Datei als Einstiegspunkt",
+      uebergeben["entry"] == "helfer.py", uebergeben.get("entry"))
+
+check("fehlende Datei meldet Fehler statt zu laufen",
+      asyncio.run(mbox.call("run_python", {"path": "gibtsnicht.py"}))
+      .startswith("FEHLER"))
+
+# Deckel: ein riesiges Projekt darf den Container-Start nicht sprengen.
+gws = ws_mod.Workspace(tempfile.mkdtemp())
+for i in range(tools.MAX_SANDBOX_FILES + 20):
+    gws.write(f"m{i}.py", f"x = {i}\n")
+gbox = tools.Toolbox(gws, run_sandbox=merk_sandbox)
+asyncio.run(gbox.call("run_python", {"path": "m0.py"}))
+check("Dateizahl ist gedeckelt",
+      len(uebergeben["files"]) <= tools.MAX_SANDBOX_FILES + 1,
+      len(uebergeben["files"]))
+check("Einstiegsdatei ist trotz Deckel dabei",
+      "m0.py" in uebergeben["files"])
+
+# Der Einmalwurf schickt weiterhin genau eine Datei.
+einzel = {}
+async def einzel_sandbox(files, entry="main.py"):
+    einzel.update({"files": files, "entry": entry})
+    return (0, "ok")
+
+async def einzel_ask(_p):
+    return "```python\nprint('x')\n```"
+
+async def stumm(_t, _text="", **_kw):
+    return None
+
+asyncio.run(main.run_agent(stumm, "aufgabe", ask_fn=einzel_ask,
+                           run_sandbox=einzel_sandbox, max_attempts=1))
+check("Einmalwurf schickt genau eine Datei",
+      list(einzel["files"]) == ["main.py"], einzel.get("files"))
+check("Einmalwurf startet main.py", einzel["entry"] == "main.py")
 
 print(f"\n=== {ok} bestanden, {fail} fehlgeschlagen ===")
 sys.exit(1 if fail else 0)

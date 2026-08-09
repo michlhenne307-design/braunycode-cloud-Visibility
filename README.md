@@ -197,7 +197,7 @@ Werkzeuge und entscheidet in jeder Runde selbst, welches dran ist.
 | `write_file` | eine Datei schreiben |
 | `search` | Text über alle Projektdateien suchen |
 | `outline` | Funktionen, Klassen und Aufrufgraph zeigen |
-| `run_python` | eine Datei in der abgeschotteten Sandbox ausführen |
+| `run_python` | eine Datei in der abgeschotteten Sandbox ausführen — **das ganze Projekt kommt mit**, Importe funktionieren |
 | `finish` | Arbeit beenden und zusammenfassen |
 
 Alle Werkzeuge arbeiten ausschließlich innerhalb des Projektverzeichnisses;
@@ -207,6 +207,15 @@ statt dass der Lauf abbricht.
 
 Damit sind zum ersten Mal Aufgaben über **mehrere Dateien und mehrere Runden**
 möglich, statt nur eine `main.py` in einem Wurf.
+
+Und zwar wirklich: `run_python` kopiert den **kompletten Projektstand** in den
+Container und startet darin die angeforderte Datei. Schreibt der Agent
+`main.py` und `helfer.py`, funktioniert der Import auch — vorher landete nur
+eine einzige Datei im Container und es lief immer fest `main.py`, ein
+mehrdateiiges Projekt war also gar nicht ausführbar. Unterverzeichnisse
+bleiben erhalten, Pfade werden dabei gegen Ausbrüche geprüft; Dateizahl und
+Gesamtgröße sind gedeckelt, damit ein großes Verzeichnis den Container-Start
+nicht ausbremst.
 
 ## Skills — Verfahrenswissen als Textdatei
 
@@ -495,7 +504,7 @@ python3 -m venv venv && venv/bin/pip install -r requirements.txt
 venv/bin/python test_smoke.py
 ```
 
-**390 Fälle in 29 Abschnitten, ohne Docker und ohne Ollama.** Modell, Sandbox
+**412 Fälle in 30 Abschnitten, ohne Docker und ohne Ollama.** Modell, Sandbox
 und Werkzeugantworten werden gescriptet hineingereicht.
 
 Abgedeckt sind unter anderem:
@@ -511,6 +520,9 @@ Abgedeckt sind unter anderem:
   Passwort-Platzhalter steht wortgleich in Konfiguration *und* Abbruchprüfung,
   die Deadlock-Abschaltung ist auf beiden Seiten da, HTTPS-Fehlschlag kippt
   die Installation nicht, das Skript endet mit `exit 0`
+- **Mehrdateiige Projekte**: `run_python` liefert das importierte Modul
+  wirklich mit in den Container, startet die angeforderte Datei statt fest
+  `main.py`, Unterverzeichnisse bleiben erhalten, Deckel greift
 - **Werkzeuge**: Pfadausbrüche (`..`, absolute Pfade, Symlinks) blockiert,
   fehlende Dateien und unbekannte Werkzeuge liefern Fehlertext statt Absturz,
   lange Ausgaben werden gekürzt
@@ -544,16 +556,24 @@ Beides läuft durch dieselbe Schleife. Der Wechsel ist eine Zeile in
 `brauny.env`. Genau dafür gibt es `provider.py`: die Architektur soll nicht am
 schwächsten Modell hängen.
 
+**Gegen echtes Netz geprüft:** `fetch_url` holt eine echte Seite und gibt sie
+als Text zurück, und der Aufruf des Cloud-Metadaten-Dienstes
+`169.254.169.254` wird dabei tatsächlich abgewiesen — nicht nur im Test mit
+gefälschter Namensauflösung.
+
 **Nicht verifiziert** (Stand dieser Fassung): Es gab noch keinen
-End-to-End-Lauf mit echtem Modell und echtem Docker. Die 390 Tests laufen
+End-to-End-Lauf mit echtem Modell und echtem Docker. Die 412 Tests laufen
 gegen gescriptete Modellantworten — sie belegen, dass die Schleife korrekt
 arbeitet, nicht dass ein bestimmtes Modell gute Ergebnisse liefert. Ob die
 Skills die Ergebnisse eines 7B-Modells **messbar** verbessern, ist nicht
 gemessen; belegt ist nur, dass der richtige Skill ausgewählt wird und seine
-Werkzeugsperre hält. `fetch_url` ist gegen echte Webseiten ungetestet — der
-Schutz ist geprüft, das Abholen selbst nicht. `install.sh` ist syntaktisch
-geprüft, aber nicht auf einem frischen Ubuntu 24.04 durchgelaufen. Die
-Zeitmessungen stammen von x86_64, nicht arm64.
+Werkzeugsperre hält. `install.sh` ist syntaktisch geprüft, aber nicht auf
+einem frischen Ubuntu 24.04 durchgelaufen. Die Zeitmessungen stammen von
+x86_64, nicht arm64.
+
+Dass `fetch_url` Weiterleitungen **nicht** automatisch folgt, ist im Code so
+umgesetzt, konnte hier aber nicht sauber nachgewiesen werden: die
+Testumgebung hebt HTTP selbst auf HTTPS an und verfälscht genau diesen Fall.
 
 Ebenso ungetestet: **cloud-init lief nie auf einem echten Server**, und
 `enable-https.sh` hat **nie ein echtes Zertifikat geholt** — geprüft sind

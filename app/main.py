@@ -293,8 +293,9 @@ async def run_agent(send, task, *, ask_fn, run_sandbox, workspace=None,
     """Plant, generiert und repariert Code, bis er laeuft oder die Versuche aus sind.
 
     ask_fn und run_sandbox sind hineingereicht, damit die Schleife ohne echtes
-    Ollama oder Docker getestet werden kann. run_sandbox(code) fuehrt den Code
-    aus, streamt die Ausgabe selbst und liefert (exit_code, gesammelte_ausgabe).
+    Ollama oder Docker getestet werden kann. run_sandbox(dateien, start) fuehrt
+    das Projekt aus, streamt die Ausgabe selbst und liefert
+    (exit_code, gesammelte_ausgabe).
     """
     start = time.monotonic()
 
@@ -348,7 +349,8 @@ async def run_agent(send, task, *, ask_fn, run_sandbox, workspace=None,
             else:
                 await send("status", f"Versuch {attempt}/{max_attempts}: "
                                      "starte korrigierte Fassung …")
-            exit_code, output = await run_sandbox(code)
+            # Der Einmalwurf erzeugt bewusst genau eine Datei.
+            exit_code, output = await run_sandbox({"main.py": code}, "main.py")
 
         last_exit = exit_code
         failed = exit_code != 0 or looks_failed(output)
@@ -520,8 +522,12 @@ async def healthz():
 
 # ------------------------------------------------------------------ Agent
 
-async def sandbox_runner(send, code: str):
-    """Fuehrt einen Codestand in einer frischen Sandbox aus.
+async def sandbox_runner(send, files: dict, entry: str = "main.py"):
+    """Fuehrt einen Projektstand in einer frischen Sandbox aus.
+
+    Bekommt ALLE Dateien, nicht nur eine: ein Projekt aus mehreren Modulen
+    liesse sich sonst nicht ausfuehren, weil der Import ins Leere geht.
+    entry bestimmt, welche davon gestartet wird.
 
     Streamt die Ausgabe als 'sandbox'-Ereignisse und liefert
     (exit_code, gesamte_ausgabe) zurueck. Jeder Aufruf bekommt eigenen
@@ -532,8 +538,9 @@ async def sandbox_runner(send, code: str):
     container = None
     lines: list[str] = []
     try:
-        project_dir = await asyncio.to_thread(sandbox.make_project_dir, {"main.py": code})
-        container = await asyncio.to_thread(sandbox.start, project_dir)
+        project_dir = await asyncio.to_thread(sandbox.make_project_dir, files)
+        container = await asyncio.to_thread(
+            sandbox.start, project_dir, sandbox.entry_command(entry))
         try:
             async for line in sandbox.stream_logs(container):
                 lines.append(line)
@@ -605,8 +612,8 @@ async def agent(ws: WebSocket):
             await send("status", f"Modell {MODEL} über {provider.PROVIDER} — "
                                  "Auftrag angenommen.")
 
-            async def run_sandbox(code):
-                return await sandbox_runner(send, code)
+            async def run_sandbox(files, entry="main.py"):
+                return await sandbox_runner(send, files, entry)
 
             await dispatch(send, prompt, ask_fn=ask, chat_fn=model_chat,
                            run_sandbox=run_sandbox, workspace=WORKSPACE)

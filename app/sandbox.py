@@ -31,16 +31,60 @@ def client():
     return _client
 
 
+def safe_relpath(name: str) -> str:
+    """Macht aus einem Dateinamen einen Pfad, der im Projekt bleibt.
+
+    Unterverzeichnisse muessen erhalten bleiben - ein Projekt aus mehreren
+    Modulen laesst sich sonst nicht ausfuehren. Alles, was aus dem
+    Verzeichnis herauszeigen koennte (absolut, '..', Laufwerksbuchstabe),
+    faellt auf den blossen Dateinamen zurueck.
+    """
+    aufgeraeumt = (name or "").replace("\\", "/").strip("/")
+    teile = [t for t in aufgeraeumt.split("/") if t not in ("", ".")]
+    if not teile or any(t == ".." for t in teile) or os.path.isabs(name or ""):
+        return os.path.basename(name or "") or "datei.py"
+    return os.path.join(*teile)
+
+
 def make_project_dir(files: dict[str, str]) -> str:
     """Legt ein temporäres Projektverzeichnis an, das der Sandbox-User lesen darf."""
     project_dir = tempfile.mkdtemp(prefix="brauny-")
     os.chmod(project_dir, stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO)
     for name, content in files.items():
-        path = os.path.join(project_dir, os.path.basename(name))
+        path = os.path.join(project_dir, safe_relpath(name))
+        ordner = os.path.dirname(path)
+        if ordner and ordner != project_dir:
+            os.makedirs(ordner, exist_ok=True)
+            # Der Sandbox-User ist ein anderer (uid 65534) und muss die
+            # Zwischenverzeichnisse betreten koennen.
+            for teil in _pfad_kette(project_dir, ordner):
+                os.chmod(teil, stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO)
         with open(path, "w", encoding="utf-8") as handle:
             handle.write(content)
         os.chmod(path, 0o666)
     return project_dir
+
+
+def _pfad_kette(wurzel: str, ziel: str):
+    """Alle Verzeichnisse zwischen Wurzel und Ziel, einschliesslich Ziel."""
+    rest = os.path.relpath(ziel, wurzel)
+    aktuell = wurzel
+    for teil in rest.split(os.sep):
+        if teil in ("", "."):
+            continue
+        aktuell = os.path.join(aktuell, teil)
+        yield aktuell
+
+
+def entry_command(entry: str = "main.py") -> list[str]:
+    """Startbefehl fuer die auszufuehrende Datei.
+
+    Frueher stand hier fest /app/main.py. Damit war jedes Projekt aus
+    mehreren Modulen unausfuehrbar - genau das, was der Agent bauen koennen
+    soll. Der Pfad wird durch dieselbe Pruefung geschickt wie beim Anlegen,
+    sonst zeigte er womoeglich aus dem Container-Verzeichnis heraus.
+    """
+    return ["python", "-u", "/app/" + safe_relpath(entry or "main.py")]
 
 
 def start(project_dir: str, command=None):
@@ -51,7 +95,7 @@ def start(project_dir: str, command=None):
     """
     return client().containers.run(
         IMAGE,
-        command or ["python", "-u", "/app/main.py"],
+        command or entry_command(),
         working_dir="/app",
         volumes={project_dir: {"bind": "/app", "mode": "rw"}},
         detach=True,

@@ -17,6 +17,10 @@ import connectors
 
 MAX_OUTPUT = 4000        # Zeichen, die ein Werkzeugergebnis zurueckgeben darf
 MAX_SEARCH_HITS = 25
+# Deckel fuer das, was in die Sandbox kopiert wird. Ein grosses
+# Projektverzeichnis wuerde sonst jeden Container-Start ausbremsen.
+MAX_SANDBOX_FILES = 60
+MAX_SANDBOX_BYTES = 400_000
 
 # Ohne dieses Werkzeug kann die Schleife nicht sauber enden - es bleibt
 # deshalb auch dann erlaubt, wenn ein Skill die Werkzeuge einschraenkt.
@@ -202,14 +206,43 @@ class Toolbox:
         text = index.overview()
         return text or "(keine Symbole gefunden)"
 
+    def _project_files(self) -> dict[str, str]:
+        """Alle lesbaren Textdateien des Projekts fuer die Sandbox.
+
+        Frueher ging nur der Inhalt EINER Datei in den Container. Ein Projekt
+        aus mehreren Modulen war damit nicht ausfuehrbar - der Import lief ins
+        Leere. Jetzt geht der ganze Stand mit, gedeckelt, damit ein grosses
+        Verzeichnis den Container-Start nicht sprengt.
+        """
+        dateien: dict[str, str] = {}
+        summe = 0
+        for rel in self.ws.list_files():
+            if len(dateien) >= MAX_SANDBOX_FILES or summe >= MAX_SANDBOX_BYTES:
+                break
+            try:
+                inhalt = self.ws.read(rel)
+            except Exception:
+                continue          # Binaerdatei oder unlesbar - fuer den Lauf egal
+            dateien[rel] = inhalt
+            summe += len(inhalt)
+        return dateien
+
     async def _run_python(self, args) -> str:
         path = str(args.get("path", "")).strip()
         if self.run_sandbox is None:
             return "FEHLER: Keine Sandbox verfügbar."
-        code = self.ws.read(path)
-        exit_code, output = await self.run_sandbox(code)
+        if not self.ws.exists(path):
+            return f"FEHLER: '{path}' gibt es nicht im Projekt."
+
+        dateien = self._project_files()
+        if path not in dateien:
+            # Kann passieren, wenn der Deckel vorher greift.
+            dateien[path] = self.ws.read(path)
+
+        exit_code, output = await self.run_sandbox(dateien, path)
         status = "erfolgreich" if exit_code == 0 else f"Exit-Code {exit_code}"
-        return f"Lauf {status}.\nAusgabe:\n{output or '(keine)'}"
+        mit = f" ({len(dateien)} Datei(en) im Container)" if len(dateien) > 1 else ""
+        return f"Lauf {status}{mit}.\nAusgabe:\n{output or '(keine)'}"
 
     async def _finish(self, args) -> str:
         self.finished = str(args.get("summary", "")).strip() or "Fertig."
