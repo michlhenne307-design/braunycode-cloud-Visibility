@@ -3224,5 +3224,215 @@ if os.path.exists(_DOCKERFILE):
     check("das Image prüft ruff beim Bauen", "ruff --version" in _df)
 
 
+print("\n[44] Laeufe leben auf dem Server, nicht in der Verbindung")
+
+# 'runs' waere hier gefaehrlich: weiter oben wird der Name als gewoehnliche
+# Variable wiederverwendet (events, runs = drive_agent(...)) und wuerde das
+# Modul ueberschreiben.
+import runs as runs_mod  # noqa: E402
+import threading  # noqa: E402
+
+async def _lauf_grundlagen():
+    lauf = runs_mod.Lauf(id="t1", prompt="x", gestartet=time.time())
+    lauf.anhaengen("status", "eins")
+    lauf.anhaengen("tool", "list_files()")
+    lauf.abschliessen(ok=True, text="Fertig.")
+
+    alle = [e async for _, e in lauf.folgen(0)]
+    ab_eins = [(i, e) async for i, e in lauf.folgen(1)]
+    return lauf, alle, ab_eins
+
+_lauf, _alle, _ab_eins = asyncio.run(_lauf_grundlagen())
+check("Ereignisse werden der Reihe nach aufbewahrt",
+      [e["type"] for e in _alle] == ["status", "tool", "done"], _alle)
+check("ein Abschluss markiert den Lauf als fertig", _lauf.fertig and _lauf.ok is True)
+check("folgen(1) fängt beim zweiten Ereignis an",
+      _ab_eins[0][0] == 1 and _ab_eins[0][1]["type"] == "tool", _ab_eins[0])
+check("folgen(1) wiederholt das erste Ereignis nicht",
+      all(e["text"] != "eins" for _, e in _ab_eins), _ab_eins)
+
+# Nach dem Abschluss darf nichts mehr dazukommen - sonst haengt ein
+# Zuschauer, der schon 'done' gesehen hat, an einem Lauf ohne Ende.
+_lauf.anhaengen("status", "zu spät")
+check("nach dem Abschluss wird nichts mehr angenommen",
+      [e["type"] for e in _lauf.ereignisse] == ["status", "tool", "done"],
+      [e["type"] for e in _lauf.ereignisse])
+
+# Speichergrenze: nicht still abschneiden, sondern sagen, dass gekuerzt wurde.
+_voll = runs_mod.Lauf(id="t2", prompt="x", gestartet=time.time())
+for _n in range(runs_mod.MAX_EREIGNISSE + 50):
+    _voll.anhaengen("sandbox", f"Zeile {_n}")
+check("die Ereignisgrenze greift", len(_voll.ereignisse) <= runs_mod.MAX_EREIGNISSE + 2,
+      len(_voll.ereignisse))
+check("und wird benannt statt verschwiegen",
+      any(e["type"] == "error" and "Zu viele" in e["text"] for e in _voll.ereignisse))
+check("der Lauf endet dann auch wirklich", _voll.fertig and _voll.ok is False)
+
+_lang = runs_mod.Lauf(id="t3", prompt="x", gestartet=time.time())
+_lang.anhaengen("sandbox", "y" * (runs_mod.MAX_TEXT + 500))
+check("überlange Texte werden gekappt",
+      len(_lang.ereignisse[0]["text"]) == runs_mod.MAX_TEXT,
+      len(_lang.ereignisse[0]["text"]))
+
+_reg = runs_mod.Register()
+_a = _reg.starten("erster")
+_b = _reg.starten("zweiter")
+check("Läufe bekommen verschiedene Kennungen", _a.id != _b.id)
+check("der offene Lauf ist der jüngste", _reg.offen().id == _b.id)
+_b.abschliessen(ok=True)
+check("ein fertiger Lauf gilt nicht mehr als offen", _reg.offen().id == _a.id)
+_a.abschliessen(ok=True)
+check("ohne laufenden Auftrag gibt es keinen offenen", _reg.offen() is None)
+check("aber abrufbar bleiben sie", _reg.holen(_a.id) is not None)
+
+# Ein langlaufender Auftrag darf niemals weggeraeumt werden - er ist genau
+# dann am wertvollsten, wenn er lange dauert.
+_reg2 = runs_mod.Register()
+_alt = _reg2.starten("laeuft seit Stunden")
+_alt.gestartet = time.time() - 10 * runs_mod.AUFBEWAHRUNG
+for _n in range(runs_mod.MAX_LAEUFE + 5):
+    _reg2.starten(f"fuellung {_n}").abschliessen(ok=True)
+_reg2.starten("neu")
+check("ein laufender Auftrag überlebt jedes Aufräumen",
+      _reg2.holen(_alt.id) is not None)
+
+# --- Der eigentliche Punkt: Verbindung weg, Lauf laeuft weiter ------------
+#
+# Genau hieran ist der erste echte Auftrag gescheitert. Der Server hatte
+# sauber gearbeitet - nur hatte niemand mehr zugehoert, und mit dem Zuhoerer
+# starb die Arbeit.
+
+# Ab hier ein ECHTER Server statt des Testclients.
+#
+# Der Testclient von Starlette gibt jeder WebSocket-Sitzung ihren eigenen
+# Ereignisloop und raeumt ihn beim Verlassen des Blocks ab - mitsamt allem,
+# was darin gestartet wurde. Genau die Faehigkeit, die hier geprueft werden
+# soll, kann er also gar nicht zeigen: jeder Lauf endete unter ihm als
+# "Abgebrochen.", obwohl der Code richtig war.
+#
+# Das ist der Unterschied zwischen "der Test ist rot" und "der Code ist
+# kaputt". Wer das verwechselt, baut die falsche Sache um.
+import socket  # noqa: E402
+import uvicorn  # noqa: E402
+import websockets  # noqa: E402
+
+_tor = threading.Event()
+
+async def _langsamer_lauf(send, prompt, **kw):
+    await send("status", "erster Schritt")
+    # threading.Event statt asyncio.Event: gesetzt wird es aus dem Testfaden,
+    # und asyncio.Event ist ueber Fadengrenzen hinweg nicht sicher.
+    while not _tor.is_set():
+        await asyncio.sleep(0.01)
+    await send("status", "zweiter Schritt")
+    await send("done", "Fertig.", ok=True, exit=0, attempts=1, seconds=0.2)
+
+_frei = socket.socket()
+_frei.bind(("127.0.0.1", 0))
+_PORT = _frei.getsockname()[1]
+_frei.close()
+
+_echtes_dispatch = main.dispatch
+main.dispatch = _langsamer_lauf
+_server = uvicorn.Server(uvicorn.Config(main.app, host="127.0.0.1", port=_PORT,
+                                        log_level="error"))
+threading.Thread(target=_server.run, daemon=True).start()
+for _ in range(200):
+    if getattr(_server, "started", False):
+        break
+    time.sleep(0.05)
+
+_URL = f"ws://127.0.0.1:{_PORT}/ws/agent"
+
+async def _reden(nutzlast, bis=2, timeout=10):
+    """Verbindet, schickt eine Nachricht, liest Ereignisse.
+
+    bis: Anzahl der Ereignisse, oder 'done' fuer 'bis zum Abschluss'.
+    """
+    gelesen = []
+    async with websockets.connect(_URL) as w:
+        await w.send(json.dumps(nutzlast))
+        while True:
+            try:
+                ev = json.loads(await asyncio.wait_for(w.recv(), timeout))
+            except Exception:
+                break
+            gelesen.append(ev)
+            if bis == "done" and ev["type"] == "done":
+                break
+            if isinstance(bis, int) and len(gelesen) >= bis:
+                break
+            if ev["type"] == "error" and ev.get("code"):
+                break
+    return gelesen
+
+try:
+    check("der Testserver ist oben", getattr(_server, "started", False))
+
+    # 1. Auftrag starten und mittendrin die Verbindung kappen.
+    _erste = asyncio.run(_reden({"token": "geheim-test-token", "prompt": "dauert"}, bis=2))
+    _lauf_id = _erste[0].get("lauf")
+    _weiter_ab = _erste[-1]["i"] + 1
+
+    check("jedes Ereignis trägt die Laufkennung",
+          all(e.get("lauf") for e in _erste), _erste)
+    check("jedes Ereignis trägt eine laufende Nummer",
+          [e["i"] for e in _erste] == [0, 1], [e.get("i") for e in _erste])
+
+    # 2. Der Server arbeitet weiter, obwohl niemand mehr zusieht.
+    time.sleep(0.3)
+    _l = main.runs.register.holen(_lauf_id)
+    check("der Lauf lebt nach dem Verbindungsabbruch weiter",
+          bool(_l) and not _l.fertig, _l and _l.ereignisse[-1:])
+
+    _tor.set()
+    for _ in range(300):
+        _l = main.runs.register.holen(_lauf_id)
+        if _l and _l.fertig:
+            break
+        time.sleep(0.01)
+    check("und läuft ohne Zuschauer zu Ende", bool(_l and _l.fertig), _l)
+
+    # 3. Wieder anhaengen - ab der Stelle, an der wir waren.
+    _rest = asyncio.run(_reden({"token": "geheim-test-token",
+                                "attach": _lauf_id, "from": _weiter_ab}, bis="done"))
+    check("beim erneuten Anhängen kommt der Rest",
+          [e["text"] for e in _rest][:1] == ["zweiter Schritt"], _rest)
+    check("und das Ergebnis kommt an",
+          _rest[-1]["type"] == "done" and _rest[-1]["ok"] is True, _rest[-1])
+    check("nichts wird doppelt geschickt",
+          all(e["i"] >= _weiter_ab for e in _rest), [e["i"] for e in _rest])
+
+    # 4. Ein Lauf, den es nicht gibt, wird benannt statt verschwiegen.
+    _ev = asyncio.run(_reden({"token": "geheim-test-token",
+                              "attach": "gibtsnicht", "from": 0}, bis=1))[0]
+    check("ein unbekannter Lauf wird als solcher gemeldet",
+          _ev["type"] == "error" and _ev.get("code") == "unbekannt", _ev)
+
+    # 5. Abbrechen muss wirklich abbrechen - der Lauf haengt ja nicht mehr an
+    #    der Verbindung, ein Wegsehen beendet ihn also nicht mehr.
+    _tor.clear()
+    _start = asyncio.run(_reden({"token": "geheim-test-token", "prompt": "dauert"}, bis=2))
+    _abbruch_id = _start[0]["lauf"]
+    _ende = asyncio.run(_reden({"token": "geheim-test-token",
+                                "cancel": _abbruch_id, "from": 0}, bis="done"))[-1]
+    check("Abbrechen beendet den Lauf wirklich",
+          _ende["type"] == "done" and _ende["ok"] is False, _ende)
+    check("und sagt, dass abgebrochen wurde", "bgebrochen" in _ende["text"], _ende)
+finally:
+    main.dispatch = _echtes_dispatch
+    _tor.set()
+    _server.should_exit = True
+    time.sleep(0.3)
+
+# Die Oberflaeche muss das auch benutzen - sonst ist die Faehigkeit da und
+# niemand ruft sie ab.
+check("die Oberfläche merkt sich den laufenden Auftrag", "brauny.run" in js)
+check("sie hängt sich beim Zurückkommen wieder an",
+      "visibilitychange" in js and "wiederanhaengen" in js)
+check("sie zählt mit, wo sie war", "ev.i" in js and "attach" in js)
+check("der Abbruch geht an den Server, statt nur wegzusehen", "cancel:" in js)
+
+
 print(f"\n=== {ok} bestanden, {fail} fehlgeschlagen ===")
 sys.exit(1 if fail else 0)

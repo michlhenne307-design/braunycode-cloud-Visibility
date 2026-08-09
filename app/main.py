@@ -20,6 +20,7 @@ import memory
 import connectors
 import provider
 import refactor
+import runs
 import sandbox
 import skills as skills_mod
 import tools
@@ -586,74 +587,126 @@ async def sandbox_runner(send, files: dict, entry: str = "main.py", *, command=N
         await asyncio.to_thread(sandbox.cleanup, container, project_dir)
 
 
+async def _arbeiten(lauf: runs.Lauf) -> None:
+    """Fuehrt einen Auftrag aus - unabhaengig davon, ob jemand zusieht.
+
+    Diese Aufgabe haengt an keiner Verbindung. Das ist der ganze Punkt: auf
+    einem Telefon verliert man die Verbindung staendig, und ein Auftrag, der
+    daran stirbt, ist auf einem Telefon nicht benutzbar.
+    """
+    async def send(event_type: str, text: str = "", **extra):
+        lauf.anhaengen(event_type, text, **extra)
+
+    # Platz im Lauf-Kontingent holen. Ist alles belegt, sofort und
+    # verstaendlich abweisen statt die Maschine zu ueberladen.
+    try:
+        await asyncio.wait_for(run_slots.acquire(), timeout=0.5)
+    except asyncio.TimeoutError:
+        lauf.anhaengen("error", f"Server ausgelastet ({MAX_CONCURRENT} Aufträge "
+                                "laufen bereits). Bitte kurz warten.", code="busy")
+        lauf.abschliessen(ok=False, text="Abgewiesen.")
+        return
+
+    try:
+        await send("status", f"Modell {MODEL} über {provider.PROVIDER} — "
+                             "Auftrag angenommen.")
+
+        async def run_sandbox(files, entry="main.py", *, command=None):
+            return await sandbox_runner(send, files, entry, command=command)
+
+        await dispatch(send, lauf.prompt, ask_fn=ask, chat_fn=model_chat,
+                       run_sandbox=run_sandbox, workspace=WORKSPACE)
+    except asyncio.CancelledError:
+        lauf.abschliessen(ok=False, text="Abgebrochen.")
+        raise
+    except Exception as exc:
+        log.exception("Agentenlauf fehlgeschlagen")
+        lauf.anhaengen("error", f"{type(exc).__name__}: {exc}")
+        lauf.abschliessen(ok=False, text="Fehlgeschlagen.")
+    finally:
+        run_slots.release()
+        # Falls dispatch ohne 'done' zurueckkam, darf der Lauf nicht ewig als
+        # laufend gelten - sonst wartet die Oberflaeche auf ein Ende, das
+        # niemand mehr schickt. abschliessen() ist wirkungslos, wenn schon
+        # ein Abschluss da ist.
+        lauf.abschliessen(ok=False, text="Ohne Abschluss beendet.")
+
+
 @app.websocket("/ws/agent")
 async def agent(ws: WebSocket):
     await ws.accept()
 
-    async def send(event_type: str, text: str = "", **extra):
+    async def send_roh(event_type: str, text: str = "", **extra):
         await ws.send_text(json.dumps({"type": event_type, "text": text, **extra}))
 
     peer = ws.client.host if ws.client else "unbekannt"
 
     try:
-        try:
-            request = json.loads(await ws.receive_text())
-            prompt = str(request.get("prompt", "")).strip()[:MAX_PROMPT]
-            supplied = str(request.get("token", ""))
-        except (json.JSONDecodeError, AttributeError, TypeError):
-            await send("error", "Ungueltige Anfrage - JSON mit token und prompt erwartet.")
-            await ws.close(code=1003)
-            return
+        request = json.loads(await ws.receive_text())
+        prompt = str(request.get("prompt", "")).strip()[:MAX_PROMPT]
+        supplied = str(request.get("token", ""))
+        anhaengen_an = str(request.get("attach", "")).strip()
+        abbrechen = str(request.get("cancel", "")).strip()
+        ab_index = max(0, int(request.get("from", 0) or 0))
+    except (json.JSONDecodeError, AttributeError, TypeError, ValueError):
+        await send_roh("error", "Ungueltige Anfrage - JSON mit token und prompt erwartet.")
+        await ws.close(code=1003)
+        return
 
-        if TOKEN:
-            if auth_blocked(peer):
-                log.warning("Zu viele Fehlversuche von %s - abgewiesen.", peer)
-                await send("error", "Zu viele Fehlversuche. Bitte etwas warten.",
+    if TOKEN:
+        if auth_blocked(peer):
+            log.warning("Zu viele Fehlversuche von %s - abgewiesen.", peer)
+            await send_roh("error", "Zu viele Fehlversuche. Bitte etwas warten.",
                            code="auth")
-                await ws.close(code=1008)
-                return
-            # compare_digest statt == : keine Rueckschluesse ueber die Laufzeit
-            if not hmac.compare_digest(supplied, TOKEN):
-                record_auth_fail(peer)
-                log.warning("Token abgelehnt von %s.", peer)
-                await send("error", "Token abgelehnt.", code="auth")
-                await ws.close(code=1008)
-                return
-            clear_auth_fails(peer)
+            await ws.close(code=1008)
+            return
+        # compare_digest statt == : keine Rueckschluesse ueber die Laufzeit
+        if not hmac.compare_digest(supplied, TOKEN):
+            record_auth_fail(peer)
+            log.warning("Token abgelehnt von %s.", peer)
+            await send_roh("error", "Token abgelehnt.", code="auth")
+            await ws.close(code=1008)
+            return
+        clear_auth_fails(peer)
 
+    if anhaengen_an or abbrechen:
+        lauf = runs.register.holen(anhaengen_an or abbrechen)
+        if lauf is not None and abbrechen:
+            # Abbrechen heisst jetzt wirklich abbrechen. Frueher genuegte es,
+            # die Verbindung zu schliessen - das beendet den Lauf nicht mehr,
+            # und ein Knopf, der nichts tut, waere schlimmer als keiner.
+            log.info("Abbruch von %s fuer Lauf %s.", peer, lauf.id)
+            if lauf.aufgabe is not None and not lauf.aufgabe.done():
+                lauf.aufgabe.cancel()
+            else:
+                lauf.abschliessen(ok=False, text="Abgebrochen.")
+        if lauf is None:
+            # Ehrlich benennen statt so zu tun, als waere nie etwas gewesen:
+            # die Oberflaeche soll den Verlauf verwerfen, nicht ewig warten.
+            await send_roh("error", "Dieser Lauf ist nicht mehr vorhanden.",
+                           code="unbekannt")
+            await ws.close()
+            return
+        log.info("Zuschauer von %s haengt sich an Lauf %s ab %d an.",
+                 peer, lauf.id, ab_index)
+    else:
         if not prompt:
-            await send("error", "Leerer Auftrag.")
+            await send_roh("error", "Leerer Auftrag.")
             return
+        lauf = runs.register.starten(prompt)
+        log.info("Auftrag von %s (Lauf %s): %s", peer, lauf.id, prompt[:120])
+        lauf.aufgabe = asyncio.create_task(_arbeiten(lauf))
+        ab_index = 0
 
-        # Platz im Lauf-Kontingent holen. Ist alles belegt, sofort und
-        # verstaendlich abweisen statt die Maschine zu ueberladen.
-        try:
-            await asyncio.wait_for(run_slots.acquire(), timeout=0.5)
-        except asyncio.TimeoutError:
-            await send("error", f"Server ausgelastet ({MAX_CONCURRENT} Aufträge "
-                                "laufen bereits). Bitte kurz warten.", code="busy")
-            await send("done", "Abgewiesen.", ok=False, exit=-1, attempts=0, seconds=0)
-            return
-
-        try:
-            log.info("Auftrag von %s: %s", peer, prompt[:120])
-            await send("status", f"Modell {MODEL} über {provider.PROVIDER} — "
-                                 "Auftrag angenommen.")
-
-            async def run_sandbox(files, entry="main.py", *, command=None):
-                return await sandbox_runner(send, files, entry, command=command)
-
-            await dispatch(send, prompt, ask_fn=ask, chat_fn=model_chat,
-                           run_sandbox=run_sandbox, workspace=WORKSPACE)
-        finally:
-            run_slots.release()
-
+    # Jedes Ereignis traegt Laufkennung und laufende Nummer. Damit weiss die
+    # Oberflaeche jederzeit, woran sie haengt und wo sie war - ohne dass es
+    # dafuer eine gesonderte erste Nachricht braucht, die jeder Aufrufer
+    # kennen muesste.
+    try:
+        async for i, ereignis in lauf.folgen(ab_index):
+            await ws.send_text(json.dumps({**ereignis, "i": i, "lauf": lauf.id}))
     except WebSocketDisconnect:
-        log.info("Client hat die Verbindung getrennt - raeume auf.")
-    except Exception as exc:
-        log.exception("Agentenlauf fehlgeschlagen")
-        try:
-            await send("error", f"{type(exc).__name__}: {exc}")
-            await send("done", "Fehlgeschlagen.", ok=False, exit=-1, attempts=0, seconds=0)
-        except Exception:
-            pass
+        log.info("Zuschauer weg - Lauf %s laeuft weiter.", lauf.id)
+    except Exception:
+        log.exception("Senden an den Zuschauer fehlgeschlagen - Lauf %s laeuft weiter.",
+                      lauf.id)

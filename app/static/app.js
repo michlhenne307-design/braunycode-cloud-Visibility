@@ -17,7 +17,9 @@
 const $ = id => document.getElementById(id);
 const TOKEN_KEY = 'brauny.token';
 const HIST_KEY = 'brauny.history';
+const RUN_KEY = 'brauny.run';
 const HIST_MAX = 20;
+const WIEDERHOLUNG = 3000;
 
 const VORSCHLAEGE = [
   'Schreibe rechner.py mit addiere(a, b) und einem Test dazu. Führe den Test aus.',
@@ -272,6 +274,36 @@ function renderHistory() {
 
 /* ----------------------------------------------------------- Lauf */
 
+/* Der Lauf gehoert dem Server, nicht dieser Verbindung. Hier steht nur, an
+   welchen wir haengen und wie weit wir gekommen sind - damit wir nach einem
+   Verbindungsabriss genau dort weitermachen und nichts doppelt anzeigen. */
+
+function laufLesen() {
+  try { return JSON.parse(localStorage.getItem(RUN_KEY)) || null; }
+  catch { return null; }
+}
+
+function laufMerken(daten) {
+  localStorage.setItem(RUN_KEY, JSON.stringify(daten));
+}
+
+function laufVergessen() {
+  localStorage.removeItem(RUN_KEY);
+}
+
+function verbinden(nutzlast, prompt) {
+  const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${scheme}://${location.host}/ws/agent`);
+  ws.onopen = () => ws.send(JSON.stringify(nutzlast));
+  ws.onmessage = e => handleEvent(e.data, prompt);
+  ws.onclose = () => {
+    ws = null;
+    // Nur wenn kein Lauf mehr offen ist, ist wirklich Schluss. Sonst haben
+    // wir bloss den Zuschauerplatz verloren und holen ihn uns gleich zurueck.
+    if (!laufLesen()) { beitragAgentBeenden(); setRunning(false); }
+  };
+}
+
 function start() {
   const prompt = $('prompt').value.trim();
   if (!prompt) { toast('Bitte einen Auftrag eingeben'); return; }
@@ -285,28 +317,61 @@ function start() {
   beitragAgentBeginnen();
   startedAt = Date.now();
   setRunning(true);
-
-  const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${scheme}://${location.host}/ws/agent`);
-  ws.onopen = () => ws.send(JSON.stringify({ token, prompt }));
-  ws.onmessage = e => handleEvent(e.data, prompt);
-  ws.onerror = () => sagen(
-    'Verbindung unterbrochen. Der Lauf auf dem Server kann weitergelaufen sein.',
-    'error');
-  ws.onclose = () => { ws = null; beitragAgentBeenden(); setRunning(false); };
+  // Vorlaeufig ohne Kennung - die kommt mit dem ersten Ereignis zurueck.
+  laufMerken({ id: '', i: 0, prompt });
+  verbinden({ token, prompt }, prompt);
 }
 
 function stop() {
+  const l = laufLesen();
+  const token = localStorage.getItem(TOKEN_KEY) || '';
+  if (l && l.id) {
+    // Der Lauf laeuft auf dem Server weiter, auch wenn wir die Verbindung
+    // kappen. Also muss der Abbruch dorthin, statt nur wegzusehen.
+    if (ws) { ws.onclose = null; ws.close(); ws = null; }
+    verbinden({ token, cancel: l.id, from: l.i || 0 }, l.prompt || '');
+    sagen('Abbruch angefordert …', 'status');
+    return;
+  }
   if (ws) { ws.close(); ws = null; }
+  laufVergessen();
   sagen('Vom Benutzer abgebrochen.', 'error');
   beitragAgentBeenden();
   setRunning(false);
+}
+
+/* Nach dem Aufwachen wieder anhaengen. Auf einem Telefon ist genau das der
+   Normalfall: Bildschirm aus, App gewechselt, Netz gewechselt. */
+function wiederanhaengen() {
+  if (ws) return;
+  const l = laufLesen();
+  if (!l || !l.id) return;
+  const token = localStorage.getItem(TOKEN_KEY) || '';
+  if (!token) return;
+
+  if (!turn) {
+    // Nach einem Neuladen ist der Verlauf leer - den Auftrag wieder hinstellen,
+    // damit die Antwort nicht ohne Frage dasteht.
+    beitragNutzer(l.prompt || '(Auftrag)');
+    beitragAgentBeginnen();
+  }
+  setRunning(true);
+  verbinden({ token, attach: l.id, from: l.i || 0 }, l.prompt || '');
 }
 
 function handleEvent(raw, prompt) {
   let ev;
   try { ev = JSON.parse(raw); }
   catch { sagen(String(raw), 'status'); return; }
+
+  // Jedes Ereignis traegt Laufkennung und laufende Nummer. Damit wissen wir
+  // nach einem Abriss, wo wir waren - und der Server schickt beim erneuten
+  // Anhaengen genau ab dort, nicht von vorn.
+  if (ev.lauf) {
+    const alt = laufLesen() || {};
+    laufMerken({ id: ev.lauf, i: (typeof ev.i === 'number' ? ev.i + 1 : (alt.i || 0)),
+                 prompt: alt.prompt || prompt || '' });
+  }
 
   switch (ev.type) {
     case 'tool':
@@ -325,13 +390,22 @@ function handleEvent(raw, prompt) {
       schritt = null;
       sagen(ev.text || '', 'error');
       if (ev.code === 'auth') {
+        laufVergessen();
         localStorage.removeItem(TOKEN_KEY);
         openGate('Token abgelehnt. Bitte erneut eingeben.');
       }
+      // Der Lauf, an den wir uns haengen wollten, gibt es nicht mehr - dann
+      // hilft auch kein weiterer Versuch.
+      if (ev.code === 'unbekannt') { laufVergessen(); setRunning(false); }
       break;
     case 'done': {
       const sek = ergebnis(ev);
-      addHistory({ prompt, ok: !!ev.ok, at: Date.now(), seconds: sek || '?' });
+      const l = laufLesen();
+      addHistory({ prompt: (l && l.prompt) || prompt,
+                   ok: !!ev.ok, at: Date.now(), seconds: sek || '?' });
+      laufVergessen();
+      beitragAgentBeenden();
+      setRunning(false);
       break;
     }
     default:
@@ -442,6 +516,16 @@ hoeheAnpassen();
 if (!localStorage.getItem(TOKEN_KEY)) openGate();
 checkHealth();
 setInterval(checkHealth, 20000);
+
+// Zurueck aus dem Hintergrund: sofort wieder anhaengen. Der regelmaessige
+// Versuch daneben faengt die Faelle ab, in denen das Ereignis ausbleibt -
+// etwa bei einem Netzwechsel, bei dem die Seite nie unsichtbar war.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) { wiederanhaengen(); checkHealth(); }
+});
+window.addEventListener('online', wiederanhaengen);
+setInterval(wiederanhaengen, WIEDERHOLUNG);
+wiederanhaengen();
 
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
