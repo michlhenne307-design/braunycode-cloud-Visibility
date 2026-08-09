@@ -1866,5 +1866,151 @@ check("_passt vergleicht mit '/' den ganzen Pfad",
 check("_als_zahl verträgt Text von Modellen", tools._als_zahl("12", 0) == 12)
 check("_als_zahl fällt bei Unsinn zurück", tools._als_zahl("viele", 7) == 7)
 
+print("\n[32] Befunde aus der Durchsicht")
+
+# 1. sys.path in der Sandbox. 'python /app/pkg/start.py' setzt sys.path[0] auf
+#    /app/pkg, nicht auf /app - ein Import aus dem Projektstamm scheitert dann.
+#    Der Mehrdatei-Lauf ging nur zufaellig, solange die Startdatei oben lag.
+import inspect  # noqa: E402
+quelle_start = inspect.getsource(sandbox.start)
+check("Sandbox setzt PYTHONPATH=/app",
+      '"PYTHONPATH": "/app"' in quelle_start, quelle_start[-300:])
+
+# Und der Nachweis, dass es ohne PYTHONPATH wirklich bricht:
+tiefes = tempfile.mkdtemp()
+os.makedirs(os.path.join(tiefes, "pkg"))
+open(os.path.join(tiefes, "helfer.py"), "w").write("wert = 7\n")
+open(os.path.join(tiefes, "pkg", "start.py"), "w").write(
+    "import helfer\nprint(helfer.wert)\n")
+ohne = subprocess.run([sys.executable, os.path.join(tiefes, "pkg", "start.py")],
+                      capture_output=True, text=True)
+mit = subprocess.run([sys.executable, os.path.join(tiefes, "pkg", "start.py")],
+                     capture_output=True, text=True,
+                     env={**os.environ, "PYTHONPATH": tiefes})
+check("ohne PYTHONPATH scheitert der Import wirklich",
+      "ModuleNotFoundError" in ohne.stderr, ohne.stderr[-120:])
+check("mit PYTHONPATH klappt er", mit.stdout.strip() == "7", mit.stdout)
+
+# 2. Ein Skill in Latin-1 darf den Dienst nicht am Start hindern.
+kaputt_dir = tempfile.mkdtemp()
+with open(os.path.join(kaputt_dir, "latin.md"), "wb") as fh:
+    fh.write("---\nname: latin\nbeschreibung: gr\xfc\xdfe\n---\nText.\n"
+             .encode("latin-1"))
+open(os.path.join(kaputt_dir, "gut.md"), "w").write(
+    "---\nname: gut\nausloeser: x\n---\nText hier.\n")
+try:
+    geladen = skills_mod.load(kaputt_dir)
+    check("Latin-1-Skill legt den Start nicht lahm", True)
+    check("die anderen Skills werden trotzdem geladen",
+          any(s.name == "gut" for s in geladen), [s.name for s in geladen])
+except Exception as exc:
+    check("Latin-1-Skill legt den Start nicht lahm", False, f"{type(exc).__name__}: {exc}")
+
+# 3. restrict darf konfigurierte Konnektoren nicht wegnehmen.
+kbox = tools.Toolbox(fws, enabled=["git_push", "fetch_url"])
+kbox.restrict(["read_file", "write_file", "finish"])   # nennt keinen Konnektor
+check("Skill ohne Konnektor-Angabe behält die konfigurierten",
+      {"git_push", "fetch_url"} <= kbox.allowed, sorted(kbox.allowed))
+check("Skill schränkt die Basiswerkzeuge trotzdem ein",
+      "delete_file" not in kbox.allowed, sorted(kbox.allowed))
+
+kbox2 = tools.Toolbox(fws, enabled=["git_push", "fetch_url"])
+kbox2.restrict(["read_file", "git_push", "finish"])    # nennt einen Konnektor
+check("nennt der Skill einen Konnektor, gilt genau seine Liste",
+      "git_push" in kbox2.allowed and "fetch_url" not in kbox2.allowed,
+      sorted(kbox2.allowed))
+
+# 4. Ein Tippfehler im Skill darf den Agenten nicht handlungsunfähig machen.
+tbox = tools.Toolbox(fws)
+verworfen = tbox.restrict(["raed_file", "wrtie_file"])   # beides Tippfehler
+check("unbekannte Werkzeuge werden gemeldet",
+      verworfen == ["raed_file", "wrtie_file"], verworfen)
+check("bei nur Tippfehlern wird gar nicht eingeschränkt",
+      len(tbox.schema()) == 16, len(tbox.schema()))
+check("der Agent bleibt handlungsfähig", "read_file" in tbox.allowed)
+
+tbox2 = tools.Toolbox(fws)
+uebrig = tbox2.restrict(["read_file", "gibtsnicht"])
+check("gültige Namen greifen trotz Tippfehler daneben",
+      tbox2.allowed == {"read_file", "finish"}, sorted(tbox2.allowed))
+check("der Tippfehler wird dabei gemeldet", uebrig == ["gibtsnicht"], uebrig)
+
+# 6. edit_file darf eine Nicht-UTF-8-Datei nicht stillschweigend zerstören.
+bws = ws_mod.Workspace(tempfile.mkdtemp())
+with open(bws.root / "latin.txt", "wb") as fh:
+    fh.write("caf\xe9 und stra\xdfe\n".encode("latin-1"))
+vorher = (bws.root / "latin.txt").read_bytes()
+bbox = tools.Toolbox(bws)
+r = asyncio.run(bbox.call("edit_file", {"path": "latin.txt",
+                                        "old_text": "und", "new_text": "oder"}))
+check("edit_file lehnt Nicht-UTF-8 ab", r.startswith("FEHLER") and "UTF-8" in r, r)
+check("die Datei bleibt dabei unangetastet",
+      (bws.root / "latin.txt").read_bytes() == vorher)
+
+# 7. read_file hinter dem Dateiende.
+bws.write("kurz.py", "eins\nzwei\n")
+r = asyncio.run(bbox.call("read_file", {"path": "kurz.py", "offset": 20}))
+check("Offset hinter Dateiende wird verständlich gemeldet",
+      "nur 2 Zeile" in r, r)
+check("kein umgedrehter Bereich mehr", "20–19" not in r, r)
+
+# 5. DNS-Rebinding: die Vorabprüfung allein reicht nicht, weil httpx danach
+#    selbst noch einmal auflöst. Die Antwort wird deshalb erst freigegeben,
+#    wenn auch die tatsächliche Gegenstelle öffentlich ist.
+class FakeStream:
+    def __init__(self, adresse): self._a = adresse
+    def get_extra_info(self, name):
+        return (self._a, 443) if name == "server_addr" else None
+
+class FakeAntwort:
+    def __init__(self, adresse):
+        self.extensions = {"network_stream": FakeStream(adresse)}
+
+def ohne_proxy(fn):
+    """Die Peer-Pruefung entfaellt hinter einem Proxy - fuer den Test weg."""
+    gesichert = {n: os.environ.pop(n, None) for n in connectors.PROXY_VARS}
+    try:
+        return fn()
+    finally:
+        for n, v in gesichert.items():
+            if v is not None:
+                os.environ[n] = v
+
+check("öffentliche Gegenstelle wird durchgelassen",
+      ohne_proxy(lambda: connectors.peer_pruefen(FakeAntwort("93.184.216.34")))
+      is None)
+for boese in ("169.254.169.254", "127.0.0.1", "10.1.2.3", "::1"):
+    try:
+        ohne_proxy(lambda: connectors.peer_pruefen(FakeAntwort(boese)))
+        check(f"Gegenstelle {boese} wird verworfen", False, "durchgelassen")
+    except connectors.ConnectorError as exc:
+        check(f"Gegenstelle {boese} wird verworfen", "verworfen" in str(exc))
+
+# Hinter einem Proxy ist die Gegenstelle der Proxy selbst - wuerde hier
+# geprueft, waere fetch_url in jedem Netz mit Proxy komplett unbrauchbar.
+os.environ["HTTPS_PROXY"] = "http://127.0.0.1:8080"
+try:
+    check("hinter einem Proxy wird nicht geprüft",
+          connectors.peer_pruefen(FakeAntwort("127.0.0.1")) is None)
+    check("proxy_aktiv erkennt die Umgebungsvariable", connectors.proxy_aktiv())
+finally:
+    del os.environ["HTTPS_PROXY"]
+check("ohne Proxy-Variable meldet proxy_aktiv False",
+      ohne_proxy(connectors.proxy_aktiv) is False)
+
+check("ohne ermittelbare Gegenstelle wird nicht blockiert",
+      connectors.peer_pruefen(FakeAntwort(None)) is None)
+class OhneStream:
+    extensions: dict = {}
+check("fehlender Stream blockiert nicht",
+      connectors.peer_pruefen(OhneStream()) is None)
+
+# 8. HTTPS braucht offene Ports 80/443.
+check("enable-https.sh öffnet Port 80 und 443",
+      "for port in 80 443" in https_text2 if (https_text2 := HTTPS_PATH.read_text())
+      else False, "fehlt")
+check("Begründung steht dabei",
+      "HTTP-01" in https_text2)
+
 print(f"\n=== {ok} bestanden, {fail} fehlgeschlagen ===")
 sys.exit(1 if fail else 0)

@@ -53,6 +53,20 @@ if [ -n "$SERVER_IP" ] && [ "$DOMAIN_IP" != "$SERVER_IP" ]; then
   warn "Wenn das nicht stimmt, scheitert die Zertifikatsausstellung."
 fi
 
+step "Ports 80 und 443 in der lokalen Firewall öffnen"
+# Manche Cloud-Images (Oracle) bringen iptables-Regeln mit, die alles ausser
+# Port 22 verwerfen - install.sh oeffnet deshalb ausdruecklich Port 8000.
+# Ohne dasselbe fuer 80 kommt die HTTP-01-Pruefung von Let's Encrypt nicht
+# durch, und das Skript meldet nur "Zertifikat noch nicht da", ohne die
+# Ursache zu nennen.
+for port in 80 443; do
+  if ! iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null; then
+    iptables -I INPUT 1 -p tcp --dport "$port" -j ACCEPT 2>/dev/null \
+      || warn "Konnte Port $port nicht oeffnen - falls eine Firewall aktiv ist, dort nachziehen."
+  fi
+done
+netfilter-persistent save >/dev/null 2>&1 || true
+
 step "Caddy installieren"
 if ! command -v caddy >/dev/null 2>&1; then
   export DEBIAN_FRONTEND=noninteractive

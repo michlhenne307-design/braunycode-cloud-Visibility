@@ -418,11 +418,15 @@ async def dispatch(send, task, *, ask_fn, chat_fn, run_sandbox, workspace=None,
         skill = skills_mod.match(task, SKILLS if skills is None else skills)
         if skill is not None:
             await send("status", f"Skill „{skill.name}“: {skill.beschreibung}")
+            # Erst einschraenken, DANN melden. Andersherum kuendigte die
+            # Meldung Konnektoren an, die der Skill gleich darauf wegnahm.
+            toolbox.restrict(skill.werkzeuge)
 
-        hinweis = (f" Konnektoren: {', '.join(freigegeben)}."
-                   if freigegeben else "")
+        offen = sorted(set(freigegeben) & toolbox.allowed)
+        hinweis = f" Konnektoren: {', '.join(offen)}." if offen else ""
         await send("status", f"Werkzeugmodus: bis zu {agentloop.MAX_STEPS} "
-                             f"Schritte am Projekt.{hinweis}")
+                             f"Schritte am Projekt, {len(toolbox.schema())} "
+                             f"Werkzeuge.{hinweis}")
         outcome = await agentloop.run_tool_agent(
             send, task, chat_fn=chat_fn, toolbox=toolbox, context=context,
             skill=skill)

@@ -100,8 +100,15 @@ def load(directory) -> list[Skill]:
         try:
             if pfad.stat().st_size > MAX_SKILL_BYTES:
                 continue
-            skill = parse(pfad.read_text(encoding="utf-8"), pfad.name)
-        except OSError:
+            # errors="replace" statt strikt: eine Datei in Latin-1 wuerde sonst
+            # UnicodeDecodeError werfen. Das ist ein ValueError, kein OSError -
+            # und weil load() beim Start des Dienstes laeuft, wuerde eine
+            # einzige solche Datei im Skill-Ordner den ganzen Server am
+            # Hochfahren hindern.
+            skill = parse(pfad.read_text(encoding="utf-8", errors="replace"),
+                          pfad.name)
+        except Exception:
+            # Ein kaputter Skill darf die anderen nicht mitreissen.
             continue
         if skill is not None:
             gefunden.append(skill)

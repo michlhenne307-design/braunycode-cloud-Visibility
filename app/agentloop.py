@@ -136,8 +136,11 @@ async def run_tool_agent(send, task, *, chat_fn, toolbox, max_steps=MAX_STEPS,
     if skill is not None:
         # Der Skill schraenkt die Werkzeuge ggf. ein - das muss VOR dem
         # Schema passieren, sonst sieht das Modell Werkzeuge, die es nicht
-        # benutzen darf.
-        toolbox.restrict(skill.werkzeuge)
+        # benutzen darf. Idempotent, falls der Aufrufer es schon getan hat.
+        unbekannt = toolbox.restrict(skill.werkzeuge)
+        if unbekannt:
+            await send("error", f"Skill „{skill.name}“ nennt unbekannte "
+                                f"Werkzeuge: {', '.join(unbekannt)} — ignoriert.")
         system = f"{SYSTEM_PROMPT}\n\n{skill.prompt()}"
 
     head = f"Bestehendes Projekt:\n{context}\n\n" if context else ""

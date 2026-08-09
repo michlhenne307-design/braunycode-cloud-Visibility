@@ -108,7 +108,13 @@ def start(project_dir: str, command=None):
         cap_drop=["ALL"],
         security_opt=["no-new-privileges:true"],
         tmpfs={"/tmp": "rw,size=64m"},
-        environment={"HOME": "/tmp", "PYTHONDONTWRITEBYTECODE": "1"},
+        # PYTHONPATH=/app ist entscheidend fuer mehrdateiige Projekte:
+        # 'python /app/pkg/start.py' setzt sys.path[0] auf /app/pkg, nicht auf
+        # /app. Ein 'import helfer' aus dem Projektstamm scheitert dann mit
+        # ModuleNotFoundError - der Mehrdatei-Lauf waere nur zufaellig
+        # gegangen, solange die Startdatei ganz oben liegt.
+        environment={"HOME": "/tmp", "PYTHONDONTWRITEBYTECODE": "1",
+                     "PYTHONPATH": "/app"},
         # Label, damit verwaiste Container nach einem Absturz wiederfindbar sind
         labels={LABEL_KEY: LABEL_VALUE},
     )

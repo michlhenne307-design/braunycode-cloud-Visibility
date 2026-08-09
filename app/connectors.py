@@ -120,6 +120,59 @@ def check_url(url: str, resolver=_resolve) -> str:
     return parsed.geturl()
 
 
+PROXY_VARS = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+              "ALL_PROXY", "all_proxy")
+
+
+def proxy_aktiv() -> bool:
+    """Laeuft der ausgehende Verkehr ueber einen Proxy?
+
+    Dann ist die Gegenstelle der Proxy - oft 127.0.0.1 - und nicht der
+    Zielserver. Die Peer-Pruefung wuerde jede Anfrage verwerfen.
+    """
+    return any(os.environ.get(name) for name in PROXY_VARS)
+
+
+def peer_pruefen(antwort) -> None:
+    """Prueft NACH dem Verbinden, mit wem tatsaechlich gesprochen wurde.
+
+    check_url loest den Namen auf und prueft die Adressen - danach loest httpx
+    aber selbst noch einmal auf. Zwischen beiden Aufloesungen kann sich die
+    DNS-Antwort aendern (DNS-Rebinding) oder ein Round-Robin eine andere
+    Adresse liefern. Die Vorabpruefung allein waere dann wirkungslos.
+
+    Die Verbindung laesst sich so nicht verhindern - aber die Antwort muss
+    nicht zurueckgegeben werden, und genau darauf kommt es an: ohne Rueckgabe
+    erfaehrt das Modell den Inhalt des Metadaten-Dienstes nicht.
+
+    Laesst sich die Gegenstelle nicht ermitteln, wird nicht blockiert - sonst
+    waere der Konnektor von einem Implementierungsdetail von httpx abhaengig.
+
+    Hinter einem Proxy ist die Gegenstelle der Proxy, haeufig 127.0.0.1. Die
+    Pruefung wuerde dort JEDE Anfrage verwerfen und den Konnektor unbrauchbar
+    machen, deshalb entfaellt sie. Der Schutz gegen Rebinding ist dann nur so
+    gut wie die Vorabpruefung - das steht so in der README.
+    """
+    if proxy_aktiv():
+        return
+    try:
+        stream = antwort.extensions.get("network_stream")
+        gegenstelle = stream.get_extra_info("server_addr") if stream else None
+        adresse = gegenstelle[0] if gegenstelle else None
+    except Exception:
+        return
+    if not adresse:
+        return
+    try:
+        ip = ipaddress.ip_address(adresse)
+    except ValueError:
+        return
+    if ip.is_multicast or not ip.is_global:
+        raise ConnectorError(
+            f"Die Verbindung ging an ein nicht-öffentliches Ziel ({adresse}) — "
+            "Antwort verworfen. Das deutet auf DNS-Rebinding hin.")
+
+
 def to_text(body: str) -> str:
     """HTML grob in Text. Kein Parser, keine Abhaengigkeit - reicht zum Lesen."""
     ohne_bloecke = DROP_BLOCKS.sub(" ", body or "")
@@ -144,6 +197,9 @@ def fetch(url: str, resolver=_resolve) -> str:
     with httpx.Client(timeout=FETCH_TIMEOUT, follow_redirects=False) as client:
         with client.stream("GET", geprueft,
                            headers={"User-Agent": "BraunyCode"}) as antwort:
+            # Zweite Verteidigungslinie gegen DNS-Rebinding: erst pruefen,
+            # mit wem wir wirklich reden, dann irgendetwas zurueckgeben.
+            peer_pruefen(antwort)
             if 300 <= antwort.status_code < 400:
                 ziel = antwort.headers.get("location", "(unbekannt)")
                 return (f"Weiterleitung {antwort.status_code} nach: {ziel}\n"

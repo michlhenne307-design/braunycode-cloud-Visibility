@@ -224,18 +224,45 @@ class Toolbox:
         self.fetched: list[str] = []
         self.finished: str | None = None
 
-    def restrict(self, names) -> None:
+    def restrict(self, names) -> list[str]:
         """Schraenkt die Werkzeuge ein, etwa weil ein Skill es so vorgibt.
 
         Erweitern kann das nie: es wird mit dem geschnitten, was ohnehin
         erlaubt ist. Ein Skill kann also keinen Konnektor freischalten, der
         nicht konfiguriert ist. 'finish' bleibt immer drin, sonst koennte die
         Schleife nicht enden.
+
+        Zwei Faelle, die frueher still danebengingen:
+
+        - Ein Tippfehler in der Skill-Datei liess die Schnittmenge leer werden.
+          Uebrig blieb nur 'finish', der Agent konnte nichts mehr tun und
+          meldete trotzdem Erfolg. Unbekannte Namen werden jetzt verworfen,
+          und bleibt danach nichts Brauchbares uebrig, wird gar nicht
+          eingeschraenkt.
+        - Konnektoren verschwanden, sobald ein Skill griff, weil keiner sie
+          auflistet. Sie sind ausdruecklich konfiguriert worden und bleiben
+          deshalb erhalten, sofern der Skill nicht selbst welche nennt.
+
+        Gibt die verworfenen Namen zurueck, damit der Aufrufer sie melden kann.
         """
         gewuenscht = {n.strip() for n in (names or []) if n and n.strip()}
         if not gewuenscht:
-            return
-        self.allowed = (self.allowed & gewuenscht) | {ALWAYS}
+            return []
+
+        unbekannt = sorted(gewuenscht - NAMES)
+        gueltig = gewuenscht & self.allowed
+        if not gueltig - {ALWAYS}:
+            # Nichts Brauchbares uebrig - lieber nicht einschraenken als den
+            # Agenten handlungsunfaehig machen.
+            return unbekannt
+
+        neu = gueltig | {ALWAYS}
+        # Nennt der Skill selbst keinen Konnektor, bleiben die konfigurierten
+        # erhalten - sie waren eine bewusste Entscheidung des Betreibers.
+        if not (gewuenscht & CONNECTOR_NAMES):
+            neu |= set(self.enabled)
+        self.allowed = neu
+        return unbekannt
 
     def schema(self) -> list[dict]:
         """Nur die Werkzeuge, die dieser Lauf wirklich benutzen darf.
@@ -283,6 +310,10 @@ class Toolbox:
         # zu holen frisst bei einem kleinen Modell das halbe Fenster.
         offset = max(1, _als_zahl(args.get("offset"), 1))
         limit = _als_zahl(args.get("limit"), 0)
+        if offset > gesamt:
+            # Sonst kaeme ein leerer Rumpf mit umgedrehtem Bereich heraus
+            # ("Zeilen 20-19 von 10") - das liest sich wie eine leere Datei.
+            return f"{path} hat nur {gesamt} Zeile(n); Zeile {offset} gibt es nicht."
         ausschnitt = lines[offset - 1:]
         if limit > 0:
             ausschnitt = ausschnitt[:limit]
@@ -322,6 +353,18 @@ class Toolbox:
             return "FEHLER: old_text und new_text sind identisch."
         if not alt:
             return "FEHLER: 'old_text' ist leer — dafür write_file benutzen."
+
+        # ws.read ersetzt ungueltige Bytes durch U+FFFD. Beim Zurueckschreiben
+        # waeren sie dauerhaft verloren - und zwar in der ganzen Datei, nicht
+        # nur an der bearbeiteten Stelle. Ein Werkzeug, das einen Ausschnitt
+        # aendern soll, darf den Rest nicht stillschweigend beschaedigen.
+        roh = self.ws.resolve(path)
+        if roh.is_file():
+            try:
+                roh.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                return (f"FEHLER: {path} ist nicht UTF-8. edit_file würde beim "
+                        "Zurückschreiben Zeichen zerstören.")
 
         text = self.ws.read(path)
         anzahl = text.count(alt)

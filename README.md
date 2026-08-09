@@ -378,9 +378,22 @@ automatisch verfolgt, weil das Ziel nach der Prüfung nach innen zeigen könnte;
 stattdessen wird die Zieladresse gemeldet und beim nächsten Aufruf normal
 mitgeprüft.
 
-Restrisiko, ehrlich benannt: Zwischen Prüfung und Verbindung könnte sich die
-DNS-Antwort ändern (DNS-Rebinding). Vollständig dicht wäre nur ein Verbinden
-auf die bereits geprüfte IP. Das ist hier nicht umgesetzt.
+### Zweite Linie gegen DNS-Rebinding
+
+Die Vorabprüfung allein reicht nicht: nach `check_url` löst die HTTP-Bibliothek
+den Namen **selbst noch einmal** auf. Ändert sich die DNS-Antwort dazwischen
+(oder liefert ein Round-Robin eine andere Adresse), zeigt die Verbindung
+womöglich doch nach innen.
+
+Deshalb wird nach dem Verbinden geprüft, mit **wem** tatsächlich gesprochen
+wurde. Ist die Gegenstelle nicht öffentlich, wird die Antwort verworfen. Die
+Verbindung selbst lässt sich so nicht verhindern — aber der Inhalt erreicht
+das Modell nicht, und darauf kommt es an.
+
+Restrisiko, ehrlich benannt: **Hinter einem Proxy entfällt diese zweite
+Prüfung.** Dort ist die Gegenstelle der Proxy (oft `127.0.0.1`), die Prüfung
+würde jede Anfrage verwerfen und den Konnektor unbrauchbar machen. In einem
+solchen Netz ist der Schutz nur so gut wie die Vorabprüfung.
 
 ### Die Schleife ist misstrauisch
 
@@ -568,7 +581,7 @@ python3 -m venv venv && venv/bin/pip install -r requirements.txt
 venv/bin/python test_smoke.py
 ```
 
-**490 Fälle in 31 Abschnitten, ohne Docker und ohne Ollama.** Modell, Sandbox
+**519 Fälle in 32 Abschnitten, ohne Docker und ohne Ollama.** Modell, Sandbox
 und Werkzeugantworten werden gescriptet hineingereicht.
 
 Abgedeckt sind unter anderem:
@@ -584,6 +597,11 @@ Abgedeckt sind unter anderem:
   Passwort-Platzhalter steht wortgleich in Konfiguration *und* Abbruchprüfung,
   die Deadlock-Abschaltung ist auf beiden Seiten da, HTTPS-Fehlschlag kippt
   die Installation nicht, das Skript endet mit `exit 0`
+- **Befunde einer Durchsicht**: Sandbox setzt `PYTHONPATH=/app` (sonst
+  scheitert der Import bei verschachtelter Startdatei — gegen echtes Python
+  nachgewiesen), ein Latin-1-Skill legt den Dienststart nicht lahm, `restrict`
+  behält konfigurierte Konnektoren und macht bei Tippfehlern nicht
+  handlungsunfähig, `edit_file` verweigert Nicht-UTF-8 statt es zu zerstören
 - **Bearbeitungswerkzeuge**: `edit_file` lehnt fehlenden und mehrdeutigen
   Text ab statt danebenzugreifen, `rename_symbol` lässt Zeichenketten und
   fremde Attribute in Ruhe, `undo` stellt geänderte Dateien wieder her und
@@ -633,7 +651,7 @@ als Text zurück, und der Aufruf des Cloud-Metadaten-Dienstes
 gefälschter Namensauflösung.
 
 **Nicht verifiziert** (Stand dieser Fassung): Es gab noch keinen
-End-to-End-Lauf mit echtem Modell und echtem Docker. Die 490 Tests laufen
+End-to-End-Lauf mit echtem Modell und echtem Docker. Die 519 Tests laufen
 gegen gescriptete Modellantworten — sie belegen, dass die Schleife korrekt
 arbeitet, nicht dass ein bestimmtes Modell gute Ergebnisse liefert. Ob die
 Skills die Ergebnisse eines 7B-Modells **messbar** verbessern, ist nicht
@@ -641,6 +659,10 @@ gemessen; belegt ist nur, dass der richtige Skill ausgewählt wird und seine
 Werkzeugsperre hält. `install.sh` ist syntaktisch geprüft, aber nicht auf
 einem frischen Ubuntu 24.04 durchgelaufen. Die Zeitmessungen stammen von
 x86_64, nicht arm64.
+
+Ebenfalls unbelegt: die Peer-Prüfung gegen DNS-Rebinding wurde nur mit
+gefälschten Antwortobjekten getestet, nicht gegen einen echten
+Rebinding-Angriff.
 
 Dass `fetch_url` Weiterleitungen **nicht** automatisch folgt, ist im Code so
 umgesetzt, konnte hier aber nicht sauber nachgewiesen werden: die
