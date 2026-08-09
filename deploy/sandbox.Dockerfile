@@ -5,8 +5,16 @@
 # Testlaeufer und ohne Hypothesis bleibt dem Agenten nur "Datei parst", und
 # genau das ist der schwaechste aller Belege.
 #
+# ruff ist mit 27 MB der groesste Brocken hier, verdient den Platz aber: es
+# findet undefinierte Namen in Millisekunden, OHNE etwas auszufuehren. Genau
+# diese Fehlerklasse produziert ein kleines Modell am haeufigsten, und sie
+# jetzt zu finden ist billiger als ein Containerstart, der daran scheitert.
+#
 # Was NICHT hineinkommt und warum:
 #
+#   mypy    - 19 MB, aber nur nuetzlich, wenn ein Projekt Typannotationen
+#             pflegt. Der Parser dafuer ist trotzdem da: bringt ein Projekt
+#             sein eigenes mypy mit, werden dessen Befunde verstanden.
 #   mutmut  - zieht textual, rich und markdown-it-py mit, einen kompletten
 #             Terminal-UI-Stapel. In einem Container ohne Netz und ohne
 #             Terminal ist das Ballast: 17 Pakete statt 6. Mutationstests
@@ -28,6 +36,7 @@ FROM python:3.11-slim
 RUN pip install --no-cache-dir --root-user-action=ignore \
       "pytest>=8,<10" \
       "hypothesis>=6,<7" \
+      "ruff>=0.6,<1" \
  && find /usr/local -name '__pycache__' -type d -prune -exec rm -rf {} + \
  && rm -rf /root/.cache
 
@@ -38,4 +47,5 @@ RUN pip install --no-cache-dir --root-user-action=ignore \
 
 # Ein Selbsttest zur Bauzeit: schlaegt der Import fehl, ist das Image kaputt
 # und der Fehler faellt beim Bauen auf statt beim ersten Agentenlauf.
-RUN python -c "import pytest, hypothesis; print(pytest.__version__, hypothesis.__version__)"
+RUN python -c "import pytest, hypothesis; print(pytest.__version__, hypothesis.__version__)" \
+ && ruff --version

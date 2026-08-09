@@ -34,6 +34,10 @@ ASSERTION = "ASSERTION"
 # eigene Kategorie, weil das Fehlergedaechtnis darauf zeigt.
 PROPERTY = "PROPERTY"
 RUNTIME = "RUNTIME"
+# Stilfragen und ungenutzte Namen. Getrennt von den echten Fehlern, weil sie
+# einen Lauf nicht kaputt machen - sie aber in dieselbe Kategorie zu werfen
+# hiesse, dem Modell eine unsortierte Importliste als Absturz zu verkaufen.
+STIL = "STYLE"
 TIMEOUT = "TIMEOUT"
 TOOL = "TOOL"
 UNKNOWN = "UNKNOWN"
@@ -88,6 +92,24 @@ _PYTEST_ORT = re.compile(r"^(?P<datei>[\w./\\-]+\.py):(?P<zeile>\d+): (?P<typ>\w
 _GEGENBEISPIEL = re.compile(
     r"^(?:E\s+)?(?:Failing test case|Falsifying example):\s*(?P<test>\w+)\($")
 _WERKZEUGFEHLER = re.compile(r"^FEHLER: (?:(?P<typ>\w+Error|\w+Exception): )?(?P<text>.*)$")
+
+# ruff, kurzes Format: 'datei.py:1:8: F401 [*] `os` imported but unused'.
+# Bei kaputter Syntax steht dort statt eines Regelcodes 'invalid-syntax'.
+_RUFF = re.compile(
+    r"^(?P<datei>[\w./\\-]+\.py):(?P<zeile>\d+):(?P<spalte>\d+): "
+    # Der Doppelpunkt nach dem Code ist OPTIONAL: bei Regelcodes steht keiner
+    # ('F401 [*] ...'), bei 'invalid-syntax:' schon. Ohne diese Kleinigkeit
+    # faellt ausgerechnet der Syntaxfehler durch - der wichtigste Befund.
+    r"(?P<code>[A-Z]+\d+|invalid-syntax)(?: \[\*\])?:? (?P<text>.+)$")
+
+# mypy: 'datei.py:9: error: Text  [return-value]', Spalte optional.
+_MYPY = re.compile(
+    r"^(?P<datei>[\w./\\-]+\.py):(?P<zeile>\d+)(?::(?P<spalte>\d+))?: "
+    r"(?P<schwere>error|warning|note): (?P<text>.+?)"
+    r"(?:\s+\[(?P<code>[\w-]+)\])?$")
+
+# ruff-Regelcodes, die echte Fehler sind - nicht Stil.
+_RUFF_NAME = ("F821", "F822", "F823")
 
 
 def _rel(pfad: str) -> str:
@@ -287,6 +309,62 @@ def _anhaengen(befunde: list[Finding], gegenbeispiele: dict[str, str]) -> list[F
     return ergebnis
 
 
+def _ruff_kategorie(code: str) -> tuple[str, str]:
+    """ruff-Code -> (Kategorie, Schwere).
+
+    Ein nicht aufgeloester Name ist ein Fehler, eine unsortierte Importliste
+    nicht. Beides als ERROR zu melden wuerde das Modell dazu bringen, Stil zu
+    reparieren, waehrend der eigentliche Fehler stehen bleibt.
+    """
+    if code == "invalid-syntax" or code.startswith("E9"):
+        return SYNTAX, FEHLER
+    if code in _RUFF_NAME:
+        return NAME, FEHLER
+    return STIL, WARNUNG
+
+
+def _linter(text: str, quelle: str) -> list[Finding]:
+    """Befunde von ruff und mypy.
+
+    Beide schreiben zeilenweise und maschinenlesbar - deshalb braucht es hier
+    keinen Modellaufruf und keine Heuristik, nur zwei Muster.
+    """
+    befunde: list[Finding] = []
+    for zeile in text.splitlines():
+        blank = zeile.strip()
+        if not blank:
+            continue
+
+        treffer = _RUFF.match(blank)
+        if treffer:
+            code = treffer.group("code")
+            kategorie, schwere = _ruff_kategorie(code)
+            befunde.append(Finding(
+                kategorie=kategorie, schwere=schwere, typ=code,
+                nachricht=treffer.group("text").strip(),
+                datei=_rel(treffer.group("datei")),
+                zeile=int(treffer.group("zeile")),
+                quelle=quelle, roh=blank))
+            continue
+
+        treffer = _MYPY.match(blank)
+        if treffer:
+            # 'note:' sind Zusatzzeilen unter einem Fehler, keine eigenen
+            # Befunde. Sie mitzuzaehlen blaehte die Liste auf, ohne etwas
+            # Neues zu sagen.
+            if treffer.group("schwere") == "note":
+                continue
+            befunde.append(Finding(
+                kategorie=TYPE, schwere=(FEHLER if treffer.group("schwere") == "error"
+                                         else WARNUNG),
+                typ=treffer.group("code") or "mypy",
+                nachricht=treffer.group("text").strip(),
+                datei=_rel(treffer.group("datei")),
+                zeile=int(treffer.group("zeile")),
+                quelle=quelle, roh=blank))
+    return befunde
+
+
 def _kopfloser_syntaxfehler(text: str, quelle: str) -> list[Finding]:
     """Der Sonderfall ohne 'Traceback'-Kopf.
 
@@ -346,6 +424,11 @@ def parse(text: str, quelle: str = "sandbox") -> list[Finding]:
     # Erst wenn kein Traceback da ist - sonst wuerde ein SyntaxError INNERHALB
     # eines Tracebacks (kaputtes Modul beim Import) doppelt gezaehlt.
     befunde = _kopfloser_syntaxfehler(text, quelle)
+    if befunde:
+        return befunde
+
+    # ruff und mypy schreiben zeilenweise und ohne Traceback.
+    befunde = _linter(text, quelle)
     if befunde:
         return befunde
 

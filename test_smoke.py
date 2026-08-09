@@ -2981,5 +2981,88 @@ check("finish geht deshalb durch",
       not asyncio.run(_tb.call("finish", {"summary": "x"})).startswith("FEHLER"))
 
 
+# --------------------------------------------------------- Linter-Ausgabe
+print("\n[43] ruff und mypy")
+
+# Aufzeichnungen aus echten Laeufen (ruff 0.16.2, mypy 2.3.0). ruff steckt im
+# Sandbox-Image, mypy nicht - dessen Parser ist trotzdem da, falls ein Projekt
+# sein eigenes mitbringt.
+
+_RUFF = """modul.py:1:1: I001 [*] Import block is un-sorted or un-formatted
+modul.py:1:8: F401 [*] `os` imported but unused
+modul.py:13:5: F841 Local variable `x` is assigned to but never used
+modul.py:13:9: F821 Undefined name `ergebnis`
+Found 4 errors."""
+
+_b = diagnostics.parse(_RUFF, "run_command")
+check("ruff: alle vier Zeilen erkannt", len(_b) == 4, _b)
+_nach_typ = {f.typ: f for f in _b}
+# Ein nicht aufgeloester Name ist ein Fehler, eine unsortierte Importliste
+# nicht. Beides gleich zu melden brächte das Modell dazu, Stil zu reparieren,
+# während der echte Fehler stehen bleibt.
+check("undefinierter Name ist ein Fehler",
+      _nach_typ["F821"].schwere == diagnostics.FEHLER
+      and _nach_typ["F821"].kategorie == diagnostics.NAME, _nach_typ["F821"])
+check("unsortierte Importe sind nur Stil",
+      _nach_typ["I001"].schwere == diagnostics.WARNUNG
+      and _nach_typ["I001"].kategorie == diagnostics.STIL, _nach_typ["I001"])
+check("ungenutzter Import ist nur Stil",
+      _nach_typ["F401"].schwere == diagnostics.WARNUNG, _nach_typ["F401"])
+check("ruff: Datei und Zeile stimmen",
+      _nach_typ["F821"].datei == "modul.py" and _nach_typ["F821"].zeile == 13,
+      _nach_typ["F821"])
+check("die Zusammenfassungszeile erzeugt keinen Befund",
+      all("Found 4 errors" not in f.nachricht for f in _b), _b)
+
+# Der Sonderfall, an dem die erste Fassung gescheitert ist: bei kaputter
+# Syntax schreibt ruff 'invalid-syntax:' MIT Doppelpunkt, bei Regelcodes steht
+# keiner. Ausgerechnet der wichtigste Befund fiel damit durch.
+_b = diagnostics.parse(
+    "kaputt.py:1:7: invalid-syntax: Expected a parameter or the end of the "
+    "parameter list\nFound 1 error.", "run_command")
+check("ruff: Syntaxfehler wird erkannt", len(_b) == 1, _b)
+check("und als SYNTAX/Fehler eingeordnet",
+      _b and _b[0].kategorie == diagnostics.SYNTAX
+      and _b[0].schwere == diagnostics.FEHLER, _b)
+
+_MYPY = ('modul.py:9: error: Incompatible return value type (got "int", '
+         'expected "str")  [return-value]\n'
+         "Found 1 error in 1 file (checked 1 source file)")
+_b = diagnostics.parse(_MYPY, "run_command")
+check("mypy: Befund erkannt", len(_b) == 1, _b)
+check("mypy: Kategorie ist TYPE",
+      _b and _b[0].kategorie == diagnostics.TYPE, _b)
+check("mypy: der Regelcode wird zum Typ",
+      _b and _b[0].typ == "return-value", _b)
+check("mypy: Zeile stimmt", _b and _b[0].zeile == 9, _b)
+
+# Mit --show-column-numbers steht eine Spalte dazwischen.
+_b = diagnostics.parse(_MYPY.replace("modul.py:9:", "modul.py:9:12:"), "run_command")
+check("mypy: Spaltenangabe stört nicht",
+      len(_b) == 1 and _b[0].zeile == 9, _b)
+
+# 'note:' sind Zusatzzeilen unter einem Fehler, keine eigenen Befunde.
+_b = diagnostics.parse(
+    'a.py:3: error: Argument 1 has incompatible type  [arg-type]\n'
+    'a.py:3: note: "f" defined here', "run_command")
+check("mypy: Notizzeilen zählen nicht als Befund", len(_b) == 1, _b)
+
+# Gegenprobe: Erfolgsmeldungen dürfen nichts erfinden.
+for _sauber in ("All checks passed!",
+                "Success: no issues found in 1 source file",
+                "Alles in Ordnung."):
+    check(f"sauberer Lauf ergibt nichts: {_sauber[:24]}",
+          diagnostics.parse(_sauber) == [])
+
+# Und ruff gehört ins Image, mypy bewusst nicht.
+if os.path.exists(_DOCKERFILE):
+    with open(_DOCKERFILE, encoding="utf-8") as _fh:
+        _df = _fh.read()
+    _rezept = _df.split("RUN pip install")[1].split("&&")[0]
+    check("ruff steckt im Sandbox-Image", "ruff" in _rezept, _rezept)
+    check("mypy bleibt bewusst draußen", "mypy" not in _rezept, _rezept)
+    check("das Image prüft ruff beim Bauen", "ruff --version" in _df)
+
+
 print(f"\n=== {ok} bestanden, {fail} fehlgeschlagen ===")
 sys.exit(1 if fail else 0)
