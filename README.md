@@ -59,6 +59,7 @@ Browser (Handy/Rechner) ──WebSocket──▶  FastAPI
 | `systemd/braunycode.service` | Referenz-Unit (wird vom Installer geschrieben) |
 | `test_smoke.py` | Tests ohne Docker/Ollama-Abhängigkeit |
 | `deploy/hetzner-cloud-init.yaml` | Unbeaufsichtigte Einrichtung — ganz ohne SSH |
+| `deploy/enable-https.sh` | Caddy davor, Zertifikat von Let's Encrypt |
 | `docs/SETUP-Hetzner.md` | Schritt für Schritt, komplett vom Handy machbar |
 | `docs/SETUP-iPhone.md` | Derselbe Weg über den Oracle Free Tier |
 
@@ -152,7 +153,22 @@ Was die Oberfläche kann:
 Zwei Einschränkungen über HTTP, in **jedem** Browser gleich: ohne HTTPS wird
 **kein Service Worker** registriert — die Seite funktioniert, nur ohne
 Offline-Hülle. Und der Kopieren-Knopf braucht ebenfalls einen sicheren
-Kontext. Beides löst ein TLS-Proxy oder der SSH-Tunnel weiter unten.
+Kontext.
+
+Beides löst [`deploy/enable-https.sh`](deploy/enable-https.sh): kostenloser
+Name bei DuckDNS, Caddy davor, Zertifikat von Let's Encrypt — und weil damit
+auch das Passwort verschlüsselt übertragen wird, ist es mehr als Kosmetik.
+
+```bash
+sudo bash deploy/enable-https.sh <name>.duckdns.org
+```
+
+Naheliegend wären Dienste wie `sslip.io`, die jede IP als Namen auflösen und
+den DuckDNS-Schritt sparen würden. Die stehen aber **nicht** auf der Public
+Suffix List: Let's Encrypt zählt dort die gesamte Domain als eine einzige mit
+50 Zertifikaten pro Woche, geteilt mit allen Nutzern weltweit — das Limit ist
+praktisch dauernd ausgeschöpft. `duckdns.org` steht auf der Liste, dort
+bekommt jede Unterdomain ihr eigenes Kontingent.
 
 > **Hinweis zu iPhone und iPad:** Dort benutzen *alle* Browser dieselbe
 > Engine (WebKit) — Chrome, Firefox und Edge sind andere Oberflächen um
@@ -479,7 +495,7 @@ python3 -m venv venv && venv/bin/pip install -r requirements.txt
 venv/bin/python test_smoke.py
 ```
 
-**359 Fälle in 27 Abschnitten, ohne Docker und ohne Ollama.** Modell, Sandbox
+**390 Fälle in 29 Abschnitten, ohne Docker und ohne Ollama.** Modell, Sandbox
 und Werkzeugantworten werden gescriptet hineingereicht.
 
 Abgedeckt sind unter anderem:
@@ -491,6 +507,10 @@ Abgedeckt sind unter anderem:
   denselben Branch; Token taucht in keiner Ausgabe auf
 - **Skills**: wortweise Auswahl (kein Teilstring), `review` kann nicht
   schreiben, ein Skill kann keinen Konnektor freischalten, `finish` bleibt
+- **Unbeaufsichtigte Einrichtung**: cloud-init ist gültiges YAML, der
+  Passwort-Platzhalter steht wortgleich in Konfiguration *und* Abbruchprüfung,
+  die Deadlock-Abschaltung ist auf beiden Seiten da, HTTPS-Fehlschlag kippt
+  die Installation nicht, das Skript endet mit `exit 0`
 - **Werkzeuge**: Pfadausbrüche (`..`, absolute Pfade, Symlinks) blockiert,
   fehlende Dateien und unbekannte Werkzeuge liefern Fehlertext statt Absturz,
   lange Ausgaben werden gekürzt
@@ -525,7 +545,7 @@ Beides läuft durch dieselbe Schleife. Der Wechsel ist eine Zeile in
 schwächsten Modell hängen.
 
 **Nicht verifiziert** (Stand dieser Fassung): Es gab noch keinen
-End-to-End-Lauf mit echtem Modell und echtem Docker. Die 359 Tests laufen
+End-to-End-Lauf mit echtem Modell und echtem Docker. Die 390 Tests laufen
 gegen gescriptete Modellantworten — sie belegen, dass die Schleife korrekt
 arbeitet, nicht dass ein bestimmtes Modell gute Ergebnisse liefert. Ob die
 Skills die Ergebnisse eines 7B-Modells **messbar** verbessern, ist nicht
@@ -534,6 +554,11 @@ Werkzeugsperre hält. `fetch_url` ist gegen echte Webseiten ungetestet — der
 Schutz ist geprüft, das Abholen selbst nicht. `install.sh` ist syntaktisch
 geprüft, aber nicht auf einem frischen Ubuntu 24.04 durchgelaufen. Die
 Zeitmessungen stammen von x86_64, nicht arm64.
+
+Ebenso ungetestet: **cloud-init lief nie auf einem echten Server**, und
+`enable-https.sh` hat **nie ein echtes Zertifikat geholt** — geprüft sind
+Syntax, Caddyfile-Struktur und die Auflösbarkeit der Namen, nicht die
+Ausstellung selbst.
 
 ### Stärkeres Modell über eine API
 

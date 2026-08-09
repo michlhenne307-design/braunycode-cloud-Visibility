@@ -47,6 +47,13 @@ write_files:
       BRAUNY_REPO=https://github.com/michlhenne307-design/braunycode-cloud-Visibility.git
       BRAUNY_BRANCH=main
 
+      # OPTIONAL: HTTPS statt HTTP.
+      # Kostenlosen Namen auf https://www.duckdns.org holen (Login mit einem
+      # bestehenden Konto, Namen ausdenken, Server-IP eintragen) und hier
+      # eintragen, z. B. BRAUNY_DOMAIN=meinbrauny.duckdns.org
+      # Leer lassen = nur HTTP. Port 8000 bleibt in beiden Faellen offen.
+      BRAUNY_DOMAIN=
+
   - path: /usr/local/bin/braunycode-setup.sh
     permissions: "0755"
     content: |
@@ -96,8 +103,24 @@ write_files:
         BRAUNY_PORT="$BRAUNY_PORT" \
         bash "$SRC/install.sh"
 
+      # HTTPS nur, wenn ein Name eingetragen wurde. Ein Fehlschlag hier darf
+      # die Einrichtung nicht kippen - der Dienst laeuft dann eben ueber HTTP
+      # weiter, statt dass gar nichts erreichbar ist.
+      if [ -n "${BRAUNY_DOMAIN:-}" ]; then
+        echo "--- HTTPS fuer $BRAUNY_DOMAIN einrichten ---"
+        bash "$SRC/deploy/enable-https.sh" "$BRAUNY_DOMAIN" \
+          || echo "HTTPS fehlgeschlagen - HTTP auf Port $BRAUNY_PORT bleibt erreichbar."
+      fi
+
       echo "=== BraunyCode-Einrichtung fertig: $(date -Is) ==="
       echo "Oberflaeche: http://$(curl -fsS --max-time 5 https://api.ipify.org || echo SERVER-IP):$BRAUNY_PORT"
+      # Als if-Block, nicht als '[ ... ] && echo': bei leerer Domain waere der
+      # Test der letzte Befehl und das Skript endete mit Status 1 - die
+      # Einrichtung wuerde faelschlich als fehlgeschlagen gemeldet.
+      if [ -n "${BRAUNY_DOMAIN:-}" ]; then
+        echo "Oder ueber HTTPS: https://$BRAUNY_DOMAIN"
+      fi
+      exit 0
 
 runcmd:
   - [ bash, -lc, "/usr/local/bin/braunycode-setup.sh || echo 'Einrichtung fehlgeschlagen - siehe /var/log/braunycode-setup.log'" ]

@@ -1497,6 +1497,49 @@ if yaml and ci_text:
           "docker" not in gruppen, gruppen)
     check("Benutzer bekommt sudo", "sudo" in gruppen, gruppen)
 
+print("\n[29] HTTPS-Einrichtung")
+
+HTTPS_PATH = main.BASE_DIR.parent / "deploy" / "enable-https.sh"
+check("enable-https.sh vorhanden", HTTPS_PATH.exists(), HTTPS_PATH)
+https_text = HTTPS_PATH.read_text() if HTTPS_PATH.exists() else ""
+
+check("enable-https.sh ist syntaktisch gültig",
+      subprocess.run(["bash", "-n", str(HTTPS_PATH)],
+                     capture_output=True).returncode == 0)
+
+# sslip.io/nip.io stehen NICHT auf der Public Suffix List. Let's Encrypt
+# zaehlt die ganze Domain als eine einzige mit 50 Zertifikaten pro Woche,
+# geteilt mit allen Nutzern weltweit - die Ausstellung wuerde fast immer
+# scheitern. Wer das hier spaeter "vereinfachen" will, faellt genau darauf
+# herein.
+check("baut NICHT auf sslip.io/nip.io",
+      "sslip.io" not in https_text.split("# WARUM")[-1].split("set -euo")[0]
+      or "NICHT auf der Public Suffix List" in https_text, "Begründung fehlt")
+check("Begründung gegen sslip.io steht im Skript",
+      "Public Suffix List" in https_text)
+check("reverse_proxy im Caddyfile (WebSocket läuft darüber)",
+      "reverse_proxy" in https_text)
+check("Caddyfile wird vor dem Neustart geprüft",
+      "caddy validate" in https_text)
+check("Domain wird gegen die Server-IP geprüft",
+      "api.ipify.org" in https_text and "getent hosts" in https_text)
+check("Aufruf ohne Domain wird abgelehnt",
+      "Aufruf: sudo bash enable-https.sh" in https_text)
+check("http:// im Argument wird abgefangen", "http://*|https://*)" in https_text)
+
+if yaml and ci_text:
+    check("cloud-init kennt BRAUNY_DOMAIN", "BRAUNY_DOMAIN=" in conf, conf[-300:])
+    check("BRAUNY_DOMAIN ist standardmäßig leer (nur HTTP)",
+          _re.search(r"^BRAUNY_DOMAIN=\s*$", conf, _re.M) is not None, conf[-200:])
+    check("cloud-init ruft enable-https.sh auf", "enable-https.sh" in setup)
+    # Ein Fehlschlag beim Zertifikat darf die ganze Einrichtung nicht kippen.
+    check("HTTPS-Fehlschlag ist nicht tödlich",
+          "|| echo \"HTTPS fehlgeschlagen" in setup, setup[-800:])
+    # Bei leerer Domain waere ein '[ -n ... ] && echo' der letzte Befehl und
+    # das Skript endete mit Status 1 - ein Fehlalarm.
+    check("Einrichtungsskript endet ausdrücklich mit exit 0",
+          setup.rstrip().endswith("exit 0"), setup[-120:])
+
 installer = (main.BASE_DIR.parent / "install.sh").read_text()
 check("Installer übernimmt ein vorgegebenes Token",
       'if [ -n "${BRAUNY_TOKEN:-}" ]' in installer)

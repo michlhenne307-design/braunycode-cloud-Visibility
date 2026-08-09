@@ -62,6 +62,29 @@ Den aktuellen Preis siehst du im Bestellvorgang direkt neben dem Typ — dort
 steht auch, ob die IPv4-Adresse extra kostet. Prüf ihn dort, statt dich auf
 Zahlen aus einer Anleitung zu verlassen.
 
+## Schritt 3b (empfohlen) — Kostenlosen Namen für HTTPS holen
+
+Überspringbar, aber lohnt sich: ohne HTTPS geht dein Passwort unverschlüsselt
+über die Leitung, und die App bleibt ohne Offline-Hülle und Kopieren-Knopf.
+
+Dauert eine Minute, kostet nichts, geht am Handy:
+
+1. **https://www.duckdns.org** öffnen
+2. Oben mit einem bestehenden Konto anmelden (GitHub, Google, Reddit …)
+3. Wunschnamen eintragen, z. B. `meinbrauny` → **add domain**
+4. Du hast jetzt `meinbrauny.duckdns.org`
+
+Das Feld **current ip** füllst du gleich nach Schritt 5 mit der IP deines
+Servers. Der Name ist danach sofort nutzbar.
+
+> **Warum ein Name und nicht einfach die IP?** Let's Encrypt stellt keine
+> Zertifikate auf IP-Adressen aus. Dienste wie `sslip.io`, die jede IP als
+> Namen auflösen, wären naheliegend — sie stehen aber nicht auf der Public
+> Suffix List. Let's Encrypt zählt dort die gesamte Domain als eine einzige
+> mit 50 Zertifikaten pro Woche, geteilt mit allen Nutzern weltweit. Das
+> Limit ist praktisch dauernd ausgeschöpft. `duckdns.org` steht auf der
+> Liste, dort bekommt jede Unterdomain ein eigenes Kontingent.
+
 ## Schritt 4 — Das Startskript einfügen (der wichtige Teil)
 
 Weiter unten auf derselben Seite: **Cloud config** aufklappen.
@@ -83,6 +106,16 @@ Dort hinein kommt der komplette Inhalt von
 > Ein öffentlich erreichbarer Dienst mit einem Passwort, das in einer
 > Anleitung steht, wäre offen für jeden.
 
+**Wenn du Schritt 3b gemacht hast**, trag ein paar Zeilen tiefer noch deinen
+Namen ein:
+
+```
+BRAUNY_DOMAIN=meinbrauny.duckdns.org
+```
+
+Leer lassen = nur HTTP. Port 8000 bleibt in beiden Fällen offen, ein
+Fehlschlag beim Zertifikat sperrt dich also nie aus.
+
 Dann: **Create & Buy now**.
 
 ## Schritt 5 — Warten
@@ -93,10 +126,20 @@ Minuten**. Das meiste davon ist der Modell-Download (~4,7 GB).
 In der Übersicht steht jetzt die **IPv4-Adresse** deines Servers, etwa
 `46.62.144.20`. Notier sie dir.
 
+**Falls du DuckDNS benutzt:** Jetzt zurück auf duckdns.org, die IP ins Feld
+**current ip** eintragen, **update ip** drücken. Am besten sofort — die
+Einrichtung braucht den Namen gegen Ende, wenn sie das Zertifikat holt.
+
 Ruf im Browser auf:
 
 ```
 http://<DEINE-SERVER-IP>:8000
+```
+
+Mit DuckDNS zusätzlich, sobald HTTPS steht:
+
+```
+https://<DEIN-NAME>.duckdns.org
 ```
 
 - **Seite lädt nicht / „Verbindung fehlgeschlagen"** → noch nicht fertig,
@@ -147,18 +190,31 @@ Ergebnisse per `git_push`-Konnektor in ein Repository schieben.
 
 ---
 
+## HTTPS nachträglich einschalten
+
+Hast du Schritt 3b übersprungen und willst es doch: Namen bei DuckDNS holen,
+Server-IP dort eintragen, dann in der Browser-Konsole (Server anklicken →
+Symbol **>_**):
+
+```bash
+bash /opt/braunycode-src/deploy/enable-https.sh <DEIN-NAME>.duckdns.org
+```
+
+Danach die App noch einmal zum Home-Bildschirm hinzufügen, damit sie die
+HTTPS-Adresse benutzt.
+
 ## Sicherheitshinweis, ehrlich gesagt
 
-Der Dienst läuft über **HTTP, nicht HTTPS**. Das heißt: dein Passwort und
-dein Code gehen unverschlüsselt über die Leitung. In einem Mobilfunknetz oder
-im heimischen WLAN ist das Risiko überschaubar, in einem fremden offenen WLAN
-nicht.
+**Ohne HTTPS** gehen dein Passwort und dein Code unverschlüsselt über die
+Leitung. Im Mobilfunknetz oder im heimischen WLAN ist das Risiko überschaubar,
+in einem fremden offenen WLAN nicht. Außerdem fehlen dann zwei Dinge, die
+Browser nur in einem sicheren Kontext erlauben: der **Service Worker** (die
+Offline-Hülle der App) und der **Kopieren-Knopf**.
 
-Zwei Folgen davon:
+**Auch mit HTTPS** bleibt der Dienst öffentlich erreichbar — geschützt nur
+durch dein Passwort. Nimm ein langes, und benutz es nirgends sonst. Wer es
+hat, kann auf deinem Server Code ausführen.
 
-- Der **Service Worker** wird nicht registriert (Browser verlangen dafür einen
-  sicheren Kontext) — die Offline-Hülle der App fehlt also.
-- Der **Kopieren-Knopf** funktioniert aus demselben Grund nicht.
-
-Beides löst erst echtes HTTPS. Das braucht einen Domainnamen oder einen
-Reverse-Proxy und ist in dieser Fassung **nicht** eingerichtet.
+Port 8000 bleibt auch nach dem Einschalten von HTTPS offen, damit ein Problem
+mit dem Zertifikat dich nicht aussperrt. Wenn du das nicht willst, kannst du
+ihn später schließen — dann ist HTTPS aber der einzige Weg hinein.
