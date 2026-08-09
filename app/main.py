@@ -429,7 +429,7 @@ async def dispatch(send, task, *, ask_fn, chat_fn, run_sandbox, workspace=None,
                              f"Werkzeuge.{hinweis}")
         outcome = await agentloop.run_tool_agent(
             send, task, chat_fn=chat_fn, toolbox=toolbox, context=context,
-            skill=skill)
+            skill=skill, symbole={s.name for s in index.symbols})
         if outcome != "no-tools":
             return outcome
         if mode == "tools":

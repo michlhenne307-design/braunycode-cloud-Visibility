@@ -19,6 +19,7 @@ import os
 import time
 
 import provider
+import readiness
 import tools
 
 # Wie viele Werkzeugrunden ein Auftrag hoechstens bekommt. Jede Runde ist ein
@@ -122,7 +123,7 @@ def trim(messages: list[dict], limit: int = MAX_HISTORY) -> list[dict]:
 
 
 async def run_tool_agent(send, task, *, chat_fn, toolbox, max_steps=MAX_STEPS,
-                         context="", skill=None):
+                         context="", skill=None, symbole=()):
     """Laesst das Modell mit Werkzeugen am Projekt arbeiten.
 
     chat_fn(messages, schema) -> provider.Reply ist hineingereicht, damit die
@@ -134,11 +135,30 @@ async def run_tool_agent(send, task, *, chat_fn, toolbox, max_steps=MAX_STEPS,
       "failed"   - Schrittgrenze oder Modellfehler, 'done' wurde gesendet
       "no-tools" - das Modell kann keine Werkzeuge; KEIN 'done' gesendet,
                    der Aufrufer soll auf den einfachen Weg wechseln
+      "clarify"  - der Auftrag nennt etwas, das es nicht gibt; nichts wurde
+                   angefasst, die Rueckfragen sind gesendet
     """
     start = time.monotonic()
 
     def elapsed():
         return round(time.monotonic() - start, 1)
+
+    # Bereitschaft VOR der ersten Aenderung. Der teuerste Fehler ist nicht der
+    # Absturz, sondern die saubere Arbeit am falschen Ziel: nennt der Auftrag
+    # eine Datei, die es nicht gibt, waehlt das Modell sonst eine aehnliche und
+    # aendert ueberzeugend die falsche. Hinterher stimmt jede Pruefung.
+    urteil = readiness.pruefen(task, toolbox.ws.list_files(), symbole)
+    if not urteil.darf_starten:
+        await send("error", urteil.text())
+        await send("done", "Rückfrage nötig — es wurde nichts geändert.",
+                   ok=False, exit=-1, attempts=0, seconds=elapsed(),
+                   verified=False)
+        return "clarify"
+    if urteil.annahmen:
+        # Nicht blockieren, aber auch nicht verschweigen: die Annahme steht
+        # sichtbar da UND im Auftrag, damit das Modell dieselbe trifft.
+        await send("status", urteil.text())
+        task = f"{task}\n\n{urteil.text()}"
 
     system = SYSTEM_PROMPT
     if skill is not None:

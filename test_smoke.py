@@ -2392,5 +2392,93 @@ for _s in _skills:
               "affected_tests" in _erlaubt, sorted(_erlaubt))
 
 
+# ------------------------------------------------------ Bereitschaftspruefung
+print("\n[37] Bereitschaft: nicht raten, welche Datei gemeint war")
+
+import readiness  # noqa: E402
+
+_d = ["app/main.py", "app/tools.py", "app/workspace.py", "test_smoke.py"]
+_sym = ["berechne_summen", "berechne_saldo", "Workspace", "Toolbox"]
+
+def _stand(text):
+    return readiness.pruefen(text, _d, _sym).stand
+
+check("bekannte Datei ist bereit",
+      _stand("Behebe den Fehler in app/tools.py") == readiness.BEREIT)
+check("Tippfehler wird zur benannten Annahme",
+      _stand("Behebe den Fehler in app/tool.py") == readiness.BEREIT_MIT_ANNAHME)
+check("unbekannte Datei löst Rückfrage aus",
+      _stand("Behebe den Fehler in app/kern.py") == readiness.RUECKFRAGE)
+check("Symbol-Tippfehler wird zur Annahme",
+      _stand("Benenne berechne_summe in summiere um") == readiness.BEREIT_MIT_ANNAHME)
+
+# Die Rueckfrage muss konkret sein, nicht "bitte praezisieren".
+_u = readiness.pruefen("Behebe den Fehler in app/tool.py", _d, _sym)
+check("die Annahme nennt beide Namen",
+      "app/tool.py" in _u.text() and "app/tools.py" in _u.text(), _u.text())
+
+# Keine Rueckfrage aus Prinzip: vage Auftraege sind kein Mangel, sie nennen
+# eben nichts Konkretes. Wer hier fragt, macht den Agenten unbrauchbar.
+for _vage in ("Mach die Anwendung schneller",
+              "Die Datenbank ist zu langsam, optimiere die Abfragen",
+              "Räum den Code auf"):
+    check(f"vage bleibt bereit: {_vage[:28]}", _stand(_vage) == readiness.BEREIT)
+
+# Anlege-Absicht: dass die Datei fehlt, IST der Auftrag.
+for _neu in ("Schreibe eine neue Datei helfer.py",
+             "Erstelle die Datei berichte.py",
+             "Lege ein neues Modul cache.py an",
+             "Create a new file cache.py"):
+    check(f"Neuanlage fragt nicht: {_neu[:30]}", _stand(_neu) == readiness.BEREIT)
+
+# ... aber "neu" auf einer Datei, die es schon gibt, ist ein Widerspruch.
+check("Neuanlage einer vorhandenen Datei wird hinterfragt",
+      _stand("Lege eine neue Datei tools.py an") == readiness.RUECKFRAGE)
+# ... und "neue Funktion IN einer Datei" ist keine Dateianlage.
+check("'neue Funktion in X' ist keine Neuanlage",
+      _stand("Füge eine neue Funktion in app/kern.py hinzu") == readiness.RUECKFRAGE)
+
+check("leeres Projekt fragt nie",
+      readiness.pruefen("Baue etwas in main.py", [], []).stand == readiness.BEREIT)
+
+# Verdrahtung: die Sperre muss VOR der ersten Änderung greifen.
+_w = ws_mod.Workspace(tempfile.mkdtemp())
+_w.write("app/tools.py", "x = 1\n")
+_ereignisse = []
+async def _send(typ, text="", **rest):
+    _ereignisse.append({"type": typ, "text": text, **rest})
+async def _chat(_messages, _schema):
+    raise AssertionError("Das Modell darf bei einer Rückfrage gar nicht laufen")
+
+_tb = tools.Toolbox(_w)
+_ausgang = asyncio.run(agentloop.run_tool_agent(
+    _send, "Behebe den Fehler in app/kern.py",
+    chat_fn=_chat, toolbox=_tb, symbole=[]))
+check("Lauf endet als clarify", _ausgang == "clarify", _ausgang)
+check("kein Modellaufruf bei Rückfrage", True)   # _chat haette sonst geworfen
+check("nichts wurde geschrieben", _tb.written == [], _tb.written)
+check("die Frage nennt die Datei",
+      any("app/kern.py" in e["text"] for e in _ereignisse if e["type"] == "error"),
+      _ereignisse)
+check("done meldet ehrlich ok=False",
+      any(e["type"] == "done" and e["ok"] is False for e in _ereignisse),
+      _ereignisse)
+
+# Annahme blockiert nicht, steht aber im Auftrag, den das Modell sieht.
+_gesehen = []
+async def _chat2(messages, _schema):
+    _gesehen.append(messages)
+    return reply(calls=[("finish", {"summary": "fertig"})])
+_tb2 = tools.Toolbox(ws_mod.Workspace(tempfile.mkdtemp()))
+_tb2.ws.write("app/tools.py", "x = 1\n")
+_ausgang = asyncio.run(agentloop.run_tool_agent(
+    _send, "Behebe den Fehler in app/tool.py",
+    chat_fn=_chat2, toolbox=_tb2, symbole=[]))
+check("Annahme blockiert den Lauf nicht", _ausgang == "ok", _ausgang)
+check("die Annahme steht im Auftrag des Modells",
+      any("app/tools.py" in m.get("content", "")
+          for m in _gesehen[0] if m.get("role") == "user"), _gesehen[0])
+
+
 print(f"\n=== {ok} bestanden, {fail} fehlgeschlagen ===")
 sys.exit(1 if fail else 0)
