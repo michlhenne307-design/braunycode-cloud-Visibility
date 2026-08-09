@@ -1,24 +1,89 @@
 #!/usr/bin/env bash
 #
-# BraunyCode Cloud - Installer fuer Ubuntu 24.04 (Oracle Cloud Ampere A1 / arm64)
+# BraunyCode Cloud - Installer fuer Ubuntu 24.04 auf x86_64 oder arm64.
 #
 #   bash install.sh
 #
 # Idempotent: kann gefahrlos mehrfach laufen.
 set -euo pipefail
 
-BRAUNY_HOME="${BRAUNY_HOME:-$HOME/braunycode}"
-BRAUNY_MODEL="${BRAUNY_MODEL:-qwen2.5-coder:7b}"
 BRAUNY_PORT="${BRAUNY_PORT:-8000}"
 SANDBOX_IMAGE="${BRAUNY_SANDBOX_IMAGE:-python:3.11-slim}"
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BRAUNY_USER="${BRAUNY_USER:-brauny}"
 
 step() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m!!  %s\033[0m\n' "$*"; }
 die()  { printf '\033[1;31mXX  %s\033[0m\n' "$*" >&2; exit 1; }
 
-[ "$(id -u)" -ne 0 ] || die "Bitte NICHT als root starten. Als Benutzer 'ubuntu' ausfuehren."
+# ---------------------------------------------------------------- 0. Benutzer
+# Die grossen Anbieter geben unterschiedliche Erstzugaenge: Oracle und AWS
+# legen einen unprivilegierten Benutzer an ('ubuntu'), Contabo und Hetzner
+# liefern nur root. Der Agent darf aber nicht als root laufen - er fuehrt
+# fremden Code aus, und ein Fehlgriff waere dann ein Fehlgriff am ganzen
+# System. Statt den Lauf abzubrechen legen wir den Benutzer selbst an und
+# starten uns als dieser neu.
+if [ "$(id -u)" -eq 0 ]; then
+  # Ohne diese Pruefung wuerde BRAUNY_USER=root sich selbst endlos neu starten.
+  [ "$BRAUNY_USER" != "root" ] \
+    || die "BRAUNY_USER darf nicht 'root' sein - der Agent laeuft unprivilegiert."
+  step "Als root gestartet - unprivilegierten Benutzer '$BRAUNY_USER' einrichten"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq sudo rsync
+  if ! id -u "$BRAUNY_USER" >/dev/null 2>&1; then
+    useradd -m -s /bin/bash "$BRAUNY_USER"
+  fi
+  usermod -aG sudo "$BRAUNY_USER"
+  # Ohne passwortloses sudo bliebe dieses Skript bei der ersten Paketinstallation
+  # auf eine Passwortabfrage stehen - und das Konto hat gar kein Passwort. Das
+  # ist dieselbe Regel, die Ubuntu-Cloud-Images fuer 'ubuntu' mitbringen.
+  printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$BRAUNY_USER" > "/etc/sudoers.d/90-$BRAUNY_USER"
+  chmod 0440 "/etc/sudoers.d/90-$BRAUNY_USER"
+  visudo -cf "/etc/sudoers.d/90-$BRAUNY_USER" >/dev/null \
+    || die "sudoers-Datei fehlerhaft - abgebrochen, bevor sudo kaputtgeht."
+
+  # Den SSH-Zugang des Erstbenutzers uebernehmen, damit man nach der
+  # Installation ohne root weiterarbeiten kann.
+  if [ -f /root/.ssh/authorized_keys ]; then
+    install -d -m 700 -o "$BRAUNY_USER" -g "$BRAUNY_USER" "/home/$BRAUNY_USER/.ssh"
+    install -m 600 -o "$BRAUNY_USER" -g "$BRAUNY_USER" \
+      /root/.ssh/authorized_keys "/home/$BRAUNY_USER/.ssh/authorized_keys"
+  fi
+
+  ZIEL="/home/$BRAUNY_USER/braunycode-src"
+  rsync -a --delete "$SRC_DIR/" "$ZIEL/"
+  chown -R "$BRAUNY_USER:$BRAUNY_USER" "$ZIEL"
+  # sudo raeumt die Umgebung ab. Was der Aufrufer bewusst gesetzt hat, muss
+  # deshalb ausdruecklich mitgegeben werden - sonst laeuft der zweite Durchgang
+  # mit anderen Vorgaben als der erste, und niemand sieht warum.
+  FORWARD=()
+  for v in BRAUNY_MODEL BRAUNY_HOME BRAUNY_PORT BRAUNY_TOKEN \
+           BRAUNY_SANDBOX_IMAGE BRAUNY_SKIP_CLOUDINIT_WAIT; do
+    [ -n "${!v:-}" ] && FORWARD+=("$v=${!v}")
+  done
+  step "Neustart als '$BRAUNY_USER'"
+  exec sudo -u "$BRAUNY_USER" -H env ${FORWARD[@]+"${FORWARD[@]}"} \
+       bash "$ZIEL/install.sh" "$@"
+fi
+
 command -v sudo >/dev/null || die "sudo wird benoetigt."
+BRAUNY_HOME="${BRAUNY_HOME:-$HOME/braunycode}"
+
+# ---------------------------------------------------------------- 0b. Modell
+# Ein zu grosses Modell laedt minutenlang und faellt dann beim ersten Aufruf
+# in den Swap oder wird vom OOM-Killer beendet. Deshalb wird die Vorgabe am
+# tatsaechlich vorhandenen Arbeitsspeicher gewaehlt statt geraten. Die Zahlen
+# sind die Downloadgroessen laut ollama, nicht der Bedarf zur Laufzeit - der
+# liegt darueber, daher der Abstand zur jeweiligen Schwelle.
+if [ -z "${BRAUNY_MODEL:-}" ]; then
+  RAM_KB="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+  if   [ "$RAM_KB" -ge 22000000 ]; then BRAUNY_MODEL="qwen3-coder:30b"    # 19 GB
+  elif [ "$RAM_KB" -ge 12000000 ]; then BRAUNY_MODEL="qwen2.5-coder:14b"  #  9 GB
+  else                                  BRAUNY_MODEL="qwen2.5-coder:7b"   # 4,7 GB
+  fi
+  step "Modell nach Arbeitsspeicher gewaehlt: $BRAUNY_MODEL ($((RAM_KB/1024)) MB RAM)"
+fi
 
 # ---------------------------------------------------------------- 1. apt
 step "Warte auf cloud-init und den apt-Lock"
@@ -95,6 +160,25 @@ for _ in $(seq 1 60); do
 done
 curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1 \
   || die "Ollama antwortet nicht auf Port 11434 (journalctl -u ollama)."
+
+# Auslagerungsdatei. Ein 30B-Modell belegt 19 GB auf einer 24-GB-Maschine -
+# daneben liegen noch System, Docker und die Anwendung. Ohne Swap beendet der
+# OOM-Killer im Zweifel ollama mitten in einer Antwort, und der Lauf bricht
+# ohne erkennbaren Grund ab. Swap ist hier kein Ersatz fuer RAM, sondern ein
+# Puffer gegen genau diesen Abbruch.
+if [ "$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo)" -lt 1000000 ]; then
+  step "Auslagerungsdatei (8 GB) anlegen"
+  if sudo fallocate -l 8G /swapfile 2>/dev/null || \
+     sudo dd if=/dev/zero of=/swapfile bs=1M count=8192 status=none; then
+    sudo chmod 600 /swapfile
+    sudo mkswap -q /swapfile >/dev/null
+    sudo swapon /swapfile
+    grep -q '^/swapfile' /etc/fstab \
+      || echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab >/dev/null
+  else
+    warn "Auslagerungsdatei konnte nicht angelegt werden - weiter ohne."
+  fi
+fi
 
 step "Modell laden: $BRAUNY_MODEL (mehrere GB, das dauert)"
 ollama pull "$BRAUNY_MODEL"
@@ -232,8 +316,10 @@ sudo systemctl restart braunycode
 
 # ---------------------------------------------------------------- 7. Firewall
 step "Lokale Firewall fuer Port $BRAUNY_PORT oeffnen"
-# Oracle-Ubuntu-Images bringen iptables-Regeln mit, die alles ausser Port 22
-# verwerfen. Ohne diese Regel ist der Port trotz offener Security List dicht.
+# Manche Ubuntu-Images (Oracle) bringen iptables-Regeln mit, die alles ausser
+# Port 22 verwerfen. Ohne diese Regel ist der Port dann dicht, obwohl beim
+# Anbieter alles offen aussieht. Auf Images ohne solche Regeln (Contabo,
+# Hetzner) ist die Zeile wirkungslos - sie schadet aber auch nicht.
 if ! sudo iptables -C INPUT -p tcp --dport "$BRAUNY_PORT" -j ACCEPT 2>/dev/null; then
   sudo iptables -I INPUT 1 -p tcp --dport "$BRAUNY_PORT" -j ACCEPT
 fi
@@ -255,13 +341,13 @@ cat <<EOF
   Projekt   $BRAUNY_HOME/workspace
   Skills    $BRAUNY_HOME/skills (eigene .md einfach dazulegen)
 
-  NOCH ZU TUN in der Oracle Console:
-    Networking > Virtual Cloud Networks > dein VCN
-      > Security Lists > Default Security List
-      > Add Ingress Rule
-        Source CIDR      0.0.0.0/0
-        IP Protocol      TCP
-        Destination Port $BRAUNY_PORT
+  FALLS DIE ADRESSE NICHT ANTWORTET:
+    Der Port ist lokal offen. Bleibt er von aussen dicht, filtert der
+    Anbieter davor. Bei Oracle Cloud:
+      Networking > Virtual Cloud Networks > dein VCN
+        > Security Lists > Default Security List > Add Ingress Rule
+          Source CIDR 0.0.0.0/0 | TCP | Destination Port $BRAUNY_PORT
+    Contabo und Hetzner haben ab Werk keine solche Filterung.
 
   ALS APP AUFS HANDY (jeder Browser):
     Adresse oeffnen > Menue- bzw. Teilen-Symbol >

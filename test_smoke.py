@@ -1637,8 +1637,45 @@ check("Installer übernimmt ein vorgegebenes Token",
       'if [ -n "${BRAUNY_TOKEN:-}" ]' in installer)
 check("Installer lehnt zu kurze Token ab",
       '"${#TOKEN}" -ge 12' in installer, )
-check("Installer läuft weiterhin nicht als root",
-      '[ "$(id -u)" -ne 0 ]' in installer)
+# Die Zusicherung lautet nicht mehr "bricht als root ab", sondern "der Agent
+# landet nie als root". Contabo und Hetzner geben ueberhaupt nur root heraus -
+# ein Abbruch haette dort jede Installation unmoeglich gemacht. Geprueft wird
+# jetzt der Ausweg: Benutzer anlegen und sich als dieser neu starten.
+check("Installer erkennt einen Start als root",
+      '[ "$(id -u)" -eq 0 ]' in installer)
+check("und startet sich als unprivilegierter Benutzer neu",
+      'exec sudo -u "$BRAUNY_USER"' in installer)
+check("der Agent selbst laeuft also nie als root",
+      'useradd -m -s /bin/bash "$BRAUNY_USER"' in installer)
+# Ohne diese Sperre startet BRAUNY_USER=root sich selbst endlos neu.
+check("BRAUNY_USER=root wird abgelehnt",
+      '[ "$BRAUNY_USER" != "root" ]' in installer)
+# Eine kaputte sudoers-Datei sperrt den Benutzer dauerhaft aus - deshalb wird
+# sie geprueft, bevor sie zaehlt.
+check("die sudoers-Datei wird vor dem Scharfschalten geprüft",
+      'visudo -cf' in installer)
+# sudo raeumt die Umgebung ab; ohne Weitergabe liefe der zweite Durchgang mit
+# anderen Vorgaben als der erste.
+check("gesetzte BRAUNY_*-Variablen überleben den Neustart",
+      'FORWARD+=("$v=${!v}")' in installer
+      and 'BRAUNY_MODEL BRAUNY_HOME' in installer)
+
+# Das Modell darf nicht fest verdrahtet sein: dieselbe Datei laeuft auf 8 GB
+# und auf 24 GB, und ein zu grosses Modell wird beim ersten Aufruf beendet.
+check("das Modell wird am vorhandenen RAM gewählt",
+      "/proc/meminfo" in installer and "qwen3-coder:30b" in installer)
+check("die kleineren Modelle bleiben als Rückfall erhalten",
+      "qwen2.5-coder:14b" in installer and "qwen2.5-coder:7b" in installer)
+check("eine ausdrückliche Vorgabe schlägt die Erkennung",
+      'if [ -z "${BRAUNY_MODEL:-}" ]' in installer)
+# 19 GB Modell auf 24 GB Maschine: ohne Puffer beendet der OOM-Killer ollama
+# mitten in einer Antwort.
+check("es wird eine Auslagerungsdatei angelegt",
+      "mkswap" in installer and "swapon" in installer)
+check("die Auslagerungsdatei überlebt den Neustart",
+      "/etc/fstab" in installer)
+check("vorhandener Swap wird nicht verdoppelt",
+      "SwapTotal" in installer)
 
 print("\n[30] Mehrdateiige Projekte in der Sandbox")
 
