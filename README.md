@@ -1,13 +1,15 @@
-# BraunyCode Cloud v1.6.0
+# BraunyCode Cloud v1.7.0
 
 Ein KI-Coding-Agent, der auf **deinem** Server an einem echten
 Projektverzeichnis arbeitet — bedienbar vom Handy wie vom Rechner.
 
 Er ist aufgebaut wie die großen Agenten: das Modell bekommt **Werkzeuge**
 (Dateien auflisten, lesen, schreiben, suchen, ausführen) und entscheidet in
-jedem Schritt selbst, was als Nächstes dran ist. Mechanische Änderungen
-erledigt er ganz **ohne Modell** über den Syntaxbaum. Jede Änderung landet im
-Git-Verlauf. Der Ablauf wird live per WebSocket gestreamt.
+jedem Schritt selbst, was als Nächstes dran ist. **Skills** geben ihm für
+wiederkehrende Aufgaben das passende Verfahren vor, **Konnektoren** lassen ihn
+kontrolliert nach außen. Mechanische Änderungen erledigt er ganz **ohne
+Modell** über den Syntaxbaum. Jede Änderung landet im Git-Verlauf. Der Ablauf
+wird live per WebSocket gestreamt.
 
 ## Aufbau
 
@@ -18,9 +20,16 @@ Browser (Handy/Rechner) ──WebSocket──▶  FastAPI
                                           │    lokal (Ollama) oder
                                           │    OpenAI-kompatible API
                                           │
+                                          ├─▶  Skills (Verfahrenswissen)
+                                          │    tests · bugfix · umbau
+                                          │    review · doku
+                                          │
                                           ├─▶  Werkzeuge am Projekt
                                           │    list · read · write · search
                                           │    outline · run_python · finish
+                                          │
+                                          ├─▶  Konnektoren (aus per Standard)
+                                          │    fetch_url · git_push
                                           │
                                           └─▶  Docker-Sandbox
                                                kein Netz · 512 MB · 1 CPU
@@ -32,8 +41,11 @@ Browser (Handy/Rechner) ──WebSocket──▶  FastAPI
 | `install.sh` | Vollständige Server-Einrichtung, idempotent |
 | `app/main.py` | FastAPI-Backend, Wegwahl, WebSocket, Auth |
 | `app/agentloop.py` | Werkzeugschleife: Modell entscheidet, Werkzeug handelt |
-| `app/tools.py` | Die sieben Werkzeuge und ihr Schema |
+| `app/tools.py` | Werkzeuge, Schema und Freigaben |
+| `app/skills.py` | Skills laden und zur Aufgabe passend auswählen |
+| `app/connectors.py` | Weg nach draußen: Webseiten lesen, Git-Push — mit Schutz |
 | `app/provider.py` | Modellanbindung: lokal oder OpenAI-kompatible API |
+| `skills/*.md` | Mitgelieferte Skills, editierbar, eigene dazulegbar |
 | `app/sandbox.py` | Gehärtete Docker-Ausführung, Log-Streaming |
 | `app/refactor.py` | Deterministische Umbauten über den Syntaxbaum, ohne Modell |
 | `app/workspace.py` | Projektverzeichnis mit Pfadschutz und Git-Historie |
@@ -84,6 +96,11 @@ Der Installer schreibt `~/braunycode/brauny.env` (Modus 600, nicht im Repo):
 | `BRAUNY_API_KEY` | leer | Schlüssel für die API, bleibt in der 600er-Datei |
 | `BRAUNY_AGENT` | `auto` | `auto`, `tools` oder `oneshot` — siehe unten |
 | `BRAUNY_MAX_STEPS` | `12` | Werkzeugrunden pro Auftrag |
+| `BRAUNY_SKILLS` | `~/braunycode/skills` | Verzeichnis mit den Skill-Dateien |
+| `BRAUNY_FETCH` | `0` | `1` erlaubt dem Agenten, Webseiten zu lesen |
+| `BRAUNY_GIT_REMOTE` | leer | Repository, auf das gepusht werden darf |
+| `BRAUNY_GIT_TOKEN` | leer | Token dafür, bleibt in der 600er-Datei |
+| `BRAUNY_GIT_BRANCH_PREFIX` | `brauny/` | Präfix aller vom Agenten erzeugten Branches |
 | `BRAUNY_MAX_ATTEMPTS` | `3` | Versuche im Einmalwurf; `1` schaltet die Selbstkorrektur ab |
 | `BRAUNY_MAX_CONCURRENT` | `2` | gleichzeitig laufende Aufträge |
 | `BRAUNY_ASK_TIMEOUT` | `300` | Sekunden, die ein Modellaufruf höchstens dauern darf |
@@ -158,6 +175,120 @@ statt dass der Lauf abbricht.
 
 Damit sind zum ersten Mal Aufgaben über **mehrere Dateien und mehrere Runden**
 möglich, statt nur eine `main.py` in einem Wurf.
+
+## Skills — Verfahrenswissen als Textdatei
+
+Ein Sprachmodell weiß, was pytest ist. Was es **nicht** weiß, ist wie hier
+gearbeitet wird: erst reproduzieren, dann fixen, dann nachweisen. Genau dieses
+Verfahrenswissen steckt in einer Skill-Datei — ein paar hundert Zeichen, die
+vor die Aufgabe gestellt werden, wenn sie passt.
+
+Für ein kleines Modell ist das der billigste Qualitätssprung, den es gibt:
+kein Training, keine Einbettungen, kein zusätzlicher Modellaufruf. Nur Text,
+der zur richtigen Zeit im Prompt steht.
+
+| Skill | Greift bei | Kern |
+|---|---|---|
+| `tests` | test, testen, pytest, abdeckung | Grenzfälle testen, und die Tests wirklich ausführen |
+| `bugfix` | fehler, bug, traceback, absturz | **Erst reproduzieren**, dann Ursache beheben, dann nachweisen |
+| `umbau` | refactor, aufräumen, vereinfachen | Aufrufgraph zuerst, kleine Schritte, Verhalten vorher/nachher vergleichen |
+| `review` | prüfe, durchsicht, schwachstellen | Melden statt ändern — **ohne Schreibrecht** |
+| `doku` | readme, docstring, dokumentation | Erst lesen, dann schreiben; keine ungeprüften Beispiele |
+
+Die Auswahl ist ein **wortweiser** Abgleich, kein Teilstring: „alphabet" löst
+nicht den Auslöser „alpha" aus. Passt nichts, läuft der Auftrag ohne Skill —
+ein falsch gewählter Skill lenkt das Modell in die falsche Richtung und wäre
+schlimmer als gar keiner.
+
+### Ein Skill kann Werkzeuge wegnehmen
+
+Der `review`-Skill listet `write_file` bewusst nicht auf. Das ist keine
+Ermahnung im Prompt, sondern eine echte Sperre: das Werkzeug taucht im Schema
+gar nicht erst auf, und ein Aufruf würde abgewiesen. Was das Modell nicht
+sieht, kann es nicht benutzen.
+
+Umgekehrt geht es nicht — ein Skill kann **nichts** freischalten. Die Liste
+wird immer mit dem geschnitten, was ohnehin erlaubt ist. `finish` bleibt immer
+übrig, sonst könnte die Schleife nicht enden.
+
+### Eigene Skills
+
+Eine `.md` nach `~/braunycode/skills/` legen, Dienst neu starten:
+
+```markdown
+---
+name: sql
+beschreibung: Datenbankabfragen schreiben
+ausloeser: sql, query, datenbank, tabelle
+werkzeuge: read_file, write_file, run_python, finish
+---
+1. Erst das Schema ansehen, nie die Spaltennamen raten.
+2. …
+```
+
+`werkzeuge` ist optional — fehlt die Zeile, bleiben alle erlaubt. Der
+Installer überschreibt vorhandene Skill-Dateien **nicht**, deine Änderungen
+überleben also eine Neuinstallation.
+
+## Konnektoren — der kontrollierte Weg nach draußen
+
+Alles andere in BraunyCode ist abgeschottet: die Sandbox hat kein Netz, die
+Werkzeuge kommen nicht aus dem Projektverzeichnis heraus. Konnektoren öffnen
+diese Grenze bewusst und eng. **Beide sind standardmäßig aus** — ohne
+Konfiguration sieht das Modell sie nicht einmal.
+
+### `git_push` — Ergebnisse vom Server holen
+
+Das ist der Konnektor, der die Handy-Nutzung rund macht: Auftrag unterwegs
+geben, und das Ergebnis liegt als Branch im Repository statt nur auf einer
+VM, an die du gerade nicht drankommst.
+
+```bash
+BRAUNY_GIT_REMOTE=https://github.com/<nutzer>/<repo>.git
+BRAUNY_GIT_TOKEN=<fine-grained token, Contents:write, nur dieses Repo>
+```
+
+Der Token steht **nur** in `brauny.env` (Rechte 600). Er wird über einen
+`credential.helper` aus der Prozessumgebung gelesen — nie als
+Kommandozeilenargument (dort läse ihn jedes `ps`) und nie in `.git/config`
+(dort bliebe er auf der Platte). Sollte er trotzdem je in einer Ausgabe
+auftauchen, ersetzt ihn ein letzter Filter durch `***`.
+
+Gepusht wird ausschließlich auf `brauny/<name>` — **nie auf `main`**.
+
+### `fetch_url` — Webseiten lesen
+
+```bash
+BRAUNY_FETCH=1
+```
+
+Und hier die Stelle, an der ein naiver Konnektor gefährlich wird: Auf jeder
+Cloud-Maschine liegt unter **`169.254.169.254`** der Metadaten-Dienst des
+Anbieters — bei Oracle, AWS und Google gleichermaßen. Wer den abrufen kann,
+bekommt die Zugangsdaten der Instanz. Ein Modell, das eine Adresse aus einer
+Aufgabenbeschreibung übernimmt, ist genau dieser Angriffsweg.
+
+Deshalb wird jede Adresse aufgelöst und **jede** resultierende IP geprüft,
+bevor irgendetwas verbunden wird:
+
+| Abgewiesen | Beispiel |
+|---|---|
+| Cloud-Metadaten | `169.254.169.254` |
+| Loopback | `127.0.0.1`, `::1`, `localhost` |
+| Private Netze | `10.x`, `172.16.x`, `192.168.x`, `fc00::` |
+| Andere Schemata | `file://`, `gopher://` |
+| Ungewöhnliche Ports | alles außer 80 und 443 |
+
+Mehrere Adressen hinter einem Namen? Eine private reicht zum Sperren. Der
+Trick `http://echte-seite.de@169.254.169.254/` greift nicht — geprüft wird der
+echte Host, nicht die Benutzerinfo davor. Weiterleitungen werden **nicht**
+automatisch verfolgt, weil das Ziel nach der Prüfung nach innen zeigen könnte;
+stattdessen wird die Zieladresse gemeldet und beim nächsten Aufruf normal
+mitgeprüft.
+
+Restrisiko, ehrlich benannt: Zwischen Prüfung und Verbindung könnte sich die
+DNS-Antwort ändern (DNS-Rebinding). Vollständig dicht wäre nur ein Verbinden
+auf die bereits geprüfte IP. Das ist hier nicht umgesetzt.
 
 ### Die Schleife ist misstrauisch
 
@@ -332,11 +463,18 @@ python3 -m venv venv && venv/bin/pip install -r requirements.txt
 venv/bin/python test_smoke.py
 ```
 
-**273 Fälle in 24 Abschnitten, ohne Docker und ohne Ollama.** Modell, Sandbox
+**359 Fälle in 27 Abschnitten, ohne Docker und ohne Ollama.** Modell, Sandbox
 und Werkzeugantworten werden gescriptet hineingereicht.
 
 Abgedeckt sind unter anderem:
 
+- **Konnektor-Schutz**: `169.254.169.254`, Loopback, alle privaten Netze,
+  IPv6-Gegenstücke, fremde Schemata, ungewöhnliche Ports und der
+  Benutzerinfo-Trick werden abgewiesen; gemischte Auflösung sperrt
+- **Git-Push echt**: gegen ein lokales bare-Repo, inklusive zweitem Push auf
+  denselben Branch; Token taucht in keiner Ausgabe auf
+- **Skills**: wortweise Auswahl (kein Teilstring), `review` kann nicht
+  schreiben, ein Skill kann keinen Konnektor freischalten, `finish` bleibt
 - **Werkzeuge**: Pfadausbrüche (`..`, absolute Pfade, Symlinks) blockiert,
   fehlende Dateien und unbekannte Werkzeuge liefern Fehlertext statt Absturz,
   lange Ausgaben werden gekürzt
@@ -371,11 +509,15 @@ Beides läuft durch dieselbe Schleife. Der Wechsel ist eine Zeile in
 schwächsten Modell hängen.
 
 **Nicht verifiziert** (Stand dieser Fassung): Es gab noch keinen
-End-to-End-Lauf mit echtem Modell und echtem Docker. Die 273 Tests laufen
+End-to-End-Lauf mit echtem Modell und echtem Docker. Die 359 Tests laufen
 gegen gescriptete Modellantworten — sie belegen, dass die Schleife korrekt
-arbeitet, nicht dass ein bestimmtes Modell gute Ergebnisse liefert.
-`install.sh` ist syntaktisch geprüft, aber nicht auf einem frischen
-Ubuntu 24.04 durchgelaufen. Die Zeitmessungen stammen von x86_64, nicht arm64.
+arbeitet, nicht dass ein bestimmtes Modell gute Ergebnisse liefert. Ob die
+Skills die Ergebnisse eines 7B-Modells **messbar** verbessern, ist nicht
+gemessen; belegt ist nur, dass der richtige Skill ausgewählt wird und seine
+Werkzeugsperre hält. `fetch_url` ist gegen echte Webseiten ungetestet — der
+Schutz ist geprüft, das Abholen selbst nicht. `install.sh` ist syntaktisch
+geprüft, aber nicht auf einem frischen Ubuntu 24.04 durchgelaufen. Die
+Zeitmessungen stammen von x86_64, nicht arm64.
 
 ### Stärkeres Modell über eine API
 

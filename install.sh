@@ -78,6 +78,20 @@ mkdir -p "$BRAUNY_HOME"
 cp -r "$SRC_DIR/app" "$BRAUNY_HOME/"
 cp "$SRC_DIR/requirements.txt" "$BRAUNY_HOME/"
 
+# Skills: vorhandene Dateien NICHT ueberschreiben. Wer einen Skill angepasst
+# oder einen eigenen dazugelegt hat, soll ihn nach einer Neuinstallation
+# wiederfinden.
+mkdir -p "$BRAUNY_HOME/skills"
+for skill in "$SRC_DIR"/skills/*.md; do
+  [ -e "$skill" ] || continue
+  ziel="$BRAUNY_HOME/skills/$(basename "$skill")"
+  if [ -e "$ziel" ]; then
+    echo "   behalte vorhandenen Skill: $(basename "$skill")"
+  else
+    cp "$skill" "$ziel"
+  fi
+done
+
 if [ ! -f "$BRAUNY_HOME/app/static/icons/icon-512.png" ]; then
   step "PWA-Icons erzeugen"
   python3 "$SRC_DIR/scripts/make_icons.py"
@@ -124,6 +138,24 @@ BRAUNY_MAX_STEPS=12
 BRAUNY_PROVIDER=ollama
 BRAUNY_API_BASE=
 BRAUNY_API_KEY=
+
+# Skills: Verfahrenswissen als Markdown. Eigene Dateien einfach dazulegen.
+BRAUNY_SKILLS=$BRAUNY_HOME/skills
+
+# Konnektoren - der einzige Weg des Agenten nach draussen. Standard: zu.
+#
+# Webseiten lesen. Interne Adressen und Cloud-Metadaten (169.254.169.254)
+# sind auch dann gesperrt - das ist nicht abschaltbar.
+BRAUNY_FETCH=0
+#
+# Ergebnisse auf ein Git-Repository schieben. Fuer GitHub ein Fine-grained
+# Token mit Contents:write NUR fuer dieses eine Repository erzeugen:
+#   BRAUNY_GIT_REMOTE=https://github.com/<nutzer>/<repo>.git
+#   BRAUNY_GIT_TOKEN=<token>
+# Der Agent pusht nur auf Branches mit dem Praefix unten, nie auf main.
+BRAUNY_GIT_REMOTE=
+BRAUNY_GIT_TOKEN=
+BRAUNY_GIT_BRANCH_PREFIX=brauny/
 EOF
 fi
 chmod 600 "$ENV_FILE"
@@ -185,6 +217,7 @@ cat <<EOF
   Token     $BRAUNY_TOKEN
   Modell    $BRAUNY_MODEL
   Projekt   $BRAUNY_HOME/workspace
+  Skills    $BRAUNY_HOME/skills (eigene .md einfach dazulegen)
 
   NOCH ZU TUN in der Oracle Console:
     Networking > Virtual Cloud Networks > dein VCN

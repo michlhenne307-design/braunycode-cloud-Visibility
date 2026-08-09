@@ -108,11 +108,12 @@ def trim(messages: list[dict], limit: int = MAX_HISTORY) -> list[dict]:
 
 
 async def run_tool_agent(send, task, *, chat_fn, toolbox, max_steps=MAX_STEPS,
-                         context=""):
+                         context="", skill=None):
     """Laesst das Modell mit Werkzeugen am Projekt arbeiten.
 
     chat_fn(messages, schema) -> provider.Reply ist hineingereicht, damit die
-    Schleife ohne echtes Modell getestet werden kann.
+    Schleife ohne echtes Modell getestet werden kann. skill ist optionales
+    Verfahrenswissen, das vor die Aufgabe gestellt wird.
 
     Rueckgabe:
       "ok"       - das Modell hat finish gemeldet
@@ -125,12 +126,20 @@ async def run_tool_agent(send, task, *, chat_fn, toolbox, max_steps=MAX_STEPS,
     def elapsed():
         return round(time.monotonic() - start, 1)
 
+    system = SYSTEM_PROMPT
+    if skill is not None:
+        # Der Skill schraenkt die Werkzeuge ggf. ein - das muss VOR dem
+        # Schema passieren, sonst sieht das Modell Werkzeuge, die es nicht
+        # benutzen darf.
+        toolbox.restrict(skill.werkzeuge)
+        system = f"{SYSTEM_PROMPT}\n\n{skill.prompt()}"
+
     head = f"Bestehendes Projekt:\n{context}\n\n" if context else ""
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system},
         {"role": "user", "content": f"{head}Aufgabe: {task}"},
     ]
-    schema = tools.schema()
+    schema = toolbox.schema()
     repeats: dict[str, int] = {}
     idle_rounds = 0
     executed = False   # wurde run_python jemals erfolgreich ausgefuehrt
@@ -192,6 +201,9 @@ async def run_tool_agent(send, task, *, chat_fn, toolbox, max_steps=MAX_STEPS,
                 for line in result.splitlines():
                     await send("sandbox", line)
                 executed = executed or result.startswith("Lauf erfolgreich")
+            elif call.name in ("fetch_url", "git_push") and not failed:
+                # Schritte nach draussen gehoeren sichtbar ins Protokoll.
+                await send("status", result.splitlines()[0] if result else call.name)
             elif failed:
                 await send("error", result)
 
@@ -229,6 +241,9 @@ async def _finish(send, task, toolbox, step, seconds, executed) -> str:
 
     await send("status", "Geänderte Dateien: " +
                (", ".join(changed) if changed else "keine"))
+    if getattr(toolbox, "pushed", None):
+        await send("status", "Nach außen übertragen: " +
+                   "; ".join(toolbox.pushed))
     if not executed:
         # Das Modell behauptet Erfolg, ohne den Code laufen gelassen zu haben.
         # Das gehoert dazugesagt, statt es als geprueft zu verkaufen.

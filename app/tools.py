@@ -13,50 +13,85 @@ from __future__ import annotations
 import json
 import re
 
+import connectors
+
 MAX_OUTPUT = 4000        # Zeichen, die ein Werkzeugergebnis zurueckgeben darf
 MAX_SEARCH_HITS = 25
 
+# Ohne dieses Werkzeug kann die Schleife nicht sauber enden - es bleibt
+# deshalb auch dann erlaubt, wenn ein Skill die Werkzeuge einschraenkt.
+ALWAYS = "finish"
 
-def schema() -> list[dict]:
-    """Werkzeugbeschreibung im OpenAI-Format - beide Anbieter verstehen das."""
-    def tool(name, description, properties, required):
-        return {
-            "type": "function",
-            "function": {
-                "name": name,
-                "description": description,
-                "parameters": {
-                    "type": "object",
-                    "properties": properties,
-                    "required": required,
-                },
+
+def _tool(name, description, properties, required):
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": required,
             },
-        }
+        },
+    }
 
+
+def base_schema() -> list[dict]:
+    """Die Werkzeuge, die immer da sind - alle nur im Projektverzeichnis."""
     return [
-        tool("list_files", "Listet alle Dateien im Projekt auf.", {}, []),
-        tool("read_file", "Liest eine Datei aus dem Projekt.",
-             {"path": {"type": "string", "description": "Pfad relativ zum Projekt"}},
-             ["path"]),
-        tool("write_file", "Schreibt eine Datei. Überschreibt vorhandenen Inhalt.",
-             {"path": {"type": "string", "description": "Pfad relativ zum Projekt"},
-              "content": {"type": "string", "description": "Vollständiger Dateiinhalt"}},
-             ["path", "content"]),
-        tool("search", "Sucht Text in allen Projektdateien.",
-             {"query": {"type": "string", "description": "Suchbegriff"}},
-             ["query"]),
-        tool("outline", "Zeigt Funktionen, Klassen und den Aufrufgraph des Projekts.",
-             {}, []),
-        tool("run_python", "Führt eine Python-Datei in der isolierten Sandbox aus.",
-             {"path": {"type": "string", "description": "Pfad der auszuführenden Datei"}},
-             ["path"]),
-        tool("finish", "Beendet die Arbeit und fasst das Ergebnis zusammen.",
-             {"summary": {"type": "string", "description": "Was wurde erreicht"}},
-             ["summary"]),
+        _tool("list_files", "Listet alle Dateien im Projekt auf.", {}, []),
+        _tool("read_file", "Liest eine Datei aus dem Projekt.",
+              {"path": {"type": "string", "description": "Pfad relativ zum Projekt"}},
+              ["path"]),
+        _tool("write_file", "Schreibt eine Datei. Überschreibt vorhandenen Inhalt.",
+              {"path": {"type": "string", "description": "Pfad relativ zum Projekt"},
+               "content": {"type": "string", "description": "Vollständiger Dateiinhalt"}},
+              ["path", "content"]),
+        _tool("search", "Sucht Text in allen Projektdateien.",
+              {"query": {"type": "string", "description": "Suchbegriff"}},
+              ["query"]),
+        _tool("outline", "Zeigt Funktionen, Klassen und den Aufrufgraph des Projekts.",
+              {}, []),
+        _tool("run_python", "Führt eine Python-Datei in der isolierten Sandbox aus.",
+              {"path": {"type": "string", "description": "Pfad der auszuführenden Datei"}},
+              ["path"]),
+        _tool(ALWAYS, "Beendet die Arbeit und fasst das Ergebnis zusammen.",
+              {"summary": {"type": "string", "description": "Was wurde erreicht"}},
+              ["summary"]),
     ]
 
 
-NAMES = {item["function"]["name"] for item in schema()}
+def connector_schema() -> dict[str, dict]:
+    """Werkzeuge, die aus dem Projekt herausreichen - nur wenn konfiguriert."""
+    return {
+        "fetch_url": _tool(
+            "fetch_url",
+            "Lädt eine öffentliche Webseite als Text. Interne Adressen und "
+            "Cloud-Metadaten sind gesperrt.",
+            {"url": {"type": "string", "description": "Vollständige http(s)-Adresse"}},
+            ["url"]),
+        "git_push": _tool(
+            "git_push",
+            "Committet den Projektstand und schiebt ihn auf den eingerichteten "
+            "Git-Remote.",
+            {"branch": {"type": "string", "description": "Gewünschter Branch-Name"},
+             "message": {"type": "string", "description": "Commit-Nachricht"}},
+            ["message"]),
+    }
+
+
+def schema(enabled=None) -> list[dict]:
+    """Basiswerkzeuge plus die freigeschalteten Konnektoren."""
+    verfuegbar = connector_schema()
+    zusatz = [verfuegbar[name] for name in (enabled or []) if name in verfuegbar]
+    return base_schema() + zusatz
+
+
+BASE_NAMES = {item["function"]["name"] for item in base_schema()}
+CONNECTOR_NAMES = set(connector_schema())
+NAMES = BASE_NAMES | CONNECTOR_NAMES
 
 
 def _clip(text: str) -> str:
@@ -72,18 +107,48 @@ class Toolbox:
     testbar bleibt.
     """
 
-    def __init__(self, ws, run_sandbox=None, index_builder=None):
+    def __init__(self, ws, run_sandbox=None, index_builder=None, enabled=None):
         self.ws = ws
         self.run_sandbox = run_sandbox
         self.index_builder = index_builder
+        # Konnektoren, die dieser Lauf benutzen darf. Leer = keine.
+        self.enabled = [n for n in (enabled or []) if n in CONNECTOR_NAMES]
+        self.allowed = BASE_NAMES | set(self.enabled)
         self.written: list[str] = []
+        self.pushed: list[str] = []
+        self.fetched: list[str] = []
         self.finished: str | None = None
+
+    def restrict(self, names) -> None:
+        """Schraenkt die Werkzeuge ein, etwa weil ein Skill es so vorgibt.
+
+        Erweitern kann das nie: es wird mit dem geschnitten, was ohnehin
+        erlaubt ist. Ein Skill kann also keinen Konnektor freischalten, der
+        nicht konfiguriert ist. 'finish' bleibt immer drin, sonst koennte die
+        Schleife nicht enden.
+        """
+        gewuenscht = {n.strip() for n in (names or []) if n and n.strip()}
+        if not gewuenscht:
+            return
+        self.allowed = (self.allowed & gewuenscht) | {ALWAYS}
+
+    def schema(self) -> list[dict]:
+        """Nur die Werkzeuge, die dieser Lauf wirklich benutzen darf.
+
+        Was das Modell nicht sieht, kann es nicht aufrufen - das ist
+        wirksamer als jede Ermahnung im Prompt.
+        """
+        return [item for item in schema(self.enabled)
+                if item["function"]["name"] in self.allowed]
 
     async def call(self, name: str, arguments: dict) -> str:
         """Fuehrt ein Werkzeug aus. Fehler werden als Text zurueckgegeben,
         damit das Modell darauf reagieren kann statt abzubrechen."""
-        if name not in NAMES:
-            return f"FEHLER: Unbekanntes Werkzeug '{name}'. Erlaubt: {sorted(NAMES)}"
+        if name not in self.allowed:
+            grund = ("ist für diese Aufgabe nicht freigegeben"
+                     if name in NAMES else "gibt es nicht")
+            return (f"FEHLER: Unbekanntes Werkzeug '{name}' — {grund}. "
+                    f"Erlaubt: {sorted(self.allowed)}")
         try:
             handler = getattr(self, f"_{name}")
             return _clip(await handler(arguments))
@@ -149,6 +214,26 @@ class Toolbox:
     async def _finish(self, args) -> str:
         self.finished = str(args.get("summary", "")).strip() or "Fertig."
         return self.finished
+
+    # ------------------------------------------------------------ Konnektoren
+
+    async def _fetch_url(self, args) -> str:
+        url = str(args.get("url", "")).strip()
+        if not url:
+            return "FEHLER: 'url' fehlt."
+        import asyncio
+        text = await asyncio.to_thread(connectors.fetch, url)
+        self.fetched.append(url)
+        return text
+
+    async def _git_push(self, args) -> str:
+        import asyncio
+        ergebnis = await asyncio.to_thread(
+            connectors.git_push, self.ws,
+            str(args.get("branch", "")).strip(),
+            str(args.get("message", "")).strip())
+        self.pushed.append(ergebnis.splitlines()[0] if ergebnis else "gepusht")
+        return ergebnis
 
 
 def format_result(name: str, result: str, call_id: str = "") -> dict:
