@@ -102,32 +102,96 @@ def _parse_arguments(raw) -> dict:
 
 
 # ------------------------------------------------------------------ Ollama
+#
+# Hier wird bewusst NICHT das Python-Paket 'ollama' benutzt, sondern direkt
+# dessen HTTP-Schnittstelle. Der Grund ist ein echter Abbruch aus dem Betrieb:
+#
+#   ValidationError: 1 validation error for Message
+#   tool_calls.0.function.arguments
+#     Input should be a valid dictionary
+#     [type=dict_type, input_value='{}', input_type=str]
+#
+# Das Paket legt die Antwort in ein pydantic-Modell, das fuer 'arguments' ein
+# dict verlangt. qwen3-coder liefert an dieser Stelle einen JSON-*Text*. Das
+# ist bei Werkzeugaufrufen verbreitet - die OpenAI-Schnittstelle gibt sie
+# sogar immer so zurueck, weshalb _parse_arguments beide Formen kennt.
+#
+# Nur kam _parse_arguments nie zum Zug: das Paket bricht schon beim Einlesen
+# ab. Die Absicherung sass hinter einer Mauer. Ueber HTTP kommt die Antwort
+# als gewoehnliches JSON an, und die Behandlung greift wieder.
+#
+# Der Preis dafuer ist gering: /api/chat ist ein einzelner POST, und wir
+# bleiben unabhaengig davon, wie streng ein Client-Paket kuenftige Antworten
+# typisiert.
+
+def _ollama_host() -> str:
+    """Adresse des Ollama-Dienstes, in der Schreibweise von ollama selbst.
+
+    OLLAMA_HOST wird dort auch ohne Schema angegeben ('127.0.0.1:11434').
+    """
+    roh = os.environ.get("OLLAMA_HOST", "").strip() or "127.0.0.1:11434"
+    if not roh.startswith(("http://", "https://")):
+        roh = "http://" + roh
+    return roh.rstrip("/")
+
+
+OLLAMA_HOST = _ollama_host()
+
+# Ein grosses Modell muss beim ersten Aufruf erst von der Platte in den
+# Speicher - bei 19 GB dauert das Minuten, und die Erzeugung auf CPU danach
+# ebenfalls. Ein knapper Zeitwert wuerde genau den ersten Lauf abwuergen, der
+# ohnehin der schwierigste ist.
+MODELL_TIMEOUT = float(os.environ.get("BRAUNY_MODEL_TIMEOUT", "900"))
+
 
 def _chat_ollama(messages, tools, policy=DETERMINISTISCH):
-    import ollama
+    import httpx
 
     optionen = {"temperature": _temperatur(policy)}
     if SEED is not None:
         # Lokal und bekannt - hier ist ein fester Startwert unbedenklich.
         optionen["seed"] = SEED
-    kwargs = {"model": MODEL, "messages": messages, "options": optionen}
+    nutzlast = {
+        "model": MODEL,
+        "messages": messages,
+        "options": optionen,
+        "stream": False,
+    }
     if tools:
-        kwargs["tools"] = tools
-    response = ollama.chat(**kwargs)
+        nutzlast["tools"] = tools
 
-    message = response["message"] if isinstance(response, dict) else response.message
-    text = (message.get("content") if isinstance(message, dict)
-            else getattr(message, "content", "")) or ""
-    raw_calls = (message.get("tool_calls") if isinstance(message, dict)
-                 else getattr(message, "tool_calls", None)) or []
+    try:
+        antwort = httpx.post(
+            f"{OLLAMA_HOST}/api/chat",
+            json=nutzlast,
+            timeout=httpx.Timeout(MODELL_TIMEOUT, connect=10.0),
+        )
+        antwort.raise_for_status()
+        daten = antwort.json()
+    except httpx.HTTPError as exc:
+        raise ProviderError(f"Ollama nicht erreichbar: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ProviderError(f"Ollama antwortete kein JSON: {exc}") from exc
+
+    if daten.get("error"):
+        raise ProviderError(f"Ollama meldet: {daten['error']}")
+
+    message = daten.get("message") or {}
+    text = message.get("content") or ""
 
     calls = []
-    for item in raw_calls:
-        function = item["function"] if isinstance(item, dict) else item.function
-        name = function["name"] if isinstance(function, dict) else function.name
-        args = (function.get("arguments") if isinstance(function, dict)
-                else getattr(function, "arguments", {}))
-        calls.append(ToolCall(name=name, arguments=_parse_arguments(args)))
+    for item in message.get("tool_calls") or []:
+        function = (item or {}).get("function") or {}
+        name = function.get("name") or ""
+        # Ein Aufruf ohne Namen ist nicht ausfuehrbar. Ihn stillschweigend
+        # zu uebergehen ist richtiger, als spaeter ueber einen leeren
+        # Werkzeugnamen zu stolpern.
+        if not name:
+            continue
+        calls.append(ToolCall(
+            name=name,
+            arguments=_parse_arguments(function.get("arguments")),
+        ))
     return Reply(text=text, tool_calls=calls)
 
 
@@ -200,9 +264,12 @@ def health() -> tuple[bool, str]:
     genau so wird es auch gemeldet.
     """
     if PROVIDER == "ollama":
+        # Auch hier ueber HTTP, aus demselben Grund wie bei _chat_ollama und
+        # damit /healthz und der Modellaufruf dieselbe Verbindung pruefen.
         try:
-            import ollama
-            ollama.list()
+            import httpx
+            antwort = httpx.get(f"{OLLAMA_HOST}/api/tags", timeout=5.0)
+            antwort.raise_for_status()
             return True, "ok"
         except Exception as exc:
             return False, f"fehler: {exc}"

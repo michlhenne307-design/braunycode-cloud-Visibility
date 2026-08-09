@@ -47,36 +47,99 @@ check("laesst keine Backticks uebrig",
 print("\n[2] Anbieter liest beide ollama-Client-Formen")
 import provider  # noqa: E402
 
-class FakeFunction:
-    name = "read_file"
-    arguments = '{"path": "main.py"}'
-class FakeCall:
-    function = FakeFunction()
-class AttrResp:
-    class message:
-        content = "attr-stil"
-        tool_calls = [FakeCall()]
+import httpx  # noqa: E402
 
-def fake_ollama_chat(response):
-    """Setzt ollama.chat voruebergehend auf eine feste Antwort."""
-    import ollama
-    orig = ollama.chat
-    ollama.chat = lambda **kw: response
+class OllamaAntwort:
+    """Minimalnachbau einer httpx-Antwort von Ollama.
+
+    Eigener Name, weil weiter unten eine andere Klasse 'FakeAntwort' fuer die
+    Konnektor-Pruefung steht - die wuerde diese hier sonst verdecken.
+    """
+    def __init__(self, daten):
+        self.daten = daten
+    def raise_for_status(self):
+        return None
+    def json(self):
+        return self.daten
+
+_letzte_anfrage = {}
+
+def fake_ollama_chat(daten, tools=None):
+    """Setzt httpx.post voruebergehend auf eine feste Ollama-Antwort."""
+    orig = httpx.post
+    def _post(url, json=None, timeout=None, **rest):
+        _letzte_anfrage.clear()
+        _letzte_anfrage.update({"url": url, "body": json})
+        return OllamaAntwort(daten)
+    httpx.post = _post
     try:
-        return provider._chat_ollama([{"role": "user", "content": "x"}], None)
+        return provider._chat_ollama([{"role": "user", "content": "x"}], tools)
     finally:
-        ollama.chat = orig
+        httpx.post = orig
 
-r = fake_ollama_chat({"message": {"content": "dict-stil"}})
-check("dict-Zugriff", r.text == "dict-stil", r)
-check("dict ohne tool_calls", r.tool_calls == [])
+r = fake_ollama_chat({"message": {"content": "hallo"}})
+check("Antworttext wird gelesen", r.text == "hallo", r)
+check("ohne tool_calls bleibt die Liste leer", r.tool_calls == [])
+check("die Anfrage geht an /api/chat", _letzte_anfrage["url"].endswith("/api/chat"),
+      _letzte_anfrage.get("url"))
+check("es wird nicht gestreamt", _letzte_anfrage["body"]["stream"] is False)
+check("Werkzeugaufrufe laufen mit Temperatur 0",
+      _letzte_anfrage["body"]["options"]["temperature"] == 0.0)
+check("ohne Werkzeuge steht kein tools-Feld in der Anfrage",
+      "tools" not in _letzte_anfrage["body"])
 
-r = fake_ollama_chat(AttrResp())
-check("attribut-Zugriff", r.text == "attr-stil", r)
-check("Werkzeugaufruf erkannt", len(r.tool_calls) == 1 and
-      r.tool_calls[0].name == "read_file", r.tool_calls)
-check("JSON-Argumente geparst",
+fake_ollama_chat({"message": {"content": ""}}, tools=[{"type": "function"}])
+check("uebergebene Werkzeuge werden mitgeschickt",
+      _letzte_anfrage["body"].get("tools") == [{"type": "function"}])
+
+# Der Absturz aus dem echten Betrieb, wortwoertlich:
+#
+#   ValidationError: 1 validation error for Message
+#   tool_calls.0.function.arguments
+#     Input should be a valid dictionary
+#     [type=dict_type, input_value='{}', input_type=str]
+#
+# qwen3-coder schickt 'arguments' als JSON-TEXT. Das Paket 'ollama' verlangt
+# an der Stelle ein dict und brach ab, bevor _parse_arguments ueberhaupt lief.
+r = fake_ollama_chat({"message": {"content": "", "tool_calls": [
+    {"function": {"name": "list_files", "arguments": "{}"}}]}})
+check("Argumente als Text '{}' stürzen nicht mehr ab",
+      len(r.tool_calls) == 1 and r.tool_calls[0].arguments == {}, r.tool_calls)
+check("und der Werkzeugname kommt an", r.tool_calls[0].name == "list_files")
+
+r = fake_ollama_chat({"message": {"tool_calls": [
+    {"function": {"name": "read_file", "arguments": '{"path": "main.py"}'}}]}})
+check("gefüllte JSON-Textargumente werden geparst",
       r.tool_calls[0].arguments == {"path": "main.py"}, r.tool_calls[0].arguments)
+
+r = fake_ollama_chat({"message": {"tool_calls": [
+    {"function": {"name": "read_file", "arguments": {"path": "a.py"}}}]}})
+check("Argumente als echtes dict bleiben unverändert",
+      r.tool_calls[0].arguments == {"path": "a.py"}, r.tool_calls[0].arguments)
+
+# Ein Aufruf ohne Namen ist nicht ausfuehrbar. Ihn zu uebergehen ist besser,
+# als spaeter ueber einen leeren Werkzeugnamen zu stolpern.
+r = fake_ollama_chat({"message": {"tool_calls": [
+    {"function": {"arguments": "{}"}},
+    {"function": {"name": "list_files", "arguments": "{}"}}]}})
+check("ein Aufruf ohne Namen wird übergangen",
+      [c.name for c in r.tool_calls] == ["list_files"], r.tool_calls)
+
+try:
+    fake_ollama_chat({"error": "model 'gibtsnicht' not found"})
+    check("Fehlermeldung von Ollama wird weitergereicht", False, "keine Ausnahme")
+except provider.ProviderError as exc:
+    check("Fehlermeldung von Ollama wird weitergereicht",
+          "gibtsnicht" in str(exc), exc)
+
+_prov_src = open(provider.__file__, encoding="utf-8").read()
+check("das Paket 'ollama' wird nicht mehr importiert",
+      "import ollama" not in _prov_src)
+check("stattdessen wird die HTTP-Schnittstelle benutzt", "/api/chat" in _prov_src)
+check("OLLAMA_HOST bekommt ein Schema, auch ohne eines",
+      provider.OLLAMA_HOST.startswith("http://"), provider.OLLAMA_HOST)
+check("der Zeitwert für den Modellaufruf ist großzügig",
+      provider.MODELL_TIMEOUT >= 600, provider.MODELL_TIMEOUT)
 
 print("\n[3] make_project_dir")
 d = sandbox.make_project_dir({"main.py": "print('x')"})
@@ -2539,16 +2602,17 @@ print("\n[38] Abtastverhalten: deterministisch, wo es genau sein muss")
 # und ein nicht nachstellbares Fehlerbild.
 
 def _ollama_kwargs(policy=provider.DETERMINISTISCH):
-    """Faengt ab, womit ollama.chat tatsaechlich gerufen wird."""
-    import ollama
+    """Faengt die Nutzlast ab, mit der Ollama tatsaechlich gerufen wird."""
     gesehen = {}
-    orig = ollama.chat
-    ollama.chat = lambda **kw: (gesehen.update(kw),
-                                {"message": {"content": "ok"}})[1]
+    orig = httpx.post
+    def _post(url, json=None, timeout=None, **rest):
+        gesehen.update(json or {})
+        return OllamaAntwort({"message": {"content": "ok"}})
+    httpx.post = _post
     try:
         provider._chat_ollama([{"role": "user", "content": "x"}], None, policy)
     finally:
-        ollama.chat = orig
+        httpx.post = orig
     return gesehen
 
 _kw = _ollama_kwargs()

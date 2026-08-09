@@ -2,6 +2,10 @@ fastapi>=0.115,<1.0
 uvicorn[standard]>=0.30,<1.0
 websockets>=12.0
 docker>=7.1,<8.0
-ollama>=0.3,<1.0
+# Das Paket 'ollama' steht hier bewusst NICHT mehr: sein pydantic-Modell
+# verlangt fuer tool_calls[].function.arguments ein dict, waehrend
+# qwen3-coder dort JSON-Text schickt - der Lauf brach damit ab, bevor unsere
+# Behandlung ueberhaupt lief. app/provider.py spricht die HTTP-Schnittstelle
+# von Ollama jetzt direkt an, dafuer reicht httpx.
 libcst>=1.1,<2.0
 httpx>=0.27,<1.0
