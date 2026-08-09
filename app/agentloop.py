@@ -34,16 +34,22 @@ SYSTEM_PROMPT = (
     "Projektverzeichnis und veraenderst es ausschliesslich ueber die "
     "bereitgestellten Werkzeuge.\n\n"
     "Arbeitsweise:\n"
-    "1. Verschaffe dir einen Ueberblick (list_files, outline, read_file), "
-    "bevor du etwas aenderst.\n"
-    "2. Aendere gezielt mit write_file. write_file ueberschreibt die ganze "
-    "Datei - gib immer den vollstaendigen neuen Inhalt an.\n"
-    "3. Pruefe das Ergebnis mit run_python.\n"
+    "1. Verschaffe dir einen Ueberblick (list_files, glob, outline, "
+    "read_file), bevor du etwas aenderst.\n"
+    "2. Aendere mit edit_file: nur den Ausschnitt angeben, der sich aendert. "
+    "write_file ist NUR fuer neue Dateien oder vollstaendigen Ersatz.\n"
+    "3. Pruefe mit check_syntax, dann mit run_python oder run_command.\n"
     "4. Erst wenn die Aufgabe erledigt ist, rufe finish mit einer kurzen "
     "Zusammenfassung auf.\n\n"
     "Regeln:\n"
     "- Pro Antwort genau ein Werkzeugaufruf, kein Fliesstext daneben.\n"
     "- Rate nie den Inhalt einer Datei, lies sie.\n"
+    "- Fuer edit_file muss old_text exakt so in der Datei stehen, mit "
+    "Einrueckung. Ist die Stelle mehrdeutig, gib mehr Zeilen drumherum mit.\n"
+    "- Zum Umbenennen einer Funktion oder Klasse nimm rename_symbol - das "
+    "arbeitet ueber den Syntaxbaum und ist genauer als eine Textersetzung.\n"
+    "- Hast du etwas zerschossen, setz mit undo auf den letzten Commit "
+    "zurueck, statt weiter daran herumzuflicken.\n"
     "- Wiederhole keinen Aufruf, der schon dasselbe Ergebnis geliefert hat.\n"
     "- Der Code laeuft ohne Netzwerk, ohne Eingabe (kein input()) und nur mit "
     "der Standardbibliothek. Er muss von selbst terminieren.\n"
@@ -197,10 +203,20 @@ async def run_tool_agent(send, task, *, chat_fn, toolbox, max_steps=MAX_STEPS,
                 await send("code", str(call.arguments.get("content", "")),
                            lang="python", attempt=step,
                            path=str(call.arguments.get("path", "")))
-            elif call.name == "run_python":
+            elif call.name in ("edit_file", "rename_symbol") and not failed:
+                # Nach einer Teiländerung den neuen Gesamtstand zeigen -
+                # sonst sieht die Oberfläche nur den Ausschnitt.
+                ziel = str(call.arguments.get("path", ""))
+                try:
+                    await send("code", toolbox.ws.read(ziel), lang="python",
+                               attempt=step, path=ziel)
+                except Exception:
+                    pass
+            elif call.name in ("run_python", "run_command"):
                 for line in result.splitlines():
                     await send("sandbox", line)
-                executed = executed or result.startswith("Lauf erfolgreich")
+                executed = executed or result.startswith(
+                    ("Lauf erfolgreich", "Befehl erfolgreich"))
             elif call.name in ("fetch_url", "git_push") and not failed:
                 # Schritte nach draussen gehoeren sichtbar ins Protokoll.
                 await send("status", result.splitlines()[0] if result else call.name)

@@ -758,7 +758,7 @@ print("\n[22] Werkzeugkasten")
 import tools  # noqa: E402
 
 sch = tools.schema()
-check("sieben Werkzeuge", len(sch) == 7, len(sch))
+check("vollständiger Werkzeugkasten", len(sch) == 16, len(sch))
 check("OpenAI-Format", all(t["type"] == "function" and "name" in t["function"]
                           and "parameters" in t["function"] for t in sch))
 check("Pflichtfelder deklariert",
@@ -777,8 +777,8 @@ async def fake_sandbox(files, entry="main.py"):
 box = tools.Toolbox(tws, run_sandbox=fake_sandbox,
                     index_builder=codeindex.CodeIndex.build)
 
-def call(name, **args):
-    return asyncio.run(box.call(name, args))
+def call(_werkzeug, **args):
+    return asyncio.run(box.call(_werkzeug, args))
 
 check("list_files nennt beide Dateien",
       set(call("list_files").split()) == {"hilfe.py", "main.py"}, call("list_files"))
@@ -1203,6 +1203,25 @@ check("overview nennt Name und Beschreibung",
       any("tests:" in z for z in skills_mod.overview(echte)),
       skills_mod.overview(echte))
 
+# Die Werkzeugliste eines Skills ist eine harte Sperre. Kommt ein neues
+# Werkzeug dazu und wird hier nicht nachgetragen, ist es unter jedem Skill
+# unbenutzbar - ohne dass irgendwo ein Fehler auftaucht.
+for sk in echte:
+    unbekannt = [w for w in sk.werkzeuge if w not in tools.NAMES]
+    check(f"Skill '{sk.name}' nennt nur existierende Werkzeuge",
+          not unbekannt, unbekannt)
+    check(f"Skill '{sk.name}' erlaubt finish",
+          "finish" in sk.werkzeuge, sk.werkzeuge)
+
+schreibende = {"edit_file", "write_file"}
+for sk in echte:
+    if sk.name == "review":
+        check("review darf nichts Schreibendes",
+              not (schreibende & set(sk.werkzeuge)), sk.werkzeuge)
+    else:
+        check(f"Skill '{sk.name}' kennt edit_file",
+              "edit_file" in sk.werkzeuge, sk.werkzeuge)
+
 print("\n[26] Konnektoren")
 import connectors  # noqa: E402
 
@@ -1348,7 +1367,7 @@ fws = ws_mod.Workspace(tempfile.mkdtemp())
 fws.write("main.py", "print(1)\n")
 
 leer = tools.Toolbox(fws)
-check("ohne Konnektoren nur Basiswerkzeuge", len(leer.schema()) == 7, len(leer.schema()))
+check("ohne Konnektoren nur Basiswerkzeuge", len(leer.schema()) == 16, len(leer.schema()))
 check("schema() ohne Argument kennt keine Konnektoren",
       {t["function"]["name"] for t in tools.schema()} == tools.BASE_NAMES)
 check("fetch_url nicht aufrufbar",
@@ -1356,7 +1375,7 @@ check("fetch_url nicht aufrufbar",
       .startswith("FEHLER"))
 
 mit = tools.Toolbox(fws, enabled=["fetch_url"])
-check("freigeschalteter Konnektor erscheint", len(mit.schema()) == 8, len(mit.schema()))
+check("freigeschalteter Konnektor erscheint", len(mit.schema()) == 17, len(mit.schema()))
 check("Konnektor steht im Schema",
       "fetch_url" in {t["function"]["name"] for t in mit.schema()})
 check("nicht freigeschalteter Konnektor fehlt",
@@ -1385,7 +1404,7 @@ check("restrict kann keinen Konnektor freischalten",
       "fetch_url" not in weit.allowed and "git_push" not in weit.allowed,
       sorted(weit.allowed))
 check("leeres restrict ändert nichts",
-      len(tools.Toolbox(fws).schema()) == 7)
+      len(tools.Toolbox(fws).schema()) == 16)
 
 # Skill im Agentenlauf
 def drive_skill(script, skill, files=None):
@@ -1599,9 +1618,10 @@ mws.write("helfer.py", "wert = 7\n")
 mws.write("notizen.txt", "kein Code\n")
 
 uebergeben = {}
-async def merk_sandbox(files, entry="main.py"):
+async def merk_sandbox(files, entry="main.py", *, command=None):
     uebergeben["files"] = files
     uebergeben["entry"] = entry
+    uebergeben["command"] = command
     return (0, "7")
 
 mbox = tools.Toolbox(mws, run_sandbox=merk_sandbox)
@@ -1653,6 +1673,198 @@ asyncio.run(main.run_agent(stumm, "aufgabe", ask_fn=einzel_ask,
 check("Einmalwurf schickt genau eine Datei",
       list(einzel["files"]) == ["main.py"], einzel.get("files"))
 check("Einmalwurf startet main.py", einzel["entry"] == "main.py")
+
+print("\n[31] Bearbeitungswerkzeuge")
+
+ews = ws_mod.Workspace(tempfile.mkdtemp())
+ews.write("main.py", "def gruss(name):\n    return f'hallo {name}'\n\n"
+                     "print(gruss('welt'))\n")
+ews.write("hilfe.py", "from main import gruss\n\ndef zweimal(n):\n"
+                      "    return gruss(n) + gruss(n)\n")
+ews.write("notiz.md", "# Notizen\nnichts\n")
+ews.git_commit("Start")
+
+ebox = tools.Toolbox(ews, run_sandbox=merk_sandbox,
+                     index_builder=codeindex.CodeIndex.build)
+
+def ecall(_werkzeug, **args):
+    """Erster Parameter unterstrichen: sonst kollidiert er mit dem
+    Argument 'name' von symbol_info."""
+    return asyncio.run(ebox.call(_werkzeug, args))
+
+# ---- edit_file: der wichtigste Neuzugang
+r = ecall("edit_file", path="main.py", old_text="hallo", new_text="moin")
+check("edit_file ersetzt", "1 Stelle ersetzt" in r, r)
+check("Datei wirklich geändert", "moin" in ews.read("main.py"))
+check("Rest der Datei bleibt", "def gruss(name)" in ews.read("main.py"))
+
+r = ecall("edit_file", path="main.py", old_text="gibtsnichtimtext", new_text="x")
+check("fehlender Text meldet Fehler", r.startswith("FEHLER"), r)
+check("Fehler erklärt, was zu tun ist", "read_file" in r, r)
+
+r = ecall("edit_file", path="hilfe.py", old_text="gruss(n)", new_text="gruesse(n)")
+check("mehrdeutige Stelle wird abgelehnt", r.startswith("FEHLER") and "2-mal" in r, r)
+check("Datei bei Mehrdeutigkeit unverändert", "gruesse" not in ews.read("hilfe.py"))
+
+r = ecall("edit_file", path="hilfe.py", old_text="gruss(n)",
+          new_text="gruesse(n)", replace_all=True)
+check("replace_all ersetzt alle", "2 Stellen ersetzt" in r, r)
+check("beide Vorkommen ersetzt", ews.read("hilfe.py").count("gruesse(n)") == 2)
+
+check("identischer Text wird abgelehnt",
+      ecall("edit_file", path="main.py", old_text="a", new_text="a")
+      .startswith("FEHLER"))
+check("leeres old_text wird abgelehnt",
+      ecall("edit_file", path="main.py", old_text="", new_text="x")
+      .startswith("FEHLER"))
+check("edit_file kommt nicht aus dem Projekt heraus",
+      ecall("edit_file", path="../fremd.py", old_text="a", new_text="b")
+      .startswith("FEHLER"))
+
+# ---- read_file abschnittsweise
+ews.write("lang.py", "\n".join(f"zeile{i}" for i in range(1, 101)) + "\n")
+r = ecall("read_file", path="lang.py", offset=10, limit=5)
+check("read_file liest Ausschnitt", "zeile10" in r and "zeile14" in r, r[:80])
+check("Ausschnitt endet wo er soll", "zeile15" not in r)
+check("Ausschnitt nennt den Gesamtumfang", "von 100" in r, r[-60:])
+check("read_file ohne Angaben liest alles",
+      "zeile100" in ecall("read_file", path="lang.py"))
+
+# ---- glob
+check("glob findet nach Endung",
+      set(ecall("glob", pattern="*.py").split()) ==
+      {"hilfe.py", "lang.py", "main.py"}, ecall("glob", pattern="*.py"))
+check("glob ohne Treffer meldet das",
+      "Keine Datei" in ecall("glob", pattern="*.rs"))
+check("glob ohne Muster meldet Fehler", ecall("glob").startswith("FEHLER"))
+
+# ---- search: regex, glob-Filter, Kontext
+check("search mit regulärem Ausdruck",
+      "main.py" in ecall("search", query=r"def \w+\(", regex=True),
+      ecall("search", query=r"def \w+\(", regex=True))
+check("kaputter Ausdruck meldet Fehler",
+      ecall("search", query="[unklosed", regex=True).startswith("FEHLER"))
+check("search filtert über glob",
+      "notiz.md" not in ecall("search", query="Notizen", glob="*.py"))
+check("search findet ohne Filter",
+      "notiz.md" in ecall("search", query="Notizen"))
+check("search mit Kontext liefert Nachbarzeilen",
+      ecall("search", query="return f", context=1).count("main.py:") >= 2,
+      ecall("search", query="return f", context=1))
+
+# ---- symbol_info
+r = ecall("symbol_info", name="gruss")
+check("symbol_info nennt die Signatur", "gruss(name)" in r, r)
+check("symbol_info nennt die Fundstelle", "main.py:1" in r, r)
+check("symbol_info nennt Aufrufer", "Aufrufer:" in r, r)
+check("unbekanntes Symbol meldet das",
+      "Kein Symbol" in ecall("symbol_info", name="gibtsnicht"))
+check("symbol_info ohne Namen meldet Fehler",
+      ecall("symbol_info").startswith("FEHLER"))
+
+# ---- check_syntax
+check("check_syntax bestätigt gültigen Code",
+      "in Ordnung" in ecall("check_syntax", path="main.py"),
+      ecall("check_syntax", path="main.py"))
+ews.write("kaputt.py", "def f(:\n    pass\n")
+r = ecall("check_syntax", path="kaputt.py")
+check("check_syntax findet den Fehler", "SyntaxError" in r, r)
+check("check_syntax nennt die Zeile", "Zeile 1" in r, r)
+
+# ---- delete_file / move_file
+check("move_file benennt um",
+      "notiz.md → doku/notiz.md" in ecall("move_file", source="notiz.md",
+                                          destination="doku/notiz.md"))
+check("Datei liegt am neuen Ort", ews.exists("doku/notiz.md"))
+check("alter Ort ist leer", not ews.exists("notiz.md"))
+check("move auf bestehendes Ziel wird abgelehnt",
+      ecall("move_file", source="doku/notiz.md", destination="main.py")
+      .startswith("FEHLER"))
+check("move einer fehlenden Datei meldet Fehler",
+      ecall("move_file", source="weg.md", destination="x.md").startswith("FEHLER"))
+
+check("delete_file löscht", "Gelöscht" in ecall("delete_file", path="doku/notiz.md"))
+check("Datei ist weg", not ews.exists("doku/notiz.md"))
+check("leer gewordenes Verzeichnis wird aufgeräumt",
+      not (ews.root / "doku").exists())
+check("delete einer fehlenden Datei meldet Fehler",
+      ecall("delete_file", path="weg.md").startswith("FEHLER"))
+
+# ---- rename_symbol: über den Syntaxbaum, nicht per Textersetzung
+rws = ws_mod.Workspace(tempfile.mkdtemp())
+rws.write("main.py", 'def berechne(x):\n    """Doku."""\n    return x\n\n'
+                     'wert = berechne(1)\n'
+                     'text = "berechne"\n'
+                     'obj.berechne()\n')
+rws.write("andere.py", "from main import berechne\n\ndef nutzer():\n"
+                       "    return berechne(2)\n")
+rws.git_commit("Start")
+rbox = tools.Toolbox(rws, index_builder=codeindex.CodeIndex.build)
+r = asyncio.run(rbox.call("rename_symbol",
+                          {"path": "main.py", "old_name": "berechne",
+                           "new_name": "rechne"}))
+neu = rws.read("main.py")
+check("rename_symbol benennt Definition um", "def rechne(x)" in neu, neu)
+check("rename_symbol benennt Aufruf um", "rechne(1)" in neu)
+check("Zeichenkette bleibt unangetastet", '"berechne"' in neu, neu)
+check("fremdes Attribut bleibt unangetastet", "obj.berechne()" in neu, neu)
+check("Kommentar/Docstring unversehrt", '"""Doku."""' in neu)
+check("warnt vor Aufrufern in anderen Dateien",
+      "ACHTUNG" in r and "andere.py" in r, r)
+check("ungültiger Bezeichner wird abgelehnt",
+      asyncio.run(rbox.call("rename_symbol",
+                            {"path": "main.py", "old_name": "rechne",
+                             "new_name": "2ungueltig"})).startswith("FEHLER"))
+
+# ---- undo: der Rückwärtsgang
+uws = ws_mod.Workspace(tempfile.mkdtemp())
+uws.write("main.py", "print('original')\n")
+uws.git_commit("Start")
+ubox = tools.Toolbox(uws)
+asyncio.run(ubox.call("write_file", {"path": "main.py", "content": "kaputt(\n"}))
+asyncio.run(ubox.call("write_file", {"path": "neu.py", "content": "x=1\n"}))
+check("Änderung ist erst mal da", "kaputt" in uws.read("main.py"))
+r = asyncio.run(ubox.call("undo", {}))
+check("undo meldet den Commit", "zurückgesetzt" in r, r)
+check("geänderte Datei ist wiederhergestellt",
+      uws.read("main.py") == "print('original')\n", uws.read("main.py"))
+check("neu angelegte Datei ist weg", not uws.exists("neu.py"))
+check("undo leert die Liste der Änderungen", ubox.written == [], ubox.written)
+
+leerws = ws_mod.Workspace(tempfile.mkdtemp())
+check("undo ohne Historie meldet Fehler",
+      asyncio.run(tools.Toolbox(leerws).call("undo", {})).startswith("FEHLER"))
+
+# ---- run_command
+cbox = tools.Toolbox(ews, run_sandbox=merk_sandbox)
+r = asyncio.run(cbox.call("run_command", {"command": "python -m unittest -v"}))
+check("run_command läuft über die Sandbox",
+      r.startswith("Befehl erfolgreich"), r)
+check("run_command ohne Befehl meldet Fehler",
+      asyncio.run(cbox.call("run_command", {"command": ""})).startswith("FEHLER"))
+check("run_command ohne Sandbox meldet Fehler",
+      asyncio.run(tools.Toolbox(ews).call("run_command", {"command": "ls"}))
+      .startswith("FEHLER"))
+check("unlesbarer Befehl meldet Fehler",
+      asyncio.run(cbox.call("run_command", {"command": 'python -c "unbalanced'}))
+      .startswith("FEHLER"))
+
+# Kein Shell-Aufruf: '&&' ist ein gewoehnliches Argument, keine Verkettung.
+befehle = {}
+async def merk_command(files, entry=None, *, command=None):
+    befehle["command"] = command
+    return (0, "ok")
+sbox = tools.Toolbox(ews, run_sandbox=merk_command)
+asyncio.run(sbox.call("run_command", {"command": "ls && rm -rf /"}))
+check("Befehl wird in Argumente zerlegt, nicht an eine Shell gegeben",
+      befehle["command"] == ["ls", "&&", "rm", "-rf", "/"], befehle["command"])
+
+# ---- Hilfsfunktionen
+check("_passt vergleicht ohne '/' den Dateinamen", tools._passt("a/b/c.py", "*.py"))
+check("_passt vergleicht mit '/' den ganzen Pfad",
+      tools._passt("src/x.py", "src/*.py") and not tools._passt("a/x.py", "src/*.py"))
+check("_als_zahl verträgt Text von Modellen", tools._als_zahl("12", 0) == 12)
+check("_als_zahl fällt bei Unsinn zurück", tools._als_zahl("viele", 7) == 7)
 
 print(f"\n=== {ok} bestanden, {fail} fehlgeschlagen ===")
 sys.exit(1 if fail else 0)

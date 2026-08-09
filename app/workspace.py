@@ -86,6 +86,36 @@ class Workspace:
         except WorkspaceError:
             return False
 
+    def delete(self, relative: str) -> str:
+        path = self.resolve(relative)
+        if not path.is_file():
+            raise WorkspaceError(f"Datei nicht gefunden: {relative}")
+        path.unlink()
+        self._prune_empty(path.parent)
+        return str(path.relative_to(self.root))
+
+    def move(self, source: str, destination: str) -> str:
+        """Verschiebt oder benennt um. Ueberschreibt nichts stillschweigend."""
+        alt = self.resolve(source)
+        neu = self.resolve(destination)
+        if not alt.is_file():
+            raise WorkspaceError(f"Datei nicht gefunden: {source}")
+        if neu.exists():
+            raise WorkspaceError(f"Ziel existiert bereits: {destination}")
+        neu.parent.mkdir(parents=True, exist_ok=True)
+        alt.rename(neu)
+        self._prune_empty(alt.parent)
+        return str(neu.relative_to(self.root))
+
+    def _prune_empty(self, ordner: Path) -> None:
+        """Raeumt leer gewordene Verzeichnisse weg, bis zur Projektwurzel."""
+        while ordner != self.root and self.root in ordner.parents:
+            try:
+                ordner.rmdir()          # schlaegt fehl, wenn nicht leer
+            except OSError:
+                return
+            ordner = ordner.parent
+
     # -------------------------------------------------------------- Git
 
     def _git(self, *args: str, check: bool = True):
@@ -123,6 +153,28 @@ class Workspace:
             if not status.stdout.strip():
                 return None
             self._git("commit", "-q", "-m", message)
+            return self._git("rev-parse", "--short", "HEAD").stdout.strip()
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            return None
+
+    def git_revert(self) -> str | None:
+        """Setzt das Projekt auf den letzten Commit zurueck.
+
+        Der Rueckwaertsgang: hat der Agent etwas zerschossen, ist das der Weg
+        zurueck, ohne dass ein Mensch eingreifen muss. Verwirft ausdruecklich
+        alle nicht committeten Aenderungen - genau das ist der Zweck.
+
+        Gibt den Commit zurueck, auf dem das Projekt jetzt steht, oder None,
+        wenn es keine Historie gibt.
+        """
+        if not (self.root / ".git").is_dir():
+            return None
+        try:
+            if not self._git("rev-parse", "HEAD", check=False).stdout.strip():
+                return None          # noch kein Commit, nichts zum Zurueckgehen
+            self._git("checkout", "--", ".")
+            # Neu angelegte Dateien sind untracked und ueberleben checkout.
+            self._git("clean", "-fdq")
             return self._git("rev-parse", "--short", "HEAD").stdout.strip()
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             return None

@@ -522,12 +522,13 @@ async def healthz():
 
 # ------------------------------------------------------------------ Agent
 
-async def sandbox_runner(send, files: dict, entry: str = "main.py"):
+async def sandbox_runner(send, files: dict, entry: str = "main.py", *, command=None):
     """Fuehrt einen Projektstand in einer frischen Sandbox aus.
 
     Bekommt ALLE Dateien, nicht nur eine: ein Projekt aus mehreren Modulen
     liesse sich sonst nicht ausfuehren, weil der Import ins Leere geht.
-    entry bestimmt, welche davon gestartet wird.
+    entry bestimmt, welche davon gestartet wird. Alternativ setzt command
+    einen beliebigen Befehl - dann wird entry nicht benutzt.
 
     Streamt die Ausgabe als 'sandbox'-Ereignisse und liefert
     (exit_code, gesamte_ausgabe) zurueck. Jeder Aufruf bekommt eigenen
@@ -540,7 +541,8 @@ async def sandbox_runner(send, files: dict, entry: str = "main.py"):
     try:
         project_dir = await asyncio.to_thread(sandbox.make_project_dir, files)
         container = await asyncio.to_thread(
-            sandbox.start, project_dir, sandbox.entry_command(entry))
+            sandbox.start, project_dir,
+            list(command) if command else sandbox.entry_command(entry))
         try:
             async for line in sandbox.stream_logs(container):
                 lines.append(line)
@@ -612,8 +614,8 @@ async def agent(ws: WebSocket):
             await send("status", f"Modell {MODEL} über {provider.PROVIDER} — "
                                  "Auftrag angenommen.")
 
-            async def run_sandbox(files, entry="main.py"):
-                return await sandbox_runner(send, files, entry)
+            async def run_sandbox(files, entry="main.py", *, command=None):
+                return await sandbox_runner(send, files, entry, command=command)
 
             await dispatch(send, prompt, ask_fn=ask, chat_fn=model_chat,
                            run_sandbox=run_sandbox, workspace=WORKSPACE)

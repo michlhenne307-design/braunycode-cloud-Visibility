@@ -25,8 +25,12 @@ Browser (Handy/Rechner) ──WebSocket──▶  FastAPI
                                           │    review · doku
                                           │
                                           ├─▶  Werkzeuge am Projekt
-                                          │    list · read · write · search
-                                          │    outline · run_python · finish
+                                          │    list · glob · read · search
+                                          │    outline · symbol_info
+                                          │    edit · write · delete · move
+                                          │    rename_symbol · check_syntax
+                                          │    run_python · run_command
+                                          │    undo · finish
                                           │
                                           ├─▶  Konnektoren (aus per Standard)
                                           │    fetch_url · git_push
@@ -190,15 +194,62 @@ wie ein Mensch am Rechner: schauen, lesen, ändern, ausführen, Ergebnis prüfen
 weitermachen. Genau das macht BraunyCode seit v1.6.0 — das Modell bekommt
 Werkzeuge und entscheidet in jeder Runde selbst, welches dran ist.
 
+**Lesen und finden**
+
 | Werkzeug | Was es tut |
 |---|---|
 | `list_files` | alle Dateien im Projekt auflisten |
-| `read_file` | eine Datei lesen (mit Zeilennummern) |
-| `write_file` | eine Datei schreiben |
-| `search` | Text über alle Projektdateien suchen |
+| `glob` | Dateien über ein Muster finden (`*.py`, `src/*.md`) |
+| `read_file` | Datei lesen, mit Zeilennummern — `offset`/`limit` für Ausschnitte |
+| `search` | Text suchen: regulärer Ausdruck, Datei-Filter, Kontextzeilen |
 | `outline` | Funktionen, Klassen und Aufrufgraph zeigen |
-| `run_python` | eine Datei in der abgeschotteten Sandbox ausführen — **das ganze Projekt kommt mit**, Importe funktionieren |
+| `symbol_info` | Signatur, Fundstelle, Aufrufer, Aufgerufenes, Auswirkung einer Änderung |
+
+**Ändern**
+
+| Werkzeug | Was es tut |
+|---|---|
+| `edit_file` | **Textstelle ersetzen** — der Normalweg für Änderungen |
+| `write_file` | Datei komplett neu schreiben (neue Dateien, vollständiger Ersatz) |
+| `delete_file` | Datei löschen |
+| `move_file` | verschieben oder umbenennen |
+| `rename_symbol` | Symbol über den Syntaxbaum umbenennen — formaterhaltend |
+
+**Prüfen und ausführen**
+
+| Werkzeug | Was es tut |
+|---|---|
+| `check_syntax` | Syntaxprüfung ohne Ausführung — kostet nichts |
+| `run_python` | Datei in der Sandbox ausführen — **das ganze Projekt kommt mit**, Importe funktionieren |
+| `run_command` | beliebiger Befehl in der Sandbox, z. B. `python -m unittest` |
+
+**Zurück und Schluss**
+
+| Werkzeug | Was es tut |
+|---|---|
+| `undo` | Projekt auf den letzten Commit zurücksetzen |
 | `finish` | Arbeit beenden und zusammenfassen |
+
+### Warum `edit_file` der wichtigste davon ist
+
+Ein 7B-Modell erzeugt auf CPU 5–10 Token pro Sekunde. Eine 200-Zeilen-Datei
+neu zu schreiben dauert damit **Minuten**; drei Zeilen zu ersetzen dauert
+Sekunden. Und der Neuschreib-Weg hat die unangenehmere Eigenschaft: kleine
+Modelle verlieren dabei zuverlässig Teile der Datei. `edit_file` nimmt beides
+weg.
+
+Damit die Ersetzung nicht danebengreift, ist sie streng: kommt `old_text` gar
+nicht vor, gibt es einen Fehler mit dem Hinweis, erst zu lesen. Kommt er
+mehrfach vor, ebenfalls — mit der Zahl der Fundstellen und der Aufforderung,
+mehr Kontext mitzugeben. Wer wirklich alle meint, setzt `replace_all`.
+
+### `run_command` ist ungefährlicher als es klingt
+
+Er läuft in derselben gehärteten Sandbox: kein Netz, non-root, alle
+Capabilities entzogen, RAM- und CPU-Deckel, Zeitlimit. Und er arbeitet auf
+einer **Kopie** des Projekts — was dort geschrieben wird, erreicht das echte
+Verzeichnis nicht. Es gibt außerdem keine Shell: die Zeile wird in Argumente
+zerlegt, `&&` und `|` sind gewöhnliche Zeichen statt Verkettung.
 
 Alle Werkzeuge arbeiten ausschließlich innerhalb des Projektverzeichnisses;
 die Pfadprüfung aus `workspace.py` lässt sich nicht umgehen. Ein Fehler wird
@@ -423,6 +474,19 @@ keine Bedeutungserkennung, und das steht so auch im Code.
 Der Aufrufgraph wird über Namen gebildet, nicht über aufgelöste Typen: zwei
 gleichnamige Methoden in verschiedenen Klassen sind für den Index dasselbe
 Ziel. Für „wer könnte betroffen sein" reicht das, eine Typanalyse ist es nicht.
+Dasselbe gilt für `symbol_info`, das genau darauf aufsetzt.
+
+### Zwei Grenzen des Werkzeugkastens
+
+**16 Werkzeuge sind viel für ein kleines Modell.** Jedes steht im Prompt und
+kostet Kontext, und je mehr Auswahl, desto eher greift ein 7B daneben. Wer das
+merkt: ein Skill schränkt die Liste für seine Aufgabenart ein — genau dafür
+gibt es das `werkzeuge`-Feld.
+
+**`edit_file` arbeitet auf exaktem Text, nicht auf Zeilennummern.** Bei stark
+wiederholtem Code muss das Modell genug Kontext mitgeben, damit die Stelle
+eindeutig wird — sonst kommt eine Fehlermeldung statt einer falschen Änderung.
+Das ist Absicht.
 
 ### Warnung bei unvollständigem Umbenennen
 
@@ -504,7 +568,7 @@ python3 -m venv venv && venv/bin/pip install -r requirements.txt
 venv/bin/python test_smoke.py
 ```
 
-**412 Fälle in 30 Abschnitten, ohne Docker und ohne Ollama.** Modell, Sandbox
+**490 Fälle in 31 Abschnitten, ohne Docker und ohne Ollama.** Modell, Sandbox
 und Werkzeugantworten werden gescriptet hineingereicht.
 
 Abgedeckt sind unter anderem:
@@ -520,6 +584,13 @@ Abgedeckt sind unter anderem:
   Passwort-Platzhalter steht wortgleich in Konfiguration *und* Abbruchprüfung,
   die Deadlock-Abschaltung ist auf beiden Seiten da, HTTPS-Fehlschlag kippt
   die Installation nicht, das Skript endet mit `exit 0`
+- **Bearbeitungswerkzeuge**: `edit_file` lehnt fehlenden und mehrdeutigen
+  Text ab statt danebenzugreifen, `rename_symbol` lässt Zeichenketten und
+  fremde Attribute in Ruhe, `undo` stellt geänderte Dateien wieder her und
+  entfernt neu angelegte, `run_command` wird in Argumente zerlegt statt an
+  eine Shell gegeben
+- **Skill-Allowlists**: jeder Skill nennt nur existierende Werkzeuge und
+  erlaubt `finish`; `review` bekommt nichts Schreibendes
 - **Mehrdateiige Projekte**: `run_python` liefert das importierte Modul
   wirklich mit in den Container, startet die angeforderte Datei statt fest
   `main.py`, Unterverzeichnisse bleiben erhalten, Deckel greift
@@ -562,7 +633,7 @@ als Text zurück, und der Aufruf des Cloud-Metadaten-Dienstes
 gefälschter Namensauflösung.
 
 **Nicht verifiziert** (Stand dieser Fassung): Es gab noch keinen
-End-to-End-Lauf mit echtem Modell und echtem Docker. Die 412 Tests laufen
+End-to-End-Lauf mit echtem Modell und echtem Docker. Die 490 Tests laufen
 gegen gescriptete Modellantworten — sie belegen, dass die Schleife korrekt
 arbeitet, nicht dass ein bestimmtes Modell gute Ergebnisse liefert. Ob die
 Skills die Ergebnisse eines 7B-Modells **messbar** verbessern, ist nicht

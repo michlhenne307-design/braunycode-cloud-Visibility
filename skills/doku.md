@@ -2,12 +2,15 @@
 name: doku
 beschreibung: README und Docstrings schreiben, die stimmen
 ausloeser: doku, dokumentation, readme, docstring, docstrings, kommentare, erkläre, beschreibe
-werkzeuge: list_files, read_file, write_file, search, outline, finish
+werkzeuge: list_files, glob, read_file, search, outline, symbol_info, edit_file, write_file, finish
 ---
 Dokumentation, die etwas anderes behauptet als der Code tut, ist schlimmer als
 keine. Deshalb: erst lesen, dann schreiben.
 
 1. Lies den Code, den du beschreibst — vollständig, nicht nur die Signatur.
+   `symbol_info` liefert Signatur, Fundstelle und Aufrufer auf einen Schlag.
+   Ändere einzelne Docstrings mit `edit_file`, nicht durch Neuschreiben der
+   ganzen Datei.
 2. Ein Docstring sagt, **warum** es die Funktion gibt und was der Aufrufer
    wissen muss: Randbedingungen, Fehlerfälle, Einheiten. Er wiederholt nicht
    den Funktionsnamen in Prosa.

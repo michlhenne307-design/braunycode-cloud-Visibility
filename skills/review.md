@@ -2,10 +2,14 @@
 name: review
 beschreibung: Code prüfen und Probleme melden, ohne etwas zu ändern
 ausloeser: review, prüfe, prüfen, durchsicht, begutachte, bewerte, schwachstellen, probleme, sicher
-werkzeuge: list_files, read_file, search, outline, finish
+werkzeuge: list_files, glob, read_file, search, outline, symbol_info, check_syntax, finish
 ---
-Du prüfst und meldest. Du änderst nichts — `write_file` steht dir bei dieser
-Aufgabe bewusst nicht zur Verfügung.
+Du prüfst und meldest. Du änderst nichts — `edit_file`, `write_file` und alles
+andere Schreibende steht dir bei dieser Aufgabe bewusst nicht zur Verfügung.
+
+`symbol_info` sagt dir für jede Funktion, wer sie aufruft und was bei einer
+Änderung brechen würde. Das ist oft der schnellste Weg zum eigentlichen
+Problem.
 
 Sieh dir in dieser Reihenfolge an:
 
