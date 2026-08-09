@@ -2,7 +2,7 @@
 name: bugfix
 beschreibung: Fehler erst reproduzieren, dann beheben, dann nachweisen
 ausloeser: fehler, bug, kaputt, absturz, exception, traceback, funktioniert, behebe, repariere, stimmt
-werkzeuge: list_files, glob, read_file, search, outline, symbol_info, edit_file, write_file, check_syntax, run_python, run_command, undo, finish
+werkzeuge: list_files, glob, read_file, search, outline, symbol_info, edit_file, write_file, check_syntax, affected_tests, run_python, run_command, undo, finish
 ---
 Die Reihenfolge ist der ganze Punkt. Halte sie ein.
 

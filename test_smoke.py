@@ -2363,5 +2363,34 @@ check("affected_tests belegt nichts",
       _tb.unverified == {"pkg/kern.py"}, _tb.unverified)
 
 
+# ------------------------------------------------- Skills gegen neue Werkzeuge
+print("\n[36] Ausgelieferte Skills kennen die Werkzeuge")
+
+# Zweimal ist in diesem Projekt schon ein neues Werkzeug hinzugekommen, ohne in
+# die Allowlists der Skills einzuziehen - und war damit ueberall still
+# gesperrt, wo ein Skill griff. Kein Fehler, keine Meldung, nur ein Agent, der
+# das Werkzeug nie benutzt. Diese Zusicherung faengt den dritten Fall.
+_skills = skills_mod.load(os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills"))
+check("Skills werden geladen", len(_skills) >= 5, len(_skills))
+
+for _s in _skills:
+    _erlaubt = set(_s.werkzeuge)
+    check(f"{_s.name}: nur existierende Werkzeuge",
+          _erlaubt <= tools.NAMES, sorted(_erlaubt - tools.NAMES))
+    check(f"{_s.name}: finish ist drin", "finish" in _erlaubt, sorted(_erlaubt))
+    if _erlaubt & tools.MODIFYING:
+        # Wer Code aendern darf, muss auch pruefen duerfen - sonst laeuft er
+        # in die Abschluss-Sperre und kommt nicht wieder heraus.
+        check(f"{_s.name}: ändert Code, also auch check_syntax",
+              "check_syntax" in _erlaubt, sorted(_erlaubt))
+    if _erlaubt & tools.MODIFYING and _erlaubt & {"run_python", "run_command"}:
+        # Nur wer auch ausfuehren darf. 'doku' aendert Docstrings, kann aber
+        # bewusst nichts starten - eine Testliste waere dort Information, mit
+        # der es nichts anfangen kann. Die erste Fassung dieser Zusicherung war
+        # zu grob und hat genau das angemahnt.
+        check(f"{_s.name}: ändert und führt aus, also auch affected_tests",
+              "affected_tests" in _erlaubt, sorted(_erlaubt))
+
+
 print(f"\n=== {ok} bestanden, {fail} fehlgeschlagen ===")
 sys.exit(1 if fail else 0)

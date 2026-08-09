@@ -2,7 +2,7 @@
 name: umbau
 beschreibung: Bestehenden Code umbauen, ohne Verhalten zu ändern
 ausloeser: umbau, umbauen, refactor, refactoring, aufräumen, vereinfachen, umstrukturieren, zerlegen, extrahiere
-werkzeuge: list_files, glob, read_file, search, outline, symbol_info, edit_file, write_file, move_file, rename_symbol, check_syntax, run_python, run_command, undo, finish
+werkzeuge: list_files, glob, read_file, search, outline, symbol_info, edit_file, write_file, move_file, rename_symbol, check_syntax, affected_tests, run_python, run_command, undo, finish
 ---
 Ein Umbau ändert die Form, nicht das Verhalten. Wenn sich das Verhalten ändert,
 ist es kein Umbau — dann sag das.
