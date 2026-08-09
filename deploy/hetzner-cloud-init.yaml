@@ -1,0 +1,146 @@
+#cloud-config
+#
+# BraunyCode Cloud - unbeaufsichtigte Einrichtung auf einem Hetzner-Server.
+#
+# Gedacht fuer den Fall, dass man KEINEN Rechner zur Hand hat: Dieses Skript
+# wird beim Erstellen des Servers in das Feld "Cloud config" eingefuegt und
+# laeuft beim ersten Start von allein durch. Es wird kein SSH gebraucht.
+#
+# VORHER GENAU EINE ZEILE AENDERN: BRAUNY_TOKEN weiter unten.
+# Das ist das Passwort, mit dem du dich spaeter in der Oberflaeche anmeldest.
+# Denk dir etwas Langes aus (mindestens 12 Zeichen) und merke es dir - danach
+# steht es nur noch auf dem Server.
+#
+# Dauer: 15-25 Minuten, ueberwiegend Modell-Download.
+# Fertig, wenn http://<SERVER-IP>:8000 die Oberflaeche zeigt.
+
+users:
+  # Die Gruppe 'docker' wird hier bewusst NICHT genannt: sie existiert beim
+  # Anlegen des Benutzers noch nicht, das Anlegen wuerde scheitern. Der
+  # Installer traegt den Benutzer spaeter selbst ein.
+  - name: brauny
+    groups: [sudo]
+    shell: /bin/bash
+    sudo: ["ALL=(ALL) NOPASSWD:ALL"]
+    lock_passwd: true
+
+package_update: true
+package_upgrade: false
+
+packages:
+  - git
+  - curl
+  - ca-certificates
+
+write_files:
+  # Die Einstellungen liegen getrennt vom Skript, damit hier oben nur eine
+  # einzige Zeile angefasst werden muss.
+  - path: /etc/braunycode.setup
+    permissions: "0600"
+    content: |
+      # ==================================================================
+      # HIER DEIN PASSWORT EINTRAGEN (mindestens 12 Zeichen):
+      BRAUNY_TOKEN=bitte-hier-ein-langes-passwort-eintragen
+      # ==================================================================
+      BRAUNY_MODEL=qwen2.5-coder:7b
+      BRAUNY_PORT=8000
+      BRAUNY_REPO=https://github.com/michlhenne307-design/braunycode-cloud-Visibility.git
+      BRAUNY_BRANCH=main
+
+      # OPTIONAL: HTTPS statt HTTP.
+      # Kostenlosen Namen auf https://www.duckdns.org holen (Login mit einem
+      # bestehenden Konto, Namen ausdenken, Server-IP eintragen) und hier
+      # eintragen, z. B. BRAUNY_DOMAIN=meinbrauny.duckdns.org
+      # Leer lassen = nur HTTP. Port 8000 bleibt in beiden Faellen offen.
+      BRAUNY_DOMAIN=
+
+  - path: /usr/local/bin/braunycode-setup.sh
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      # Holt den Quelltext und ruft den normalen Installer auf - denselben,
+      # den man auch von Hand starten wuerde. Kein Sonderweg, der spaeter
+      # auseinanderlaeuft.
+      set -euo pipefail
+      exec > >(tee -a /var/log/braunycode-setup.log) 2>&1
+      echo "=== BraunyCode-Einrichtung gestartet: $(date -Is) ==="
+
+      # Die Datei wird ZEILENWEISE gelesen, nicht mit '.' eingebunden.
+      # Ein 'source' wuerde jeden Wert als Bash auswerten: ein Passwort mit
+      # '$' waere still ein anderes (der Nutzer kaeme nicht mehr rein), und
+      # eines mit $(...) oder Backticks wuerde beim Systemstart als root
+      # ausgefuehrt. Genau in diese Datei soll aber ein selbst ausgedachtes
+      # Passwort eingetragen werden.
+      while IFS= read -r zeile || [ -n "$zeile" ]; do
+        case "$zeile" in
+          ''|'#'*) continue ;;
+          BRAUNY_*=*) : ;;
+          *) continue ;;
+        esac
+        schluessel=${zeile%%=*}
+        wert=${zeile#*=}
+        export "$schluessel=$wert"
+      done < /etc/braunycode.setup
+
+      if [ -z "${BRAUNY_TOKEN:-}" ] || [ "${#BRAUNY_TOKEN}" -lt 12 ] \
+         || [ "$BRAUNY_TOKEN" = "bitte-hier-ein-langes-passwort-eintragen" ]; then
+        echo "ABBRUCH: In /etc/braunycode.setup steht kein eigenes Passwort."
+        echo "Datei anpassen und dann: sudo /usr/local/bin/braunycode-setup.sh"
+        exit 1
+      fi
+
+      SRC=/opt/braunycode-src
+      if [ -d "$SRC/.git" ]; then
+        git -C "$SRC" fetch --depth 1 origin "$BRAUNY_BRANCH"
+        git -C "$SRC" reset --hard FETCH_HEAD
+      else
+        git clone --depth 1 --branch "$BRAUNY_BRANCH" "$BRAUNY_REPO" "$SRC"
+      fi
+      chown -R brauny:brauny "$SRC"
+
+      # Der Installer weigert sich bewusst, als root zu laufen.
+      #
+      # Die Werte werden ueber 'env' uebergeben, nicht in eine Kommandozeile
+      # eingesetzt: ein Passwort mit Anfuehrungszeichen wuerde die Zeile sonst
+      # zerlegen. HOME und USER muessen mit, weil runuser sie nicht setzt und
+      # der Installer beides benutzt.
+      #
+      # BRAUNY_SKIP_CLOUDINIT_WAIT: wir laufen SELBST aus cloud-init heraus -
+      # auf dessen Ende zu warten waere ein Deadlock.
+      runuser -u brauny -- env \
+        HOME=/home/brauny \
+        USER=brauny \
+        BRAUNY_SKIP_CLOUDINIT_WAIT=1 \
+        BRAUNY_TOKEN="$BRAUNY_TOKEN" \
+        BRAUNY_MODEL="$BRAUNY_MODEL" \
+        BRAUNY_PORT="$BRAUNY_PORT" \
+        bash "$SRC/install.sh"
+
+      # HTTPS nur, wenn ein Name eingetragen wurde. Ein Fehlschlag hier darf
+      # die Einrichtung nicht kippen - der Dienst laeuft dann eben ueber HTTP
+      # weiter, statt dass gar nichts erreichbar ist.
+      if [ -n "${BRAUNY_DOMAIN:-}" ]; then
+        echo "--- HTTPS fuer $BRAUNY_DOMAIN einrichten ---"
+        bash "$SRC/deploy/enable-https.sh" "$BRAUNY_DOMAIN" \
+          || echo "HTTPS fehlgeschlagen - HTTP auf Port $BRAUNY_PORT bleibt erreichbar."
+      fi
+
+      echo "=== BraunyCode-Einrichtung fertig: $(date -Is) ==="
+      echo "Oberflaeche: http://$(curl -fsS --max-time 5 https://api.ipify.org || echo SERVER-IP):$BRAUNY_PORT"
+      # Als if-Block, nicht als '[ ... ] && echo': bei leerer Domain waere der
+      # Test der letzte Befehl und das Skript endete mit Status 1 - die
+      # Einrichtung wuerde faelschlich als fehlgeschlagen gemeldet.
+      if [ -n "${BRAUNY_DOMAIN:-}" ]; then
+        echo "Oder ueber HTTPS: https://$BRAUNY_DOMAIN"
+      fi
+      exit 0
+
+runcmd:
+  # Ohne '|| echo': scheitert die Einrichtung, soll cloud-init das auch
+  # melden. Vorher wurde jeder Fehlschlag in Erfolg umgewandelt - der Server
+  # haette "fertig" gemeldet, obwohl nichts lief. Die Einzelheiten stehen in
+  # /var/log/braunycode-setup.log, und der HTTPS-Schritt ist innerhalb des
+  # Skripts weiterhin nicht toedlich.
+  - [ bash, -lc, "/usr/local/bin/braunycode-setup.sh" ]
+
+final_message: "BraunyCode-Einrichtung beendet. Protokoll: /var/log/braunycode-setup.log"

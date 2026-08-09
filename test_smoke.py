@@ -3,6 +3,8 @@ import asyncio
 import json
 import os
 import struct
+import shutil
+import subprocess
 import sys
 
 os.environ["BRAUNY_TOKEN"] = "geheim-test-token"
@@ -246,7 +248,7 @@ def drive_agent(*, replies, runs, max_attempts=3):
     async def ask_fn(_prompt):
         return next(reply_iter)
 
-    async def run_sandbox(code):
+    async def run_sandbox(files, entry="main.py"):
         sandbox_calls["n"] += 1
         return next(run_iter)
 
@@ -607,7 +609,7 @@ def drive_mech(intent, files, replies=None, runs=None):
         calls["ask"] += 1
         return next(reply_iter)
 
-    async def run_sandbox(code):
+    async def run_sandbox(files, entry="main.py"):
         calls["sandbox"] += 1
         return next(run_iter)
 
@@ -756,7 +758,7 @@ print("\n[22] Werkzeugkasten")
 import tools  # noqa: E402
 
 sch = tools.schema()
-check("sieben Werkzeuge", len(sch) == 7, len(sch))
+check("vollständiger Werkzeugkasten", len(sch) == 16, len(sch))
 check("OpenAI-Format", all(t["type"] == "function" and "name" in t["function"]
                           and "parameters" in t["function"] for t in sch))
 check("Pflichtfelder deklariert",
@@ -768,15 +770,15 @@ tws.write("main.py", "def gruss():\n    return 'hallo'\n")
 tws.write("hilfe.py", "WERT = 42\n")
 
 sandbox_calls = []
-async def fake_sandbox(code):
-    sandbox_calls.append(code)
+async def fake_sandbox(files, entry="main.py"):
+    sandbox_calls.append((files, entry))
     return (0, "hallo")
 
 box = tools.Toolbox(tws, run_sandbox=fake_sandbox,
                     index_builder=codeindex.CodeIndex.build)
 
-def call(name, **args):
-    return asyncio.run(box.call(name, args))
+def call(_werkzeug, **args):
+    return asyncio.run(box.call(_werkzeug, args))
 
 check("list_files nennt beide Dateien",
       set(call("list_files").split()) == {"hilfe.py", "main.py"}, call("list_files"))
@@ -860,7 +862,7 @@ def drive_loop(script, files=None, sandbox_result=(0, "ok"), max_steps=12):
     async def send(t, text="", **extra):
         events.append({"type": t, "text": text, **extra})
 
-    async def run_sandbox(_code):
+    async def run_sandbox(_files, _entry="main.py"):
         return sandbox_result
 
     steps = iter(script)
@@ -1088,7 +1090,7 @@ def drive_dispatch(intent, script, mode, files=None):
         counts["chat"] += 1
         return next(steps, reply("nichts mehr"))
 
-    async def run_sandbox(_c):
+    async def run_sandbox(_files, _entry="main.py"):
         counts["sandbox"] += 1
         return (0, "ok")
 
@@ -1130,6 +1132,1004 @@ outcome, events, counts, w = drive_dispatch(
     "baue etwas Neues", [reply(calls=[("finish", {"summary": "x"})])], "oneshot")
 check("Modus 'oneshot' ruft die Werkzeugschleife nicht auf",
       outcome == "oneshot" and counts["chat"] == 0, (outcome, counts))
+
+print("\n[25] Skills")
+import skills as skills_mod  # noqa: E402
+
+SKILL_TEXT = """---
+name: beispiel
+beschreibung: Ein Beispiel
+ausloeser: alpha, beta gamma, delta
+werkzeuge: read_file, finish
+---
+Erst lesen, dann melden.
+"""
+
+s = skills_mod.parse(SKILL_TEXT, "beispiel.md")
+check("Kopf wird gelesen", s.name == "beispiel" and s.beschreibung == "Ein Beispiel", s)
+check("Auslöser als Liste", s.ausloeser == ["alpha", "beta gamma", "delta"], s.ausloeser)
+check("Werkzeuge als Liste", s.werkzeuge == ["read_file", "finish"], s.werkzeuge)
+check("Anleitung ist der Körper", s.anleitung == "Erst lesen, dann melden.")
+check("prompt enthält Anleitung und Name",
+      "Erst lesen" in s.prompt() and "beispiel" in s.prompt())
+check("Name fällt auf den Dateinamen zurück",
+      skills_mod.parse("---\nbeschreibung: x\n---\nText", "ersatz.md").name == "ersatz")
+check("ohne Kopf kein Skill", skills_mod.parse("Nur Text") is None)
+check("ohne Körper kein Skill", skills_mod.parse("---\nname: x\n---\n\n") is None)
+check("leerer Text kein Skill", skills_mod.parse("") is None)
+
+echte = skills_mod.load(main.BASE_DIR.parent / "skills")
+namen = {sk.name for sk in echte}
+check("mitgelieferte Skills geladen", len(echte) == 5, sorted(namen))
+check("Skills heißen wie erwartet",
+      namen == {"tests", "bugfix", "umbau", "review", "doku"}, sorted(namen))
+check("jeder Skill hat Auslöser", all(sk.ausloeser for sk in echte))
+check("jeder Skill hat eine Anleitung", all(len(sk.anleitung) > 100 for sk in echte))
+check("fehlendes Verzeichnis -> leere Liste",
+      skills_mod.load("/gibt/es/nicht") == [])
+
+sdir = tempfile.mkdtemp()
+def schreibe(ordner, name, inhalt):
+    """Mit Kontextmanager: sonst haengt der Puffer am Garbage Collector."""
+    with open(os.path.join(ordner, name), "w") as fh:
+        fh.write(inhalt)
+
+schreibe(sdir, "zu_gross.md",
+         "---\nname: gross\n---\n" + "x" * (skills_mod.MAX_SKILL_BYTES + 10))
+schreibe(sdir, "gut.md", "---\nname: gut\n---\nText hier.")
+schreibe(sdir, "keine.txt", "---\nname: nein\n---\nText.")
+geladen = skills_mod.load(sdir)
+check("zu große Datei wird übersprungen", [sk.name for sk in geladen] == ["gut"],
+      [sk.name for sk in geladen])
+
+check("Auslöser trifft wortweise", skills_mod.score("mach alpha fertig", s) == 1)
+check("Auslöser trifft NICHT als Teilstring",
+      skills_mod.score("alphabet lesen", s) == 0, skills_mod.score("alphabet lesen", s))
+check("Name zählt doppelt", skills_mod.score("beispiel bauen", s) == 2)
+check("leere Aufgabe ergibt 0", skills_mod.score("", s) == 0)
+
+check("match wählt den passenden Skill",
+      skills_mod.match("schreibe tests für die Funktion", echte).name == "tests")
+check("match erkennt Fehlersuche",
+      skills_mod.match("da ist ein bug im traceback", echte).name == "bugfix")
+check("match erkennt Durchsicht",
+      skills_mod.match("prüfe den code auf probleme", echte).name == "review")
+check("match ohne Treffer gibt None",
+      skills_mod.match("mach irgendwas völlig anderes", echte) is None,
+      skills_mod.match("mach irgendwas völlig anderes", echte))
+check("match ohne Skills gibt None", skills_mod.match("tests", []) is None)
+
+review = next(sk for sk in echte if sk.name == "review")
+check("review-Skill erlaubt kein Schreiben",
+      "write_file" not in review.werkzeuge, review.werkzeuge)
+check("review-Skill erlaubt Lesen und finish",
+      "read_file" in review.werkzeuge and "finish" in review.werkzeuge)
+check("overview nennt Name und Beschreibung",
+      any("tests:" in z for z in skills_mod.overview(echte)),
+      skills_mod.overview(echte))
+
+# Die Werkzeugliste eines Skills ist eine harte Sperre. Kommt ein neues
+# Werkzeug dazu und wird hier nicht nachgetragen, ist es unter jedem Skill
+# unbenutzbar - ohne dass irgendwo ein Fehler auftaucht.
+for sk in echte:
+    unbekannt = [w for w in sk.werkzeuge if w not in tools.NAMES]
+    check(f"Skill '{sk.name}' nennt nur existierende Werkzeuge",
+          not unbekannt, unbekannt)
+    check(f"Skill '{sk.name}' erlaubt finish",
+          "finish" in sk.werkzeuge, sk.werkzeuge)
+
+schreibende = {"edit_file", "write_file"}
+for sk in echte:
+    if sk.name == "review":
+        check("review darf nichts Schreibendes",
+              not (schreibende & set(sk.werkzeuge)), sk.werkzeuge)
+    else:
+        check(f"Skill '{sk.name}' kennt edit_file",
+              "edit_file" in sk.werkzeuge, sk.werkzeuge)
+
+print("\n[26] Konnektoren")
+import connectors  # noqa: E402
+
+def blocked(url, ips=None):
+    """True, wenn check_url die Adresse abweist."""
+    resolver = (lambda _h: set(ips)) if ips else connectors._resolve
+    try:
+        connectors.check_url(url, resolver)
+        return False
+    except connectors.ConnectorError:
+        return True
+
+# Der wichtigste Fall: der Metadaten-Dienst der Cloud. Wer den lesen kann,
+# bekommt die Zugangsdaten der Instanz.
+check("Cloud-Metadaten 169.254.169.254 blockiert",
+      blocked("http://169.254.169.254/opc/v2/instance/"))
+check("Loopback blockiert", blocked("http://127.0.0.1:80/"))
+check("localhost blockiert", blocked("http://localhost/", ["127.0.0.1"]))
+check("privates 10er-Netz blockiert", blocked("http://10.0.0.5/", ["10.0.0.5"]))
+check("privates 192.168er-Netz blockiert", blocked("http://192.168.1.1/"))
+check("privates 172.16er-Netz blockiert", blocked("http://172.16.0.1/"))
+check("IPv6-Loopback blockiert", blocked("http://[::1]/"))
+check("IPv6 unique-local blockiert", blocked("http://[fc00::1]/"))
+check("0.0.0.0 blockiert", blocked("http://0.0.0.0/"))
+check("file:// blockiert", blocked("file:///etc/passwd"))
+check("gopher:// blockiert", blocked("gopher://example.com/"))
+check("ohne Hostnamen blockiert", blocked("http:///pfad"))
+check("ungewöhnlicher Port blockiert",
+      blocked("http://93.184.216.34:22/", ["93.184.216.34"]))
+check("öffentliche Adresse erlaubt",
+      not blocked("https://93.184.216.34/", ["93.184.216.34"]))
+check("Port 443 erlaubt",
+      not blocked("https://93.184.216.34:443/", ["93.184.216.34"]))
+# Ein Name kann auf mehrere Adressen zeigen - eine private reicht zum Sperren.
+check("gemischte Auflösung wird gesperrt",
+      blocked("http://beispiel.test/", ["93.184.216.34", "169.254.169.254"]))
+# Klassischer Trick: alles vor dem @ ist Benutzerinfo, nicht der Host.
+check("Benutzerinfo-Trick greift nicht",
+      blocked("http://echte-seite.de@169.254.169.254/"))
+
+check("to_text entfernt Tags",
+      connectors.to_text("<p>Hallo <b>Welt</b></p>").replace("  ", " ").strip()
+      == "Hallo Welt")
+check("to_text wirft script-Blöcke weg",
+      "geheim" not in connectors.to_text("<script>var geheim=1</script><p>ok</p>"))
+check("to_text löst Entities auf", "&" in connectors.to_text("<p>a &amp; b</p>"))
+
+check("safe_branch säubert", connectors.safe_branch("Mein Fix / Bug #42!")
+      == "mein-fix-bug-42", connectors.safe_branch("Mein Fix / Bug #42!"))
+check("safe_branch nie leer", connectors.safe_branch("###") == "arbeit")
+check("safe_branch kürzt", len(connectors.safe_branch("x" * 200)) <= 60)
+check("safe_branch entfernt '..' (git lehnt das ab)",
+      ".." not in connectors.safe_branch("a..b"), connectors.safe_branch("a..b"))
+check("safe_branch entfernt '.lock' am Ende",
+      not connectors.safe_branch("fix.lock").endswith(".lock"),
+      connectors.safe_branch("fix.lock"))
+
+def with_token(fn):
+    orig = connectors.GIT_TOKEN
+    connectors.GIT_TOKEN = "ghp-streng-geheim-4711"
+    try:
+        return fn()
+    finally:
+        connectors.GIT_TOKEN = orig
+
+check("scrub entfernt den Token",
+      with_token(lambda: connectors.scrub("push nach https://ghp-streng-geheim-4711@x"))
+      == "push nach https://***@x")
+check("scrub verträgt leeren Text", connectors.scrub("") == "")
+
+def with_remote(fn):
+    orig_r, orig_t = connectors.GIT_REMOTE, connectors.GIT_TOKEN
+    connectors.GIT_REMOTE = "https://github.com/nutzer/repo.git"
+    connectors.GIT_TOKEN = "ghp-streng-geheim-4711"
+    try:
+        return fn()
+    finally:
+        connectors.GIT_REMOTE, connectors.GIT_TOKEN = orig_r, orig_t
+
+beschreibung = with_remote(lambda: str(connectors.describe()))
+check("describe nennt nur den Host",
+      "github.com" in beschreibung and "nutzer/repo" not in beschreibung, beschreibung)
+check("describe verrät den Token nicht",
+      "ghp-streng-geheim" not in beschreibung, beschreibung)
+
+check("ohne Konfiguration keine Konnektoren", connectors.available() == [],
+      connectors.available())
+
+# Echter Push gegen ein lokales bare-Repo. Kein Netz noetig, beweist aber,
+# dass der Weg wirklich funktioniert - inklusive zweitem Push auf denselben
+# Branch, wo --force-with-lease ohne Remote-Tracking-Ref haette scheitern
+# koennen.
+bare = os.path.join(tempfile.mkdtemp(), "remote.git")
+subprocess.run(["git", "init", "--bare", "-q", bare], check=True)
+
+def with_local_remote(fn):
+    orig_r, orig_t = connectors.GIT_REMOTE, connectors.GIT_TOKEN
+    connectors.GIT_REMOTE, connectors.GIT_TOKEN = bare, "dummy"
+    try:
+        return fn()
+    finally:
+        connectors.GIT_REMOTE, connectors.GIT_TOKEN = orig_r, orig_t
+
+pws = ws_mod.Workspace(tempfile.mkdtemp())
+pws.write("main.py", "print(1)\n")
+erste = with_local_remote(lambda: connectors.git_push(pws, "Mein Fix / Bug #42",
+                                                      "Erster Stand"))
+check("erster Push geht durch", "brauny/mein-fix-bug-42" in erste, erste)
+zweig = subprocess.run(["git", f"--git-dir={bare}", "branch", "--list"],
+                       capture_output=True, text=True).stdout
+check("Branch liegt wirklich im Remote", "brauny/mein-fix-bug-42" in zweig, zweig)
+
+pws.write("main.py", "print(2)\n")
+zweiter = with_local_remote(lambda: connectors.git_push(pws, "Mein Fix / Bug #42",
+                                                        "Zweiter Stand"))
+check("zweiter Push auf denselben Branch geht auch",
+      "brauny/mein-fix-bug-42" in zweiter, zweiter)
+
+leer_ws = ws_mod.Workspace(tempfile.mkdtemp())
+try:
+    with_local_remote(lambda: connectors.git_push(leer_ws, "x", ""))
+    check("Push ohne Commit wird abgelehnt", False, "kein Fehler")
+except connectors.ConnectorError as exc:
+    check("Push ohne Commit wird abgelehnt", "keinen Commit" in str(exc), str(exc))
+
+def ohne_remote(fn):
+    """Erzwingt den unkonfigurierten Zustand.
+
+    Ohne das wuerde dieser Test auf einer Maschine mit gesetztem
+    BRAUNY_GIT_REMOTE einen ECHTEN Push auf ein fremdes Repository ausloesen.
+    """
+    orig_r, orig_t = connectors.GIT_REMOTE, connectors.GIT_TOKEN
+    connectors.GIT_REMOTE, connectors.GIT_TOKEN = "", ""
+    try:
+        return fn()
+    finally:
+        connectors.GIT_REMOTE, connectors.GIT_TOKEN = orig_r, orig_t
+
+try:
+    ohne_remote(lambda: connectors.git_push(pws, "x", "y"))
+    check("Push ohne Konfiguration wirft", False, "kein Fehler")
+except connectors.ConnectorError as exc:
+    check("Push ohne Konfiguration wirft", "BRAUNY_GIT_REMOTE" in str(exc), str(exc))
+check("fetch abgeschaltet meldet das deutlich",
+      blocked("https://93.184.216.34/") is False and
+      not connectors.FETCH_ENABLED)
+try:
+    connectors.fetch("https://93.184.216.34/", lambda _h: {"93.184.216.34"})
+    check("fetch ohne Freischaltung wirft", False, "kein Fehler")
+except connectors.ConnectorError as exc:
+    check("fetch ohne Freischaltung wirft", "BRAUNY_FETCH" in str(exc), str(exc))
+
+print("\n[27] Werkzeugfreigabe und Skill-Beschränkung")
+
+fws = ws_mod.Workspace(tempfile.mkdtemp())
+fws.write("main.py", "print(1)\n")
+
+leer = tools.Toolbox(fws)
+check("ohne Konnektoren nur Basiswerkzeuge", len(leer.schema()) == 16, len(leer.schema()))
+check("schema() ohne Argument kennt keine Konnektoren",
+      {t["function"]["name"] for t in tools.schema()} == tools.BASE_NAMES)
+check("fetch_url nicht aufrufbar",
+      asyncio.run(leer.call("fetch_url", {"url": "https://x.de"}))
+      .startswith("FEHLER"))
+
+mit = tools.Toolbox(fws, enabled=["fetch_url"])
+check("freigeschalteter Konnektor erscheint", len(mit.schema()) == 17, len(mit.schema()))
+check("Konnektor steht im Schema",
+      "fetch_url" in {t["function"]["name"] for t in mit.schema()})
+check("nicht freigeschalteter Konnektor fehlt",
+      "git_push" not in {t["function"]["name"] for t in mit.schema()})
+check("unbekannter Name wird nicht freigeschaltet",
+      tools.Toolbox(fws, enabled=["rm_rf"]).enabled == [])
+
+eng = tools.Toolbox(fws)
+eng.restrict(["read_file", "list_files"])
+namen_eng = {t["function"]["name"] for t in eng.schema()}
+check("restrict schrumpft das Schema",
+      namen_eng == {"read_file", "list_files", "finish"}, namen_eng)
+check("finish bleibt trotz restrict erlaubt", "finish" in eng.allowed)
+check("restrict blockiert das Schreiben",
+      asyncio.run(eng.call("write_file", {"path": "a.py", "content": "x"}))
+      .startswith("FEHLER"))
+check("Fehlermeldung erklärt den Grund",
+      "nicht freigegeben" in
+      asyncio.run(eng.call("write_file", {"path": "a.py", "content": "x"})))
+check("erlaubtes Werkzeug geht weiter",
+      not asyncio.run(eng.call("list_files", {})).startswith("FEHLER"))
+
+weit = tools.Toolbox(fws)
+weit.restrict(["fetch_url", "git_push", "read_file"])
+check("restrict kann keinen Konnektor freischalten",
+      "fetch_url" not in weit.allowed and "git_push" not in weit.allowed,
+      sorted(weit.allowed))
+check("leeres restrict ändert nichts",
+      len(tools.Toolbox(fws).schema()) == 16)
+
+# Skill im Agentenlauf
+def drive_skill(script, skill, files=None):
+    w = ws_mod.Workspace(tempfile.mkdtemp())
+    for name, body in (files or {"main.py": "print('alt')\n"}).items():
+        w.write(name, body)
+    w.git_commit("Start")
+    events, gesehen = [], []
+
+    async def send(t, text="", **extra):
+        events.append({"type": t, "text": text, **extra})
+
+    async def run_sandbox(_files, _entry="main.py"):
+        return (0, "ok")
+
+    steps = iter(script)
+    async def chat_fn(messages, schema):
+        gesehen.append({"messages": list(messages), "schema": list(schema)})
+        return next(steps, reply("nichts mehr"))
+
+    box = tools.Toolbox(w, run_sandbox=run_sandbox,
+                        index_builder=codeindex.CodeIndex.build)
+    outcome = asyncio.run(agentloop.run_tool_agent(
+        send, "aufgabe", chat_fn=chat_fn, toolbox=box, skill=skill))
+    return outcome, events, w, gesehen
+
+outcome, events, w, gesehen = drive_skill(
+    [reply(calls=[("finish", {"summary": "fertig"})])], review)
+system = gesehen[0]["messages"][0]["content"]
+check("Skill-Anleitung steht im Systemprompt",
+      "Korrektheit" in system, system[-200:])
+check("Grundanweisung bleibt erhalten", "BraunyCode" in system)
+angeboten = {t["function"]["name"] for t in gesehen[0]["schema"]}
+check("Skill beschränkt das angebotene Schema",
+      "write_file" not in angeboten, sorted(angeboten))
+check("Skill lässt Lesen zu", "read_file" in angeboten)
+
+outcome, events, w, gesehen = drive_skill([
+    reply(calls=[("write_file", {"path": "main.py", "content": "print('neu')\n"})]),
+    reply(calls=[("finish", {"summary": "trotzdem"})]),
+], review)
+check("Schreibversuch unter review wird abgewiesen",
+      w.read("main.py") == "print('alt')\n", w.read("main.py"))
+check("Abweisung wird gemeldet",
+      any("nicht freigegeben" in e["text"] for e in events if e["type"] == "error"),
+      [e["text"] for e in events if e["type"] == "error"])
+check("Lauf geht danach normal weiter", outcome == "ok", outcome)
+
+outcome, events, counts, w = drive_dispatch("prüfe den code auf probleme", [
+    reply(calls=[("finish", {"summary": "geprüft"})]),
+], "auto")
+check("dispatch wählt und meldet den Skill",
+      any("Skill" in e["text"] and "review" in e["text"]
+          for e in events if e["type"] == "status"),
+      [e["text"] for e in events if e["type"] == "status"])
+
+print("\n[28] Unbeaufsichtigte Einrichtung (cloud-init)")
+
+CI_PATH = main.BASE_DIR.parent / "deploy" / "hetzner-cloud-init.yaml"
+check("cloud-init-Datei vorhanden", CI_PATH.exists(), CI_PATH)
+ci_text = CI_PATH.read_text() if CI_PATH.exists() else ""
+check("beginnt mit #cloud-config (sonst ignoriert cloud-init sie)",
+      ci_text.startswith("#cloud-config"), ci_text[:30])
+
+try:
+    import yaml  # noqa: E402
+except ImportError:
+    yaml = None
+    # Kein check(): eine fehlende optionale Abhaengigkeit ist kein Defekt im
+    # Code und darf die Fehlerzahl nicht erhoehen.
+    print("  ÜBERSPR.  PyYAML fehlt — cloud-init-YAML wird nicht geprüft.")
+
+if yaml and ci_text:
+    ci = yaml.safe_load(ci_text)
+    check("YAML ist gültig", isinstance(ci, dict), type(ci))
+    dateien = {f["path"]: f["content"] for f in ci.get("write_files", [])}
+    check("Konfigurationsdatei wird angelegt", "/etc/braunycode.setup" in dateien)
+    check("Einrichtungsskript wird angelegt",
+          "/usr/local/bin/braunycode-setup.sh" in dateien)
+
+    conf = dateien.get("/etc/braunycode.setup", "")
+    setup = dateien.get("/usr/local/bin/braunycode-setup.sh", "")
+
+    # Der Platzhalter muss in BEIDEN Dateien wortgleich stehen. Driften sie
+    # auseinander, liefe die Installation mit dem Standard-Passwort durch -
+    # ein oeffentlich erreichbarer Dienst mit bekanntem Token.
+    import re as _re
+    platzhalter = _re.search(r"BRAUNY_TOKEN=(\S+)", conf)
+    check("Platzhalter-Passwort steht in der Konfiguration", bool(platzhalter), conf[:200])
+    if platzhalter:
+        check("Abbruch prüft genau diesen Platzhalter",
+              platzhalter.group(1) in setup, platzhalter.group(1))
+    check("Abbruch prüft auch die Mindestlänge",
+          "-lt 12" in setup, setup[:400])
+
+    # Der Deadlock, der die Einrichtung sonst haengen laesst.
+    check("cloud-init-Warteschleife wird abgeschaltet",
+          "BRAUNY_SKIP_CLOUDINIT_WAIT=1" in setup, setup[:600])
+    check("Installer kennt den Schalter",
+          "BRAUNY_SKIP_CLOUDINIT_WAIT" in (main.BASE_DIR.parent / "install.sh").read_text())
+
+    # Werte duerfen nicht in eine Kommandozeile eingesetzt werden - ein
+    # Passwort mit Anfuehrungszeichen wuerde die Zeile zerlegen.
+    check("Werte werden über env übergeben, nicht interpoliert",
+          "runuser -u brauny -- env" in setup, setup[-500:])
+    check("HOME wird gesetzt (runuser tut das nicht)", "HOME=/home/brauny" in setup)
+
+    benutzer = ci.get("users", [])
+    gruppen = benutzer[0].get("groups", []) if benutzer else []
+    # docker existiert beim Anlegen des Benutzers noch nicht.
+    check("Benutzer wird NICHT in die docker-Gruppe gelegt",
+          "docker" not in gruppen, gruppen)
+    check("Benutzer bekommt sudo", "sudo" in gruppen, gruppen)
+
+print("\n[29] HTTPS-Einrichtung")
+
+HTTPS_PATH = main.BASE_DIR.parent / "deploy" / "enable-https.sh"
+check("enable-https.sh vorhanden", HTTPS_PATH.exists(), HTTPS_PATH)
+https_text = HTTPS_PATH.read_text() if HTTPS_PATH.exists() else ""
+
+check("enable-https.sh ist syntaktisch gültig",
+      subprocess.run(["bash", "-n", str(HTTPS_PATH)],
+                     capture_output=True).returncode == 0)
+
+# sslip.io/nip.io stehen NICHT auf der Public Suffix List. Let's Encrypt
+# zaehlt die ganze Domain als eine einzige mit 50 Zertifikaten pro Woche,
+# geteilt mit allen Nutzern weltweit - die Ausstellung wuerde fast immer
+# scheitern. Wer das hier spaeter "vereinfachen" will, faellt genau darauf
+# herein.
+check("baut NICHT auf sslip.io/nip.io",
+      "sslip.io" not in https_text.split("# WARUM")[-1].split("set -euo")[0]
+      or "NICHT auf der Public Suffix List" in https_text, "Begründung fehlt")
+check("Begründung gegen sslip.io steht im Skript",
+      "Public Suffix List" in https_text)
+check("reverse_proxy im Caddyfile (WebSocket läuft darüber)",
+      "reverse_proxy" in https_text)
+check("Caddyfile wird vor dem Neustart geprüft",
+      "caddy validate" in https_text)
+check("Domain wird gegen die Server-IP geprüft",
+      "api.ipify.org" in https_text and "getent hosts" in https_text)
+check("Aufruf ohne Domain wird abgelehnt",
+      "Aufruf: sudo bash enable-https.sh" in https_text)
+check("http:// im Argument wird abgefangen", "http://*|https://*)" in https_text)
+
+if yaml and ci_text:
+    check("cloud-init kennt BRAUNY_DOMAIN", "BRAUNY_DOMAIN=" in conf, conf[-300:])
+    check("BRAUNY_DOMAIN ist standardmäßig leer (nur HTTP)",
+          _re.search(r"^BRAUNY_DOMAIN=\s*$", conf, _re.M) is not None, conf[-200:])
+    check("cloud-init ruft enable-https.sh auf", "enable-https.sh" in setup)
+    # Ein Fehlschlag beim Zertifikat darf die ganze Einrichtung nicht kippen.
+    check("HTTPS-Fehlschlag ist nicht tödlich",
+          "|| echo \"HTTPS fehlgeschlagen" in setup, setup[-800:])
+    # Bei leerer Domain waere ein '[ -n ... ] && echo' der letzte Befehl und
+    # das Skript endete mit Status 1 - ein Fehlalarm.
+    check("Einrichtungsskript endet ausdrücklich mit exit 0",
+          setup.rstrip().endswith("exit 0"), setup[-120:])
+
+installer = (main.BASE_DIR.parent / "install.sh").read_text()
+check("Installer übernimmt ein vorgegebenes Token",
+      'if [ -n "${BRAUNY_TOKEN:-}" ]' in installer)
+check("Installer lehnt zu kurze Token ab",
+      '"${#TOKEN}" -ge 12' in installer, )
+check("Installer läuft weiterhin nicht als root",
+      '[ "$(id -u)" -ne 0 ]' in installer)
+
+print("\n[30] Mehrdateiige Projekte in der Sandbox")
+
+# Der Kern: frueher ging nur EINE Datei in den Container und es lief immer
+# fest /app/main.py. Ein Projekt aus mehreren Modulen war damit nicht
+# ausfuehrbar - obwohl genau das das Versprechen der Werkzeugschleife ist.
+
+check("safe_relpath behält Unterverzeichnisse",
+      sandbox.safe_relpath("pkg/mod.py") == os.path.join("pkg", "mod.py"),
+      sandbox.safe_relpath("pkg/mod.py"))
+check("safe_relpath wirft '..' weg",
+      sandbox.safe_relpath("../../evil.py") == "evil.py")
+# Ein absoluter Pfad faellt bewusst auf den blossen Dateinamen zurueck,
+# statt eine etc/-Struktur im Projekt nachzubauen.
+check("absoluter Pfad wird auf den Dateinamen reduziert",
+      sandbox.safe_relpath("/etc/passwd") == "passwd",
+      sandbox.safe_relpath("/etc/passwd"))
+check("safe_relpath verträgt Backslashes",
+      sandbox.safe_relpath("pkg\\mod.py") == os.path.join("pkg", "mod.py"))
+check("safe_relpath nie leer", sandbox.safe_relpath("") == "datei.py")
+
+md = sandbox.make_project_dir({
+    "main.py": "from pkg.helfer import wert\nprint(wert)\n",
+    "pkg/helfer.py": "wert = 7\n",
+    "pkg/__init__.py": "",
+})
+check("Unterverzeichnis wird angelegt",
+      os.path.isfile(os.path.join(md, "pkg", "helfer.py")))
+check("Hauptdatei liegt richtig", os.path.isfile(os.path.join(md, "main.py")))
+check("Unterverzeichnis ist für den Sandbox-User betretbar",
+      os.stat(os.path.join(md, "pkg")).st_mode & 0o001 != 0,
+      oct(os.stat(os.path.join(md, "pkg")).st_mode))
+shutil.rmtree(md, ignore_errors=True)
+
+check("entry_command startet die gewünschte Datei",
+      sandbox.entry_command("pkg/start.py")[-1] == "/app/pkg/start.py",
+      sandbox.entry_command("pkg/start.py"))
+check("entry_command ohne Angabe nimmt main.py",
+      sandbox.entry_command()[-1] == "/app/main.py")
+check("entry_command lässt sich nicht aus /app herauslocken",
+      sandbox.entry_command("../../etc/passwd")[-1] == "/app/passwd",
+      sandbox.entry_command("../../etc/passwd"))
+
+# Und jetzt der eigentliche Regressionstest: ein Projekt, dessen Hauptdatei
+# ein zweites Modul importiert.
+mws = ws_mod.Workspace(tempfile.mkdtemp())
+mws.write("main.py", "from helfer import wert\nprint(wert)\n")
+mws.write("helfer.py", "wert = 7\n")
+mws.write("notizen.txt", "kein Code\n")
+
+uebergeben = {}
+async def merk_sandbox(files, entry="main.py", *, command=None):
+    uebergeben["files"] = files
+    uebergeben["entry"] = entry
+    uebergeben["command"] = command
+    return (0, "7")
+
+mbox = tools.Toolbox(mws, run_sandbox=merk_sandbox)
+ergebnis = asyncio.run(mbox.call("run_python", {"path": "main.py"}))
+check("run_python meldet Erfolg", ergebnis.startswith("Lauf erfolgreich"), ergebnis)
+check("importiertes Modul geht mit in den Container",
+      "helfer.py" in uebergeben["files"], sorted(uebergeben.get("files", {})))
+check("Hauptdatei geht mit", "main.py" in uebergeben["files"])
+check("Einstiegspunkt ist die angeforderte Datei",
+      uebergeben["entry"] == "main.py", uebergeben.get("entry"))
+check("Ergebnis nennt die Dateianzahl",
+      "Datei(en) im Container" in ergebnis, ergebnis)
+
+# Eine andere Datei starten als main.py - frueher unmoeglich.
+asyncio.run(mbox.call("run_python", {"path": "helfer.py"}))
+check("beliebige Datei als Einstiegspunkt",
+      uebergeben["entry"] == "helfer.py", uebergeben.get("entry"))
+
+check("fehlende Datei meldet Fehler statt zu laufen",
+      asyncio.run(mbox.call("run_python", {"path": "gibtsnicht.py"}))
+      .startswith("FEHLER"))
+
+# Deckel: ein riesiges Projekt darf den Container-Start nicht sprengen.
+gws = ws_mod.Workspace(tempfile.mkdtemp())
+for i in range(tools.MAX_SANDBOX_FILES + 20):
+    gws.write(f"m{i}.py", f"x = {i}\n")
+gbox = tools.Toolbox(gws, run_sandbox=merk_sandbox)
+asyncio.run(gbox.call("run_python", {"path": "m0.py"}))
+check("Dateizahl ist gedeckelt",
+      len(uebergeben["files"]) <= tools.MAX_SANDBOX_FILES + 1,
+      len(uebergeben["files"]))
+check("Einstiegsdatei ist trotz Deckel dabei",
+      "m0.py" in uebergeben["files"])
+
+# Der Einmalwurf schickt weiterhin genau eine Datei.
+einzel = {}
+async def einzel_sandbox(files, entry="main.py"):
+    einzel.update({"files": files, "entry": entry})
+    return (0, "ok")
+
+async def einzel_ask(_p):
+    return "```python\nprint('x')\n```"
+
+async def stumm(_t, _text="", **_kw):
+    return None
+
+asyncio.run(main.run_agent(stumm, "aufgabe", ask_fn=einzel_ask,
+                           run_sandbox=einzel_sandbox, max_attempts=1))
+check("Einmalwurf schickt genau eine Datei",
+      list(einzel["files"]) == ["main.py"], einzel.get("files"))
+check("Einmalwurf startet main.py", einzel["entry"] == "main.py")
+
+print("\n[31] Bearbeitungswerkzeuge")
+
+ews = ws_mod.Workspace(tempfile.mkdtemp())
+ews.write("main.py", "def gruss(name):\n    return f'hallo {name}'\n\n"
+                     "print(gruss('welt'))\n")
+ews.write("hilfe.py", "from main import gruss\n\ndef zweimal(n):\n"
+                      "    return gruss(n) + gruss(n)\n")
+ews.write("notiz.md", "# Notizen\nnichts\n")
+ews.git_commit("Start")
+
+ebox = tools.Toolbox(ews, run_sandbox=merk_sandbox,
+                     index_builder=codeindex.CodeIndex.build)
+
+def ecall(_werkzeug, **args):
+    """Erster Parameter unterstrichen: sonst kollidiert er mit dem
+    Argument 'name' von symbol_info."""
+    return asyncio.run(ebox.call(_werkzeug, args))
+
+# ---- edit_file: der wichtigste Neuzugang
+r = ecall("edit_file", path="main.py", old_text="hallo", new_text="moin")
+check("edit_file ersetzt", "1 Stelle ersetzt" in r, r)
+check("Datei wirklich geändert", "moin" in ews.read("main.py"))
+check("Rest der Datei bleibt", "def gruss(name)" in ews.read("main.py"))
+
+r = ecall("edit_file", path="main.py", old_text="gibtsnichtimtext", new_text="x")
+check("fehlender Text meldet Fehler", r.startswith("FEHLER"), r)
+check("Fehler erklärt, was zu tun ist", "read_file" in r, r)
+
+r = ecall("edit_file", path="hilfe.py", old_text="gruss(n)", new_text="gruesse(n)")
+check("mehrdeutige Stelle wird abgelehnt", r.startswith("FEHLER") and "2-mal" in r, r)
+check("Datei bei Mehrdeutigkeit unverändert", "gruesse" not in ews.read("hilfe.py"))
+
+r = ecall("edit_file", path="hilfe.py", old_text="gruss(n)",
+          new_text="gruesse(n)", replace_all=True)
+check("replace_all ersetzt alle", "2 Stellen ersetzt" in r, r)
+check("beide Vorkommen ersetzt", ews.read("hilfe.py").count("gruesse(n)") == 2)
+
+check("identischer Text wird abgelehnt",
+      ecall("edit_file", path="main.py", old_text="a", new_text="a")
+      .startswith("FEHLER"))
+check("leeres old_text wird abgelehnt",
+      ecall("edit_file", path="main.py", old_text="", new_text="x")
+      .startswith("FEHLER"))
+check("edit_file kommt nicht aus dem Projekt heraus",
+      ecall("edit_file", path="../fremd.py", old_text="a", new_text="b")
+      .startswith("FEHLER"))
+
+# ---- read_file abschnittsweise
+ews.write("lang.py", "\n".join(f"zeile{i}" for i in range(1, 101)) + "\n")
+r = ecall("read_file", path="lang.py", offset=10, limit=5)
+check("read_file liest Ausschnitt", "zeile10" in r and "zeile14" in r, r[:80])
+check("Ausschnitt endet wo er soll", "zeile15" not in r)
+check("Ausschnitt nennt den Gesamtumfang", "von 100" in r, r[-60:])
+check("read_file ohne Angaben liest alles",
+      "zeile100" in ecall("read_file", path="lang.py"))
+
+# ---- glob
+check("glob findet nach Endung",
+      set(ecall("glob", pattern="*.py").split()) ==
+      {"hilfe.py", "lang.py", "main.py"}, ecall("glob", pattern="*.py"))
+check("glob ohne Treffer meldet das",
+      "Keine Datei" in ecall("glob", pattern="*.rs"))
+check("glob ohne Muster meldet Fehler", ecall("glob").startswith("FEHLER"))
+
+# ---- search: regex, glob-Filter, Kontext
+check("search mit regulärem Ausdruck",
+      "main.py" in ecall("search", query=r"def \w+\(", regex=True),
+      ecall("search", query=r"def \w+\(", regex=True))
+check("kaputter Ausdruck meldet Fehler",
+      ecall("search", query="[unklosed", regex=True).startswith("FEHLER"))
+check("search filtert über glob",
+      "notiz.md" not in ecall("search", query="Notizen", glob="*.py"))
+check("search findet ohne Filter",
+      "notiz.md" in ecall("search", query="Notizen"))
+check("search mit Kontext liefert Nachbarzeilen",
+      ecall("search", query="return f", context=1).count("main.py:") >= 2,
+      ecall("search", query="return f", context=1))
+
+# ---- symbol_info
+r = ecall("symbol_info", name="gruss")
+check("symbol_info nennt die Signatur", "gruss(name)" in r, r)
+check("symbol_info nennt die Fundstelle", "main.py:1" in r, r)
+check("symbol_info nennt Aufrufer", "Aufrufer:" in r, r)
+check("unbekanntes Symbol meldet das",
+      "Kein Symbol" in ecall("symbol_info", name="gibtsnicht"))
+check("symbol_info ohne Namen meldet Fehler",
+      ecall("symbol_info").startswith("FEHLER"))
+
+# ---- check_syntax
+check("check_syntax bestätigt gültigen Code",
+      "in Ordnung" in ecall("check_syntax", path="main.py"),
+      ecall("check_syntax", path="main.py"))
+ews.write("kaputt.py", "def f(:\n    pass\n")
+r = ecall("check_syntax", path="kaputt.py")
+check("check_syntax findet den Fehler", "SyntaxError" in r, r)
+check("check_syntax nennt die Zeile", "Zeile 1" in r, r)
+
+# ---- delete_file / move_file
+check("move_file benennt um",
+      "notiz.md → doku/notiz.md" in ecall("move_file", source="notiz.md",
+                                          destination="doku/notiz.md"))
+check("Datei liegt am neuen Ort", ews.exists("doku/notiz.md"))
+check("alter Ort ist leer", not ews.exists("notiz.md"))
+check("move auf bestehendes Ziel wird abgelehnt",
+      ecall("move_file", source="doku/notiz.md", destination="main.py")
+      .startswith("FEHLER"))
+check("move einer fehlenden Datei meldet Fehler",
+      ecall("move_file", source="weg.md", destination="x.md").startswith("FEHLER"))
+
+check("delete_file löscht", "Gelöscht" in ecall("delete_file", path="doku/notiz.md"))
+check("Datei ist weg", not ews.exists("doku/notiz.md"))
+check("leer gewordenes Verzeichnis wird aufgeräumt",
+      not (ews.root / "doku").exists())
+check("delete einer fehlenden Datei meldet Fehler",
+      ecall("delete_file", path="weg.md").startswith("FEHLER"))
+
+# ---- rename_symbol: über den Syntaxbaum, nicht per Textersetzung
+rws = ws_mod.Workspace(tempfile.mkdtemp())
+rws.write("main.py", 'def berechne(x):\n    """Doku."""\n    return x\n\n'
+                     'wert = berechne(1)\n'
+                     'text = "berechne"\n'
+                     'obj.berechne()\n')
+rws.write("andere.py", "from main import berechne\n\ndef nutzer():\n"
+                       "    return berechne(2)\n")
+rws.git_commit("Start")
+rbox = tools.Toolbox(rws, index_builder=codeindex.CodeIndex.build)
+r = asyncio.run(rbox.call("rename_symbol",
+                          {"path": "main.py", "old_name": "berechne",
+                           "new_name": "rechne"}))
+neu = rws.read("main.py")
+check("rename_symbol benennt Definition um", "def rechne(x)" in neu, neu)
+check("rename_symbol benennt Aufruf um", "rechne(1)" in neu)
+check("Zeichenkette bleibt unangetastet", '"berechne"' in neu, neu)
+check("fremdes Attribut bleibt unangetastet", "obj.berechne()" in neu, neu)
+check("Kommentar/Docstring unversehrt", '"""Doku."""' in neu)
+check("warnt vor Aufrufern in anderen Dateien",
+      "ACHTUNG" in r and "andere.py" in r, r)
+check("ungültiger Bezeichner wird abgelehnt",
+      asyncio.run(rbox.call("rename_symbol",
+                            {"path": "main.py", "old_name": "rechne",
+                             "new_name": "2ungueltig"})).startswith("FEHLER"))
+
+# ---- undo: der Rückwärtsgang
+uws = ws_mod.Workspace(tempfile.mkdtemp())
+uws.write("main.py", "print('original')\n")
+uws.git_commit("Start")
+ubox = tools.Toolbox(uws)
+asyncio.run(ubox.call("write_file", {"path": "main.py", "content": "kaputt(\n"}))
+asyncio.run(ubox.call("write_file", {"path": "neu.py", "content": "x=1\n"}))
+check("Änderung ist erst mal da", "kaputt" in uws.read("main.py"))
+r = asyncio.run(ubox.call("undo", {}))
+check("undo meldet den Commit", "zurückgesetzt" in r, r)
+check("geänderte Datei ist wiederhergestellt",
+      uws.read("main.py") == "print('original')\n", uws.read("main.py"))
+check("neu angelegte Datei ist weg", not uws.exists("neu.py"))
+check("undo leert die Liste der Änderungen", ubox.written == [], ubox.written)
+
+leerws = ws_mod.Workspace(tempfile.mkdtemp())
+check("undo ohne Historie meldet Fehler",
+      asyncio.run(tools.Toolbox(leerws).call("undo", {})).startswith("FEHLER"))
+
+# ---- run_command
+cbox = tools.Toolbox(ews, run_sandbox=merk_sandbox)
+r = asyncio.run(cbox.call("run_command", {"command": "python -m unittest -v"}))
+check("run_command läuft über die Sandbox",
+      r.startswith("Befehl erfolgreich"), r)
+check("run_command ohne Befehl meldet Fehler",
+      asyncio.run(cbox.call("run_command", {"command": ""})).startswith("FEHLER"))
+check("run_command ohne Sandbox meldet Fehler",
+      asyncio.run(tools.Toolbox(ews).call("run_command", {"command": "ls"}))
+      .startswith("FEHLER"))
+check("unlesbarer Befehl meldet Fehler",
+      asyncio.run(cbox.call("run_command", {"command": 'python -c "unbalanced'}))
+      .startswith("FEHLER"))
+
+# Kein Shell-Aufruf: '&&' ist ein gewoehnliches Argument, keine Verkettung.
+befehle = {}
+async def merk_command(files, entry=None, *, command=None):
+    befehle["command"] = command
+    return (0, "ok")
+sbox = tools.Toolbox(ews, run_sandbox=merk_command)
+asyncio.run(sbox.call("run_command", {"command": "ls && rm -rf /"}))
+check("Befehl wird in Argumente zerlegt, nicht an eine Shell gegeben",
+      befehle["command"] == ["ls", "&&", "rm", "-rf", "/"], befehle["command"])
+
+# ---- Hilfsfunktionen
+check("_passt vergleicht ohne '/' den Dateinamen", tools._passt("a/b/c.py", "*.py"))
+check("_passt vergleicht mit '/' den ganzen Pfad",
+      tools._passt("src/x.py", "src/*.py") and not tools._passt("a/x.py", "src/*.py"))
+check("_als_zahl verträgt Text von Modellen", tools._als_zahl("12", 0) == 12)
+check("_als_zahl fällt bei Unsinn zurück", tools._als_zahl("viele", 7) == 7)
+
+print("\n[32] Befunde aus der Durchsicht")
+
+# 1. sys.path in der Sandbox. 'python /app/pkg/start.py' setzt sys.path[0] auf
+#    /app/pkg, nicht auf /app - ein Import aus dem Projektstamm scheitert dann.
+#    Der Mehrdatei-Lauf ging nur zufaellig, solange die Startdatei oben lag.
+import inspect  # noqa: E402
+quelle_start = inspect.getsource(sandbox.start)
+check("Sandbox setzt PYTHONPATH=/app",
+      '"PYTHONPATH": "/app"' in quelle_start, quelle_start[-300:])
+
+# Und der Nachweis, dass es ohne PYTHONPATH wirklich bricht:
+tiefes = tempfile.mkdtemp()
+os.makedirs(os.path.join(tiefes, "pkg"))
+schreibe(tiefes, "helfer.py", "wert = 7\n")
+schreibe(os.path.join(tiefes, "pkg"), "start.py",
+         "import helfer\nprint(helfer.wert)\n")
+ohne = subprocess.run([sys.executable, os.path.join(tiefes, "pkg", "start.py")],
+                      capture_output=True, text=True)
+mit = subprocess.run([sys.executable, os.path.join(tiefes, "pkg", "start.py")],
+                     capture_output=True, text=True,
+                     env={**os.environ, "PYTHONPATH": tiefes})
+check("ohne PYTHONPATH scheitert der Import wirklich",
+      "ModuleNotFoundError" in ohne.stderr, ohne.stderr[-120:])
+check("mit PYTHONPATH klappt er", mit.stdout.strip() == "7", mit.stdout)
+
+# 2. Ein Skill in Latin-1 darf den Dienst nicht am Start hindern.
+kaputt_dir = tempfile.mkdtemp()
+with open(os.path.join(kaputt_dir, "latin.md"), "wb") as fh:
+    fh.write("---\nname: latin\nbeschreibung: gr\xfc\xdfe\n---\nText.\n"
+             .encode("latin-1"))
+schreibe(kaputt_dir, "gut.md", "---\nname: gut\nausloeser: x\n---\nText hier.\n")
+try:
+    geladen = skills_mod.load(kaputt_dir)
+    check("Latin-1-Skill legt den Start nicht lahm", True)
+    check("die anderen Skills werden trotzdem geladen",
+          any(s.name == "gut" for s in geladen), [s.name for s in geladen])
+except Exception as exc:
+    check("Latin-1-Skill legt den Start nicht lahm", False, f"{type(exc).__name__}: {exc}")
+
+# 3. restrict darf konfigurierte Konnektoren nicht wegnehmen.
+kbox = tools.Toolbox(fws, enabled=["git_push", "fetch_url"])
+kbox.restrict(["read_file", "write_file", "finish"])   # nennt keinen Konnektor
+check("Skill ohne Konnektor-Angabe behält die konfigurierten",
+      {"git_push", "fetch_url"} <= kbox.allowed, sorted(kbox.allowed))
+check("Skill schränkt die Basiswerkzeuge trotzdem ein",
+      "delete_file" not in kbox.allowed, sorted(kbox.allowed))
+
+kbox2 = tools.Toolbox(fws, enabled=["git_push", "fetch_url"])
+kbox2.restrict(["read_file", "git_push", "finish"])    # nennt einen Konnektor
+check("nennt der Skill einen Konnektor, gilt genau seine Liste",
+      "git_push" in kbox2.allowed and "fetch_url" not in kbox2.allowed,
+      sorted(kbox2.allowed))
+
+# 4. Ein Tippfehler im Skill darf den Agenten nicht handlungsunfähig machen.
+tbox = tools.Toolbox(fws)
+verworfen = tbox.restrict(["raed_file", "wrtie_file"])   # beides Tippfehler
+check("unbekannte Werkzeuge werden gemeldet",
+      verworfen == ["raed_file", "wrtie_file"], verworfen)
+check("bei nur Tippfehlern wird gar nicht eingeschränkt",
+      len(tbox.schema()) == 16, len(tbox.schema()))
+check("der Agent bleibt handlungsfähig", "read_file" in tbox.allowed)
+
+tbox2 = tools.Toolbox(fws)
+uebrig = tbox2.restrict(["read_file", "gibtsnicht"])
+check("gültige Namen greifen trotz Tippfehler daneben",
+      tbox2.allowed == {"read_file", "finish"}, sorted(tbox2.allowed))
+check("der Tippfehler wird dabei gemeldet", uebrig == ["gibtsnicht"], uebrig)
+
+# 6. edit_file darf eine Nicht-UTF-8-Datei nicht stillschweigend zerstören.
+bws = ws_mod.Workspace(tempfile.mkdtemp())
+with open(bws.root / "latin.txt", "wb") as fh:
+    fh.write("caf\xe9 und stra\xdfe\n".encode("latin-1"))
+vorher = (bws.root / "latin.txt").read_bytes()
+bbox = tools.Toolbox(bws)
+r = asyncio.run(bbox.call("edit_file", {"path": "latin.txt",
+                                        "old_text": "und", "new_text": "oder"}))
+check("edit_file lehnt Nicht-UTF-8 ab", r.startswith("FEHLER") and "UTF-8" in r, r)
+check("die Datei bleibt dabei unangetastet",
+      (bws.root / "latin.txt").read_bytes() == vorher)
+
+# 7. read_file hinter dem Dateiende.
+bws.write("kurz.py", "eins\nzwei\n")
+r = asyncio.run(bbox.call("read_file", {"path": "kurz.py", "offset": 20}))
+check("Offset hinter Dateiende wird verständlich gemeldet",
+      "nur 2 Zeile" in r, r)
+check("kein umgedrehter Bereich mehr", "20–19" not in r, r)
+
+# 5. DNS-Rebinding: die Vorabprüfung allein reicht nicht, weil httpx danach
+#    selbst noch einmal auflöst. Die Antwort wird deshalb erst freigegeben,
+#    wenn auch die tatsächliche Gegenstelle öffentlich ist.
+class FakeStream:
+    def __init__(self, adresse): self._a = adresse
+    def get_extra_info(self, name):
+        return (self._a, 443) if name == "server_addr" else None
+
+class FakeAntwort:
+    def __init__(self, adresse):
+        self.extensions = {"network_stream": FakeStream(adresse)}
+
+def ohne_proxy(fn):
+    """Die Peer-Pruefung entfaellt hinter einem Proxy - fuer den Test weg."""
+    gesichert = {n: os.environ.pop(n, None) for n in connectors.PROXY_VARS}
+    try:
+        return fn()
+    finally:
+        for n, v in gesichert.items():
+            if v is not None:
+                os.environ[n] = v
+
+check("öffentliche Gegenstelle wird durchgelassen",
+      ohne_proxy(lambda: connectors.peer_pruefen(FakeAntwort("93.184.216.34")))
+      is None)
+for boese in ("169.254.169.254", "127.0.0.1", "10.1.2.3", "::1"):
+    try:
+        ohne_proxy(lambda: connectors.peer_pruefen(FakeAntwort(boese)))
+        check(f"Gegenstelle {boese} wird verworfen", False, "durchgelassen")
+    except connectors.ConnectorError as exc:
+        check(f"Gegenstelle {boese} wird verworfen", "verworfen" in str(exc))
+
+# Proxy-Variablen werden standardmäßig ignoriert (trust_env=0). Erst wer sie
+# ausdrücklich einschaltet, bekommt den Proxy-Weg — und damit die schwächere
+# Zusicherung, weil dann die Gegenstelle der Proxy ist.
+check("Proxy-Variablen werden standardmäßig ignoriert",
+      connectors.FETCH_TRUST_ENV is False)
+os.environ["HTTPS_PROXY"] = "http://127.0.0.1:8080"
+try:
+    check("Proxy-Variable allein reicht nicht", not connectors.proxy_aktiv())
+    connectors.FETCH_TRUST_ENV = True
+    check("erst mit trust_env gilt der Proxy", connectors.proxy_aktiv())
+    check("dann wird die Gegenstelle nicht geprüft",
+          connectors.peer_pruefen(FakeAntwort("127.0.0.1")) is None)
+finally:
+    connectors.FETCH_TRUST_ENV = False
+    del os.environ["HTTPS_PROXY"]
+check("ohne Proxy-Variable meldet proxy_aktiv False",
+      ohne_proxy(connectors.proxy_aktiv) is False)
+
+check("ohne ermittelbare Gegenstelle wird nicht blockiert",
+      connectors.peer_pruefen(FakeAntwort(None)) is None)
+class OhneStream:
+    extensions: dict = {}
+check("fehlender Stream blockiert nicht",
+      connectors.peer_pruefen(OhneStream()) is None)
+
+# 8. HTTPS braucht offene Ports 80/443.
+# https_text stammt von weiter oben und ist "" wenn die Datei fehlt - dann
+# meldet der Check einen Fehlschlag, statt die ganze Suite abzubrechen.
+check("enable-https.sh öffnet Port 80 und 443",
+      "for port in 80 443" in https_text, "fehlt")
+check("Begründung steht dabei", "HTTP-01" in https_text)
+
+print("\n[33] Befunde aus der externen Durchsicht")
+
+# Ungueltige Portangabe: parsed.port wirft ValueError, der frueher roh aus dem
+# Konnektor herausfiel statt als verstaendliche Meldung anzukommen.
+for kaputt in ("https://beispiel.de:abc", "http://beispiel.de:abc/pfad"):
+    try:
+        connectors.check_url(kaputt, lambda _h: {"93.184.216.34"})
+        check(f"ungültiger Port in {kaputt} wird abgewiesen", False, "durchgelassen")
+    except connectors.ConnectorError as exc:
+        check(f"ungültiger Port in {kaputt} wird abgewiesen", "Port" in str(exc), str(exc))
+    except ValueError as exc:
+        check(f"ungültiger Port in {kaputt} wird abgewiesen", False,
+              f"roher ValueError: {exc}")
+
+# Zugangsdaten im Remote landen woertlich in .git/config - scrub() kennt sie
+# nicht, weil sie nicht BRAUNY_GIT_TOKEN sind.
+def mit_remote(url, fn):
+    orig_r, orig_t = connectors.GIT_REMOTE, connectors.GIT_TOKEN
+    connectors.GIT_REMOTE, connectors.GIT_TOKEN = url, "dummy"
+    try:
+        return fn()
+    finally:
+        connectors.GIT_REMOTE, connectors.GIT_TOKEN = orig_r, orig_t
+
+try:
+    mit_remote("https://ghp_fremdes_token@github.com/n/r.git",
+               lambda: connectors.git_push(pws, "x", "y"))
+    check("Remote mit eingebettetem Token wird abgelehnt", False, "durchgelassen")
+except connectors.ConnectorError as exc:
+    check("Remote mit eingebettetem Token wird abgelehnt",
+          "Zugangsdaten" in str(exc), str(exc))
+check("Remote ohne Zugangsdaten bleibt erlaubt",
+      "brauny/" in mit_remote(bare, lambda: connectors.git_push(pws, "sauber", "Test")))
+
+# Sandbox-Rechte: nicht mehr world-writable.
+rechte_dir = sandbox.make_project_dir({"main.py": "x=1\n", "pkg/m.py": "y=2\n"})
+for pfad, art in [(rechte_dir, "Projektverzeichnis"),
+                  (os.path.join(rechte_dir, "pkg"), "Unterverzeichnis")]:
+    modus = os.stat(pfad).st_mode & 0o777
+    check(f"{art} ist nicht world-writable", not modus & 0o002, oct(modus))
+    check(f"{art} ist für den Sandbox-User betretbar", modus & 0o001, oct(modus))
+for datei in ["main.py", os.path.join("pkg", "m.py")]:
+    modus = os.stat(os.path.join(rechte_dir, datei)).st_mode & 0o777
+    check(f"{datei} ist nicht world-writable", not modus & 0o002, oct(modus))
+    check(f"{datei} ist für den Sandbox-User lesbar", modus & 0o004, oct(modus))
+shutil.rmtree(rechte_dir, ignore_errors=True)
+check("Projekt wird nur-lesend eingehängt",
+      '"mode": "ro"' in inspect.getsource(sandbox.start))
+
+# Mehrwortige Ausloeser haetten nie gezuendet.
+mehrwort = skills_mod.parse(
+    "---\nname: mw\nausloeser: leerer test, alpha\n---\nAnleitung hier.\n", "mw.md")
+check("mehrwortiger Auslöser zündet",
+      skills_mod.score("mach einen leerer test daraus", mehrwort) >= 1,
+      skills_mod.score("mach einen leerer test daraus", mehrwort))
+check("einzelnes Wort daraus zündet NICHT allein",
+      skills_mod.score("nur leerer text", mehrwort) == 0,
+      skills_mod.score("nur leerer text", mehrwort))
+check("einwortiger Auslöser bleibt wortweise",
+      skills_mod.score("alphabet lesen", mehrwort) == 0)
+
+# read_file auf einer leeren Datei.
+bws.write("leer.py", "")
+r = asyncio.run(bbox.call("read_file", {"path": "leer.py"}))
+check("leere Datei wird als leer gemeldet", "ist leer" in r, r)
+check("keine irreführende Zeilenmeldung", "gibt es nicht" not in r, r)
+
+# cloud-init: Passwort darf nicht als Bash ausgewertet werden.
+if yaml and ci_text:
+    check("Konfiguration wird NICHT mit '.' eingebunden",
+          ". /etc/braunycode.setup" not in setup, setup[:400])
+    check("Konfiguration wird zeilenweise gelesen",
+          "while IFS= read -r zeile" in setup, setup[:600])
+    check("runcmd verschluckt den Fehlerstatus nicht",
+          "|| echo 'Einrichtung fehlgeschlagen" not in str(ci["runcmd"]),
+          str(ci["runcmd"]))
+
+# Und der Nachweis, dass ein Passwort mit '$' bei 'source' verfälscht würde.
+konf = os.path.join(tempfile.mkdtemp(), "setup")
+with open(konf, "w") as fh:
+    fh.write("BRAUNY_TOKEN=geheim$HOME-passwort\n")
+mit_source = subprocess.run(
+    ["bash", "-c", f'set -a; . "{konf}"; set +a; printf %s "$BRAUNY_TOKEN"'],
+    capture_output=True, text=True).stdout
+zeilenweise = subprocess.run(
+    ["bash", "-c",
+     f'while IFS= read -r z || [ -n "$z" ]; do case "$z" in BRAUNY_*=*) : ;; *) continue ;; esac; '
+     f'k=${{z%%=*}}; w=${{z#*=}}; export "$k=$w"; done < "{konf}"; printf %s "$BRAUNY_TOKEN"'],
+    capture_output=True, text=True).stdout
+check("'source' würde das Passwort verfälschen",
+      mit_source != "geheim$HOME-passwort", mit_source)
+check("zeilenweises Lesen erhält es wörtlich",
+      zeilenweise == "geheim$HOME-passwort", zeilenweise)
 
 print(f"\n=== {ok} bestanden, {fail} fehlgeschlagen ===")
 sys.exit(1 if fail else 0)

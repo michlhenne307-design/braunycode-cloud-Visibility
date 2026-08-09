@@ -16,9 +16,11 @@ from fastapi.staticfiles import StaticFiles
 
 import agentloop
 import codeindex
+import connectors
 import provider
 import refactor
 import sandbox
+import skills as skills_mod
 import tools
 import workspace as ws_mod
 
@@ -55,8 +57,13 @@ WORKSPACE_ROOT = os.environ.get("BRAUNY_WORKSPACE", str(BASE_DIR.parent / "works
 #               "tools"   - nur Werkzeugschleife
 #               "oneshot" - nur der alte Weg: planen, schreiben, ausfuehren
 AGENT_MODE = os.environ.get("BRAUNY_AGENT", "auto").strip().lower()
+# Verzeichnis mit Skill-Dateien (Verfahrenswissen als Markdown).
+SKILL_DIR = os.environ.get("BRAUNY_SKILLS", str(BASE_DIR.parent / "skills"))
 
-app = FastAPI(title="BraunyCode Cloud", version="1.6.0")
+app = FastAPI(title="BraunyCode Cloud", version="1.7.0")
+
+# Einmal beim Start lesen - Skills aendern sich nicht waehrend eines Laufs.
+SKILLS = skills_mod.load(SKILL_DIR)
 
 # Begrenzt die gleichzeitig laufenden Auftraege.
 run_slots = asyncio.Semaphore(MAX_CONCURRENT)
@@ -286,8 +293,9 @@ async def run_agent(send, task, *, ask_fn, run_sandbox, workspace=None,
     """Plant, generiert und repariert Code, bis er laeuft oder die Versuche aus sind.
 
     ask_fn und run_sandbox sind hineingereicht, damit die Schleife ohne echtes
-    Ollama oder Docker getestet werden kann. run_sandbox(code) fuehrt den Code
-    aus, streamt die Ausgabe selbst und liefert (exit_code, gesammelte_ausgabe).
+    Ollama oder Docker getestet werden kann. run_sandbox(dateien, start) fuehrt
+    das Projekt aus, streamt die Ausgabe selbst und liefert
+    (exit_code, gesammelte_ausgabe).
     """
     start = time.monotonic()
 
@@ -341,7 +349,8 @@ async def run_agent(send, task, *, ask_fn, run_sandbox, workspace=None,
             else:
                 await send("status", f"Versuch {attempt}/{max_attempts}: "
                                      "starte korrigierte Fassung …")
-            exit_code, output = await run_sandbox(code)
+            # Der Einmalwurf erzeugt bewusst genau eine Datei.
+            exit_code, output = await run_sandbox({"main.py": code}, "main.py")
 
         last_exit = exit_code
         failed = exit_code != 0 or looks_failed(output)
@@ -374,7 +383,7 @@ async def run_agent(send, task, *, ask_fn, run_sandbox, workspace=None,
 
 
 async def dispatch(send, task, *, ask_fn, chat_fn, run_sandbox, workspace=None,
-                   mode=None):
+                   mode=None, skills=None, enabled_connectors=None):
     """Waehlt den Weg, der zur Aufgabe und zum Modell passt.
 
     Drei Wege, vom billigsten zum teuersten:
@@ -399,12 +408,28 @@ async def dispatch(send, task, *, ask_fn, chat_fn, run_sandbox, workspace=None,
         index = await asyncio.to_thread(codeindex.CodeIndex.build, workspace)
         context = index.overview()
 
+        freigegeben = (connectors.available() if enabled_connectors is None
+                       else enabled_connectors)
         toolbox = tools.Toolbox(workspace, run_sandbox=run_sandbox,
-                                index_builder=codeindex.CodeIndex.build)
+                                index_builder=codeindex.CodeIndex.build,
+                                enabled=freigegeben)
+
+        # Passendes Verfahrenswissen dazustellen, falls eines passt.
+        skill = skills_mod.match(task, SKILLS if skills is None else skills)
+        if skill is not None:
+            await send("status", f"Skill „{skill.name}“: {skill.beschreibung}")
+            # Erst einschraenken, DANN melden. Andersherum kuendigte die
+            # Meldung Konnektoren an, die der Skill gleich darauf wegnahm.
+            toolbox.restrict(skill.werkzeuge)
+
+        offen = sorted(set(freigegeben) & toolbox.allowed)
+        hinweis = f" Konnektoren: {', '.join(offen)}." if offen else ""
         await send("status", f"Werkzeugmodus: bis zu {agentloop.MAX_STEPS} "
-                             "Schritte am Projekt.")
+                             f"Schritte am Projekt, {len(toolbox.schema())} "
+                             f"Werkzeuge.{hinweis}")
         outcome = await agentloop.run_tool_agent(
-            send, task, chat_fn=chat_fn, toolbox=toolbox, context=context)
+            send, task, chat_fn=chat_fn, toolbox=toolbox, context=context,
+            skill=skill)
         if outcome != "no-tools":
             return outcome
         if mode == "tools":
@@ -427,6 +452,10 @@ async def dispatch(send, task, *, ask_fn, chat_fn, run_sandbox, workspace=None,
 @app.on_event("startup")
 async def on_startup():
     """Raeumt Container auf, die ein frueherer Absturz liegen gelassen hat."""
+    log.info("%d Skill(s) geladen aus %s: %s", len(SKILLS), SKILL_DIR,
+             ", ".join(s.name for s in SKILLS) or "keine")
+    offen = connectors.available()
+    log.info("Konnektoren: %s", ", ".join(offen) or "keine (alles abgeschottet)")
     try:
         removed = await asyncio.to_thread(sandbox.reap_orphans)
         if removed:
@@ -477,7 +506,9 @@ async def icon(name: str):
 @app.get("/healthz")
 async def healthz():
     status = {"model": MODEL, "auth": bool(TOKEN), "version": app.version,
-              "modus": AGENT_MODE, "provider": provider.describe()}
+              "modus": AGENT_MODE, "provider": provider.describe(),
+              "skills": skills_mod.overview(SKILLS),
+              "konnektoren": connectors.describe()}
     if WORKSPACE is not None:
         status["workspace"] = {"pfad": str(WORKSPACE.root),
                                "dateien": len(WORKSPACE.list_files()),
@@ -495,8 +526,13 @@ async def healthz():
 
 # ------------------------------------------------------------------ Agent
 
-async def sandbox_runner(send, code: str):
-    """Fuehrt einen Codestand in einer frischen Sandbox aus.
+async def sandbox_runner(send, files: dict, entry: str = "main.py", *, command=None):
+    """Fuehrt einen Projektstand in einer frischen Sandbox aus.
+
+    Bekommt ALLE Dateien, nicht nur eine: ein Projekt aus mehreren Modulen
+    liesse sich sonst nicht ausfuehren, weil der Import ins Leere geht.
+    entry bestimmt, welche davon gestartet wird. Alternativ setzt command
+    einen beliebigen Befehl - dann wird entry nicht benutzt.
 
     Streamt die Ausgabe als 'sandbox'-Ereignisse und liefert
     (exit_code, gesamte_ausgabe) zurueck. Jeder Aufruf bekommt eigenen
@@ -507,8 +543,10 @@ async def sandbox_runner(send, code: str):
     container = None
     lines: list[str] = []
     try:
-        project_dir = await asyncio.to_thread(sandbox.make_project_dir, {"main.py": code})
-        container = await asyncio.to_thread(sandbox.start, project_dir)
+        project_dir = await asyncio.to_thread(sandbox.make_project_dir, files)
+        container = await asyncio.to_thread(
+            sandbox.start, project_dir,
+            list(command) if command else sandbox.entry_command(entry))
         try:
             async for line in sandbox.stream_logs(container):
                 lines.append(line)
@@ -580,8 +618,8 @@ async def agent(ws: WebSocket):
             await send("status", f"Modell {MODEL} über {provider.PROVIDER} — "
                                  "Auftrag angenommen.")
 
-            async def run_sandbox(code):
-                return await sandbox_runner(send, code)
+            async def run_sandbox(files, entry="main.py", *, command=None):
+                return await sandbox_runner(send, files, entry, command=command)
 
             await dispatch(send, prompt, ask_fn=ask, chat_fn=model_chat,
                            run_sandbox=run_sandbox, workspace=WORKSPACE)
