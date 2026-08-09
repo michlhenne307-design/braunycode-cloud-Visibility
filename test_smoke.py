@@ -3427,6 +3427,27 @@ finally:
 
 # Die Oberflaeche muss das auch benutzen - sonst ist die Faehigkeit da und
 # niemand ruft sie ab.
+# Der Aktualisierungsbefehl. Anlass war ein echter Fehlschlag: die Anleitung
+# begann mit 'cd' ins Quellverzeichnis, das ein frueherer Lauf geloescht
+# hatte. Die Zeile brach sofort ab, alles dahinter passierte nie - und weil
+# sofort wieder ein Prompt kam, sah es aus, als sei es gelaufen.
+_upd_pfad = main.BASE_DIR.parent / "deploy" / "update.sh"
+check("es gibt einen Aktualisierungsbefehl", _upd_pfad.exists(), str(_upd_pfad))
+if _upd_pfad.exists():
+    _upd = _upd_pfad.read_text()
+    check("er setzt kein vorhandenes Quellverzeichnis voraus",
+          'rm -rf "$SRC"' in _upd and "git clone" in _upd)
+    check("er faengt ein fehlendes git ab", "command -v git" in _upd)
+    check("er laeuft losgeloest vom Terminal weiter",
+          "setsid" in _upd and "nohup" in _upd)
+    check("er nennt den eingespielten Stand", "rev-parse --short HEAD" in _upd)
+    check("er sagt, wo man nachsieht", "tail -f" in _upd)
+    check("er besteht auf root statt halb zu laufen",
+          '"$(id -u)" -ne 0' in _upd)
+    _inst = (main.BASE_DIR.parent / "install.sh").read_text()
+    check("der Installer legt ihn als Befehl ab",
+          "/usr/local/bin/braunycode-update" in _inst)
+
 check("die Oberfläche merkt sich den laufenden Auftrag", "brauny.run" in js)
 check("sie hängt sich beim Zurückkommen wieder an",
       "visibilitychange" in js and "wiederanhaengen" in js)

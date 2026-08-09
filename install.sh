@@ -314,6 +314,14 @@ sudo systemctl daemon-reload
 sudo systemctl enable braunycode
 sudo systemctl restart braunycode
 
+# ---------------------------------------------------------------- 6b. Update
+# Damit die naechste Aktualisierung ein Wort ist statt einer langen Zeile, die
+# man auf einem Telefon abtippt und dabei verunstaltet.
+if [ -f "$SRC_DIR/deploy/update.sh" ]; then
+  step "Aktualisierungsbefehl einrichten (braunycode-update)"
+  sudo install -m 0755 "$SRC_DIR/deploy/update.sh" /usr/local/bin/braunycode-update
+fi
+
 # ---------------------------------------------------------------- 7. Firewall
 step "Lokale Firewall fuer Port $BRAUNY_PORT oeffnen"
 # Manche Ubuntu-Images (Oracle) bringen iptables-Regeln mit, die alles ausser
@@ -353,6 +361,8 @@ cat <<EOF
     Adresse oeffnen > Menue- bzw. Teilen-Symbol >
     "Zum Home-Bildschirm" / "App installieren".
     Startet dann im Vollbild ohne Browserleiste.
+
+  Aktualisieren  sudo braunycode-update
 
   Status    sudo systemctl status braunycode
   Logs      journalctl -u braunycode -f
