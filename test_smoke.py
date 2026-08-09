@@ -2652,5 +2652,124 @@ check("ein gescheiterter Bau kippt die Einrichtung nicht",
       _r.returncode == 0, _r.returncode)
 
 
+# --------------------------------------------- Gegenbeispiele aus Testlaeufen
+print("\n[40] Gegenbeispiele und pytest-Ausgabe")
+
+# Die folgenden Ausgaben stammen aus ECHTEN Laeufen (pytest 9.1.1,
+# hypothesis 6.165.2) und sind hier festgehalten, weil hypothesis in der
+# Testumgebung nicht installiert sein muss. Weiter unten wird zusaetzlich
+# frisch erzeugt, falls es doch verfügbar ist.
+
+_HYP_PYTEST = """guthaben = 0, betrag = 1
+
+    @given(st.integers(min_value=0, max_value=1000),
+           st.integers(min_value=0, max_value=1000))
+    def test_kontostand_nie_negativ(guthaben, betrag):
+>       assert abheben(guthaben, betrag) >= 0
+E       assert -1 >= 0
+E        +  where -1 = abheben(0, 1)
+E       Failing test case: test_kontostand_nie_negativ(
+E           guthaben=0,
+E           betrag=1,
+E       )
+
+test_konto.py:9: AssertionError
+=========================== short test summary info ============================
+FAILED test_konto.py::test_kontostand_nie_negativ - assert -1 >= 0
+1 failed in 0.89s"""
+
+_b = diagnostics.parse(_HYP_PYTEST, "run_command")
+check("pytest-Fehlschlag ergibt einen Befund", len(_b) == 1, _b)
+check("widerlegte Eigenschaft wird PROPERTY",
+      _b and _b[0].kategorie == diagnostics.PROPERTY, _b)
+check("Datei aus der pytest-Zusammenfassung",
+      _b and _b[0].datei == "test_konto.py", _b)
+check("Zeilennummer nachgereicht", _b and _b[0].zeile == 9, _b)
+check("Testname als Symbol",
+      _b and _b[0].symbol == "test_kontostand_nie_negativ", _b)
+check("Gegenbeispiel extrahiert",
+      _b and _b[0].gegenbeispiel == "guthaben=0, betrag=1", _b and _b[0].gegenbeispiel)
+check("Gegenbeispiel steht im Einzeiler",
+      _b and "guthaben=0" in _b[0].einzeiler(), _b and _b[0].einzeiler())
+# Der Fingerabdruck darf den konkreten Fall NICHT enthalten - sonst zeigt jede
+# neue Eingabe auf einen anderen Eintrag im Fehlergedaechtnis.
+check("Fingerabdruck ohne den konkreten Fall",
+      _b and "guthaben=0" not in _b[0].fingerprint(), _b and _b[0].fingerprint())
+
+_HYP_DIREKT = """Traceback (most recent call last):
+  File "/app/direkt.py", line 7, in <module>
+    test_nie_negativ()
+  File "/app/direkt.py", line 5, in test_nie_negativ
+    assert abheben(g, b) >= 0
+AssertionError
+Failing test case: test_nie_negativ(
+    g=0,
+    b=1,
+)"""
+_b = diagnostics.parse(_HYP_DIREKT, "run_python")
+check("auch ohne pytest erkannt", len(_b) == 1, _b)
+check("und ebenfalls PROPERTY",
+      _b and _b[0].kategorie == diagnostics.PROPERTY, _b)
+check("Gegenbeispiel ohne pytest",
+      _b and _b[0].gegenbeispiel == "g=0, b=1", _b and _b[0].gegenbeispiel)
+
+# Ältere Hypothesis-Fassungen schreiben 'Falsifying example'.
+check("die ältere Schreibweise wird auch verstanden",
+      diagnostics.parse(_HYP_DIREKT.replace("Failing test case",
+                                            "Falsifying example"))[0]
+      .gegenbeispiel == "g=0, b=1")
+
+_PYTEST_SCHLICHT = """=================================== FAILURES ===================================
+__________________________________ test_summe __________________________________
+
+    def test_summe():
+>       assert summe(2, 3) == 5
+E       assert -1 == 5
+
+test_schlicht.py:3: AssertionError
+=========================== short test summary info ============================
+FAILED test_schlicht.py::test_summe - assert -1 == 5
+1 failed in 0.17s"""
+_b = diagnostics.parse(_PYTEST_SCHLICHT, "run_command")
+check("gewöhnlicher pytest-Fehlschlag wird erkannt", len(_b) == 1, _b)
+# Ohne Gegenbeispiel bleibt es eine Zusicherung. Alles zu PROPERTY zu erklären
+# waere eine Behauptung ueber eine ganze Eingabeklasse, die hier niemand belegt.
+check("ohne Gegenbeispiel bleibt es ASSERTION",
+      _b and _b[0].kategorie == diagnostics.ASSERTION, _b)
+check("kein Gegenbeispiel erfunden", _b and _b[0].gegenbeispiel is None, _b)
+
+_MEHRERE = _PYTEST_SCHLICHT + "\nFAILED test_a.py::test_x - assert 1 == 2"
+check("mehrere FAILED-Zeilen ergeben mehrere Befunde",
+      len(diagnostics.parse(_MEHRERE)) == 2, diagnostics.parse(_MEHRERE))
+
+check("bestandener Lauf ergibt keinen Befund",
+      diagnostics.parse("2 passed in 0.10s") == [])
+
+# Wenn hypothesis zur Hand ist: frisch erzeugen statt nur die Aufzeichnung.
+try:
+    import hypothesis  # noqa: F401
+except ImportError:
+    print("  ÜBERSPRUNGEN  Livelauf gegen hypothesis (nicht installiert)")
+else:
+    _ordner = tempfile.mkdtemp()
+    with open(os.path.join(_ordner, "p.py"), "w", encoding="utf-8") as _fh:
+        _fh.write(textwrap.dedent("""
+            from hypothesis import given, strategies as st
+            def abheben(g, b): return g - b
+            @given(st.integers(min_value=0, max_value=100),
+                   st.integers(min_value=0, max_value=100))
+            def test_nie_negativ(g, b):
+                assert abheben(g, b) >= 0
+            test_nie_negativ()
+        """))
+    _roh = subprocess.run([sys.executable, os.path.join(_ordner, "p.py")],
+                          capture_output=True, text=True).stderr
+    _b = diagnostics.parse(_roh.replace(_ordner, "/app"))
+    check("Livelauf ergibt ein Gegenbeispiel",
+          _b and _b[0].gegenbeispiel is not None, _roh[-300:])
+    check("Livelauf wird als PROPERTY eingeordnet",
+          _b and _b[0].kategorie == diagnostics.PROPERTY, _b)
+
+
 print(f"\n=== {ok} bestanden, {fail} fehlgeschlagen ===")
 sys.exit(1 if fail else 0)

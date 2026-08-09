@@ -18,7 +18,7 @@ Deshalb ist die Kategorie grob und stabil gehalten statt fein und wackelig.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 # Kategorien. Absichtlich wenige: sie sollen ueber Jahre gleich bleiben, weil
 # das Fehlergedaechtnis darauf zeigt. Feiner unterscheiden kann man spaeter
@@ -28,6 +28,11 @@ TYPE = "TYPE"
 NAME = "NAME"
 IMPORT = "IMPORT"
 ASSERTION = "ASSERTION"
+# Eine widerlegte Eigenschaft ist etwas anderes als eine fehlgeschlagene
+# Zusicherung: sie sagt, dass der Code fuer eine ganze Klasse von Eingaben
+# falsch ist, und liefert den kleinsten Fall dazu mit. Das verdient eine
+# eigene Kategorie, weil das Fehlergedaechtnis darauf zeigt.
+PROPERTY = "PROPERTY"
 RUNTIME = "RUNTIME"
 TIMEOUT = "TIMEOUT"
 TOOL = "TOOL"
@@ -68,6 +73,20 @@ _ABSCHLUSS = re.compile(
 # check_syntax spricht deutsch - eigenes Muster, damit sein Befund dieselben
 # Felder bekommt wie ein Traceback.
 _CHECK_SYNTAX = re.compile(r"^SyntaxError in (?P<datei>.+?), Zeile (?P<zeile>\d+): (?P<text>.*)$")
+
+# pytest fasst am Ende zusammen: 'FAILED datei.py::test_name - Meldung'.
+# Das ist die verlaesslichste Zeile der ganzen Ausgabe, weil sie unabhaengig
+# vom Formatierungsstil der Fehlerdarstellung immer gleich aussieht.
+_PYTEST_FAILED = re.compile(
+    r"^FAILED\s+(?P<datei>[^\s:]+)::(?P<test>[\w\[\]\.\- ]+?)"
+    r"(?:\s+-\s+(?P<text>.*))?$")
+# 'datei.py:9: AssertionError' - liefert die Zeilennummer nach.
+_PYTEST_ORT = re.compile(r"^(?P<datei>[\w./\\-]+\.py):(?P<zeile>\d+): (?P<typ>\w+(?:Error|Exception))")
+
+# Hypothesis nennt den kleinsten ausloesenden Fall. Zwei Schreibweisen je nach
+# Version, und unter pytest steht ein 'E' davor.
+_GEGENBEISPIEL = re.compile(
+    r"^(?:E\s+)?(?:Failing test case|Falsifying example):\s*(?P<test>\w+)\($")
 _WERKZEUGFEHLER = re.compile(r"^FEHLER: (?:(?P<typ>\w+Error|\w+Exception): )?(?P<text>.*)$")
 
 
@@ -90,6 +109,10 @@ class Finding:
     datei: str | None = None
     zeile: int | None = None
     symbol: str | None = None
+    # Der kleinste Eingabewert, der den Fehler ausloest - falls einer bekannt
+    # ist. Das ist der Unterschied zwischen "irgendwo stimmt etwas nicht" und
+    # einer Reparatur mit konkretem Ziel.
+    gegenbeispiel: str | None = None
     roh: str = field(default="", repr=False)
 
     def fingerprint(self) -> str:
@@ -111,13 +134,16 @@ class Finding:
         kopf = f"{self.kategorie}"
         if self.typ and self.typ != self.kategorie:
             kopf += f"/{self.typ}"
-        return f"{kopf} {ort} — {self.nachricht}"
+        zeile = f"{kopf} {ort} — {self.nachricht}"
+        if self.gegenbeispiel:
+            zeile += f"\n    Gegenbeispiel: {self.gegenbeispiel}"
+        return zeile
 
     def to_dict(self) -> dict:
         return {"kategorie": self.kategorie, "schwere": self.schwere,
                 "typ": self.typ, "datei": self.datei, "zeile": self.zeile,
                 "symbol": self.symbol, "nachricht": self.nachricht,
-                "quelle": self.quelle}
+                "gegenbeispiel": self.gegenbeispiel, "quelle": self.quelle}
 
 
 def kategorie_fuer(typ: str) -> str:
@@ -169,6 +195,95 @@ def _tracebacks(text: str, quelle: str) -> list[Finding]:
     return befunde
 
 
+def _pytest(text: str, quelle: str) -> list[Finding]:
+    """Die Zusammenfassungszeilen von pytest.
+
+    'FAILED datei.py::test_name - Meldung' ist die verlaesslichste Zeile der
+    ganzen Ausgabe: sie sieht unabhaengig vom Formatierungsstil der
+    Fehlerdarstellung immer gleich aus. Die Zeilennummer wird aus den
+    'datei.py:9: AssertionError'-Zeilen nachgereicht, sofern vorhanden.
+    """
+    orte: dict[str, tuple[int, str]] = {}
+    for zeile in text.splitlines():
+        treffer = _PYTEST_ORT.match(zeile.strip())
+        if treffer:
+            orte[_rel(treffer.group("datei"))] = (int(treffer.group("zeile")),
+                                                  treffer.group("typ"))
+
+    befunde: list[Finding] = []
+    for zeile in text.splitlines():
+        treffer = _PYTEST_FAILED.match(zeile.strip())
+        if not treffer:
+            continue
+        datei = _rel(treffer.group("datei"))
+        zeile_nr, typ = orte.get(datei, (None, "AssertionError"))
+        befunde.append(Finding(
+            kategorie=kategorie_fuer(typ), schwere=FEHLER, typ=typ,
+            nachricht=(treffer.group("text") or "").strip() or "Test fehlgeschlagen",
+            datei=datei, zeile=zeile_nr, symbol=treffer.group("test").strip(),
+            quelle=quelle, roh=zeile.strip()))
+    return befunde
+
+
+def _gegenbeispiele(text: str) -> dict[str, str]:
+    """Testname -> kleinster ausloesender Fall, wie Hypothesis ihn meldet.
+
+    Der Block sieht so aus (unter pytest mit 'E' davor):
+
+        Failing test case: test_nie_negativ(
+            g=0,
+            b=1,
+        )
+
+    Genau dieser Wert ist es, den ein SMT-Solver als Gegenbeispiel liefern
+    wuerde - hier faellt er ohne Spezifikationssprache und ohne
+    Uebersetzungsschritt an.
+    """
+    gefunden: dict[str, str] = {}
+    zeilen = text.splitlines()
+    for i, zeile in enumerate(zeilen):
+        treffer = _GEGENBEISPIEL.match(zeile.strip())
+        if not treffer:
+            continue
+        teile = []
+        for weiter in zeilen[i + 1:]:
+            roh = weiter.strip()
+            if roh.startswith("E "):
+                roh = roh[2:].strip()
+            elif roh == "E":
+                continue
+            if roh.startswith(")"):
+                break
+            if roh:
+                teile.append(roh.rstrip(","))
+        if teile:
+            gefunden[treffer.group("test")] = ", ".join(teile)
+    return gefunden
+
+
+def _anhaengen(befunde: list[Finding], gegenbeispiele: dict[str, str]) -> list[Finding]:
+    """Gegenbeispiel dem passenden Befund zuordnen.
+
+    Ueber den Testnamen, wenn er bekannt ist - sonst an den letzten Befund,
+    denn Hypothesis meldet den Fall direkt zur ausloesenden Ausnahme. Ein
+    Befund MIT Gegenbeispiel wird zu PROPERTY: nicht 'eine Zusicherung ist
+    einmal gescheitert', sondern 'diese Eigenschaft gilt nicht'.
+    """
+    if not gegenbeispiele or not befunde:
+        return befunde
+    ergebnis = []
+    offen = dict(gegenbeispiele)
+    for f in befunde:
+        fall = offen.pop(f.symbol, None) if f.symbol else None
+        ergebnis.append(f if fall is None else replace(
+            f, gegenbeispiel=fall, kategorie=PROPERTY))
+    if offen and ergebnis and ergebnis[-1].gegenbeispiel is None:
+        letzter = ergebnis[-1]
+        ergebnis[-1] = replace(letzter, gegenbeispiel=next(iter(offen.values())),
+                               kategorie=PROPERTY)
+    return ergebnis
+
+
 def _kopfloser_syntaxfehler(text: str, quelle: str) -> list[Finding]:
     """Der Sonderfall ohne 'Traceback'-Kopf.
 
@@ -214,9 +329,16 @@ def parse(text: str, quelle: str = "sandbox") -> list[Finding]:
     if not text or not text.strip():
         return []
 
+    faelle = _gegenbeispiele(text)
+
     befunde = _tracebacks(text, quelle)
     if befunde:
-        return befunde
+        return _anhaengen(befunde, faelle)
+
+    # pytest formatiert eigen und ohne 'Traceback'-Kopf.
+    befunde = _pytest(text, quelle)
+    if befunde:
+        return _anhaengen(befunde, faelle)
 
     # Erst wenn kein Traceback da ist - sonst wuerde ein SyntaxError INNERHALB
     # eines Tracebacks (kaputtes Modul beim Import) doppelt gezaehlt.
