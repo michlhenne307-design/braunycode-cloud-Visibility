@@ -24,6 +24,52 @@ API_BASE = os.environ.get("BRAUNY_API_BASE", "").rstrip("/")
 API_KEY = os.environ.get("BRAUNY_API_KEY", "")
 TIMEOUT = int(os.environ.get("BRAUNY_ASK_TIMEOUT", "300"))
 
+# ---------------------------------------------------------- Abtastverhalten
+#
+# Bisher wurde gar keine Temperatur gesetzt - der Lauf uebernahm damit die
+# Vorgabe des Anbieters, bei den meisten Modellen um 0.8. Fuer einen Agenten,
+# der Werkzeuge mit exakten Argumenten aufrufen soll, ist das die falsche
+# Einstellung: dieselbe Aufgabe erzeugt zweimal verschiedene Aufrufe, und ein
+# Fehlschlag laesst sich nicht nachstellen.
+#
+# Eine pauschale Regel "immer 0" waere aber ebenso falsch. Wo mehrere
+# Loesungsvorschlaege verglichen werden sollen, ist Vielfalt genau der Zweck.
+# Deshalb zwei benannte Betriebsarten statt einer Zahl im Code.
+DETERMINISTISCH = "deterministisch"
+VIELFALT = "vielfalt"
+
+TEMPERATUREN = {DETERMINISTISCH: 0.0, VIELFALT: 0.8}
+
+# Ein fester Startwert macht auch die Reihenfolge gleicher
+# Wahrscheinlichkeiten reproduzierbar. Bei Ollama ist er unbedenklich, weil
+# lokal und bekannt. Fremde OpenAI-kompatible Endpunkte kennen 'seed' nicht
+# alle und weisen unbekannte Felder teils zurueck - dort nur auf ausdrueckliche
+# Ansage. Das ist der Unterschied zwischen "reproduzierbar" und "kaputt".
+def _seed_lesen():
+    """Einmal beim Laden auswerten, nicht bei jedem Aufruf.
+
+    Ein Tippfehler in BRAUNY_SEED wuerde sonst jeden einzelnen Modellaufruf
+    mit einem ValueError sprengen - und zwar mitten im Lauf, weit weg von der
+    Ursache. Hier faellt er sofort auf und wird ignoriert statt weitergereicht.
+    """
+    roh = os.environ.get("BRAUNY_SEED", "").strip()
+    if not roh:
+        return None
+    try:
+        return int(roh)
+    except ValueError:
+        import logging
+        logging.getLogger(__name__).warning(
+            "BRAUNY_SEED=%r ist keine ganze Zahl — wird ignoriert.", roh)
+        return None
+
+
+SEED = _seed_lesen()
+
+
+def _temperatur(policy: str) -> float:
+    return TEMPERATUREN.get(policy, TEMPERATUREN[DETERMINISTISCH])
+
 
 @dataclass
 class ToolCall:
@@ -57,10 +103,14 @@ def _parse_arguments(raw) -> dict:
 
 # ------------------------------------------------------------------ Ollama
 
-def _chat_ollama(messages, tools):
+def _chat_ollama(messages, tools, policy=DETERMINISTISCH):
     import ollama
 
-    kwargs = {"model": MODEL, "messages": messages}
+    optionen = {"temperature": _temperatur(policy)}
+    if SEED is not None:
+        # Lokal und bekannt - hier ist ein fester Startwert unbedenklich.
+        optionen["seed"] = SEED
+    kwargs = {"model": MODEL, "messages": messages, "options": optionen}
     if tools:
         kwargs["tools"] = tools
     response = ollama.chat(**kwargs)
@@ -83,12 +133,17 @@ def _chat_ollama(messages, tools):
 
 # ------------------------------------------------------------------ OpenAI-kompatibel
 
-def _chat_openai(messages, tools):
+def _chat_openai(messages, tools, policy=DETERMINISTISCH):
     import httpx
 
     if not API_BASE:
         raise ProviderError("BRAUNY_API_BASE ist nicht gesetzt.")
-    payload = {"model": MODEL, "messages": messages}
+    payload = {"model": MODEL, "messages": messages,
+               "temperature": _temperatur(policy)}
+    if SEED is not None:
+        # Nur auf Ansage: nicht jeder Endpunkt kennt 'seed', und manche
+        # weisen unbekannte Felder mit 400 zurueck.
+        payload["seed"] = SEED
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
@@ -122,12 +177,17 @@ def _chat_openai(messages, tools):
 
 # ------------------------------------------------------------------ Fassade
 
-def chat(messages, tools=None) -> Reply:
-    """Blockierender Modellaufruf. Aufrufer legen ihn in einen Thread."""
+def chat(messages, tools=None, policy=DETERMINISTISCH) -> Reply:
+    """Blockierender Modellaufruf. Aufrufer legen ihn in einen Thread.
+
+    policy waehlt das Abtastverhalten: DETERMINISTISCH fuer alles, was genau
+    einmal richtig sein muss - Werkzeugaufrufe, Plaene, Extraktion. VIELFALT
+    nur dort, wo mehrere Vorschlaege verglichen werden sollen.
+    """
     if PROVIDER == "ollama":
-        return _chat_ollama(messages, tools)
+        return _chat_ollama(messages, tools, policy)
     if PROVIDER in OPENAI_ALIASES:
-        return _chat_openai(messages, tools)
+        return _chat_openai(messages, tools, policy)
     raise ProviderError(f"Unbekannter Anbieter: {PROVIDER!r}")
 
 

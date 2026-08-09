@@ -2480,5 +2480,104 @@ check("die Annahme steht im Auftrag des Modells",
           for m in _gesehen[0] if m.get("role") == "user"), _gesehen[0])
 
 
+# --------------------------------------------------------- Abtastverhalten
+print("\n[38] Abtastverhalten: deterministisch, wo es genau sein muss")
+
+# Bis hierher setzte KEIN Pfad eine Temperatur - der Lauf uebernahm die
+# Vorgabe des Anbieters, meist um 0.8. Ein Agent, der Werkzeuge mit exakten
+# Argumenten aufruft, bekam damit bei gleicher Aufgabe verschiedene Aufrufe
+# und ein nicht nachstellbares Fehlerbild.
+
+def _ollama_kwargs(policy=provider.DETERMINISTISCH):
+    """Faengt ab, womit ollama.chat tatsaechlich gerufen wird."""
+    import ollama
+    gesehen = {}
+    orig = ollama.chat
+    ollama.chat = lambda **kw: (gesehen.update(kw),
+                                {"message": {"content": "ok"}})[1]
+    try:
+        provider._chat_ollama([{"role": "user", "content": "x"}], None, policy)
+    finally:
+        ollama.chat = orig
+    return gesehen
+
+_kw = _ollama_kwargs()
+check("Ollama bekommt Optionen", "options" in _kw, _kw.keys())
+check("deterministisch heißt Temperatur 0",
+      _kw["options"]["temperature"] == 0.0, _kw.get("options"))
+check("ohne BRAUNY_SEED kein seed im Aufruf",
+      "seed" not in _kw["options"], _kw.get("options"))
+
+_kw = _ollama_kwargs(provider.VIELFALT)
+check("Vielfalt heißt Temperatur über 0",
+      _kw["options"]["temperature"] > 0, _kw.get("options"))
+
+def _openai_payload(policy=provider.DETERMINISTISCH):
+    """Faengt die Nutzlast ab, ohne eine Anfrage zu senden."""
+    import httpx
+    gesehen = {}
+
+    class _Antwort:
+        status_code = 200
+        @staticmethod
+        def json():
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+    class _Client:
+        def __init__(self, **_): pass
+        def __enter__(self): return self
+        def __exit__(self, *_): return False
+        def post(self, _url, json=None, headers=None):
+            gesehen.update(json or {})
+            return _Antwort()
+
+    orig_client, orig_base, orig_provider = (
+        httpx.Client, provider.API_BASE, provider.PROVIDER)
+    httpx.Client = _Client
+    provider.API_BASE, provider.PROVIDER = "https://example.invalid/v1", "openai"
+    try:
+        provider._chat_openai([{"role": "user", "content": "x"}], None, policy)
+    finally:
+        httpx.Client = orig_client
+        provider.API_BASE, provider.PROVIDER = orig_base, orig_provider
+    return gesehen
+
+_p = _openai_payload()
+check("API-Nutzlast trägt eine Temperatur", "temperature" in _p, sorted(_p))
+check("und sie ist 0", _p["temperature"] == 0.0, _p.get("temperature"))
+check("ohne BRAUNY_SEED kein seed in der Nutzlast", "seed" not in _p, sorted(_p))
+check("Vielfalt wirkt auch über die API",
+      _openai_payload(provider.VIELFALT)["temperature"] > 0)
+
+# Ein gesetzter Startwert muss ankommen ...
+_orig_seed = provider.SEED
+try:
+    provider.SEED = 4711
+    check("gesetzter Startwert erreicht Ollama",
+          _ollama_kwargs()["options"].get("seed") == 4711)
+    check("gesetzter Startwert erreicht die API",
+          _openai_payload().get("seed") == 4711)
+finally:
+    provider.SEED = _orig_seed
+
+# ... und ein Tippfehler darin darf NICHT jeden Modellaufruf sprengen.
+_alt = os.environ.get("BRAUNY_SEED")
+try:
+    os.environ["BRAUNY_SEED"] = "vier-sieben-eins-eins"
+    check("unbrauchbarer Startwert wird ignoriert statt zu werfen",
+          provider._seed_lesen() is None)
+    os.environ["BRAUNY_SEED"] = "  17 "
+    check("Leerzeichen um den Startwert stören nicht",
+          provider._seed_lesen() == 17)
+finally:
+    if _alt is None:
+        os.environ.pop("BRAUNY_SEED", None)
+    else:
+        os.environ["BRAUNY_SEED"] = _alt
+
+check("Standard ist deterministisch",
+      provider._temperatur("unbekannte-betriebsart") == 0.0)
+
+
 print(f"\n=== {ok} bestanden, {fail} fehlgeschlagen ===")
 sys.exit(1 if fail else 0)
