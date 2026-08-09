@@ -244,8 +244,67 @@ check("index ist standalone-faehig", 'apple-mobile-web-app-capable" content="yes
 check("app.js registriert Service Worker", "serviceWorker" in js and "'/sw.js'" in js)
 check("keine innerHTML-Zuweisung im Frontend (XSS)",
       ".innerHTML" not in js, "innerHTML-Zugriff gefunden")
-for element in ["panel-log", "panel-code", "panel-out", "btn-run", "gate", "token"]:
-    check(f"app.js-Ziel #{element} existiert im HTML", f'id="{element}"' in html)
+# Frueher stand hier eine feste Liste von sechs Bezeichnern. Die musste bei
+# jedem Umbau der Oberflaeche von Hand nachgezogen werden - und genau das
+# vergisst man. Jetzt werden die Ziele aus app.js selbst gelesen: was das
+# Skript anspricht, muss es im HTML auch geben. Das faengt jeden kuenftigen
+# Umbau mit ab, nicht nur diese sechs.
+import re as _re_ui  # noqa: E402
+_ziele = sorted(set(_re_ui.findall(r"\$\('([a-z0-9-]+)'\)", js)))
+check("app.js spricht überhaupt Elemente an", len(_ziele) >= 6, _ziele)
+_fehlend = [z for z in _ziele if f'id="{z}"' not in html]
+check("jedes von app.js angesprochene Element existiert im HTML",
+      not _fehlend, _fehlend)
+
+# --- Gespraechsverlauf statt Formular -------------------------------------
+#
+# Die Oberflaeche war ein Auftragsformular: Textfeld oben, drei Reiter, ein
+# Knopf. Jeder Lauf loeschte den vorigen. Jetzt waechst ein Verlauf mit, in
+# dem Auftrag und Arbeit nebeneinander stehen bleiben.
+css = (main.STATIC_DIR / "app.css").read_text()
+
+check("es gibt einen fortlaufenden Verlauf", 'id="stream"' in html)
+check("die Eingabe sitzt in einem Formular unten",
+      'class="composer"' in html and 'id="composer"' in html)
+check("Absenden laeuft ueber submit, nicht ueber einen Klick-Handler",
+      "'submit'" in js and "preventDefault" in js)
+check("das Eingabefeld wächst mit", "hoeheAnpassen" in js and "scrollHeight" in js)
+
+# Werkzeugaufrufe gehoeren zugeklappt - im Normalfall sind sie Rauschen.
+check("Werkzeugaufrufe sind aufklappbar",
+      "createElement('details')" in js and "'summary'" in js)
+check("die Ausgabe eines Werkzeugs steckt in dessen Klappe",
+      "if (schritt)" in js)
+
+# Der Kern des Programms sind die Belegzeilen am Ende eines Laufs. Landeten
+# die in einer zugeklappten Zeile, waere die Oberflaeche huebsch und nutzlos.
+_zweig = js.split("default:")[-1]
+check("status-Zeilen schließen die offene Klappe, statt darin zu verschwinden",
+      "schritt = null" in _zweig, _zweig[:200])
+
+# Bildschirmtastatur: mit 100vh schiebt sie die Eingabe aus dem Bild.
+check("die Höhe folgt der sichtbaren Fläche (dvh/svh)", "dvh" in css and "svh" in css)
+check("die sicheren Bereiche werden beachtet", "safe-area-inset" in css)
+# Unter 16px zoomen mobile Browser beim Fokus ins Feld - und kommen nicht
+# wieder heraus.
+check("das Eingabefeld ist mindestens 16px groß",
+      "font-size: 16px" in css.split("#prompt {")[1].split("}")[0],
+      css.split("#prompt {")[1].split("}")[0])
+check("der Startknopf wird beim Laufen zum Abbruch",
+      "body.running .send" in css)
+
+# Beim Umbau tatsaechlich passiert und erst auf einer Bildschirmaufnahme
+# aufgefallen: 'hidden' setzt display:none nur in der Browservorlage. Eine
+# eigene display-Regel auf derselben Klasse ist spezifischer und gewinnt -
+# Anmeldung und Verlauf lagen dauerhaft ueber der Seite. Wer 'hidden'
+# benutzt, um etwas zu verstecken, muss es also selbst durchsetzen.
+_versteckbar = [zeile.split("{")[0].strip()
+                for zeile in css.splitlines()
+                if "display:" in zeile and zeile.strip().startswith(".")]
+check("verstecktes bleibt versteckt: .sheet[hidden] setzt display:none",
+      ".sheet[hidden] { display: none; }" in css, _versteckbar)
+for _id in ("gate", "history"):
+    check(f"#{_id} startet versteckt", f'id="{_id}" hidden' in html)
 
 print("\n[8] WebSocket-Protokoll")
 def ws_exchange(payload, raw=None):
