@@ -916,16 +916,47 @@ check("jedes Ergebnis folgt auf seinen Aufruf",
           a["tool_calls"][0]["id"] == t["tool_call_id"] for a, t in paare),
       paare[:1])
 
-# finish ohne Ausfuehrung: das muss ausdruecklich dazugesagt werden
+# finish ohne Pruefung wird abgewiesen - und zwar im Werkzeug, nicht im Prompt.
+# Erst nach FINISH_BLOCK_LIMIT Ablehnungen darf der Lauf enden, dann aber
+# ausdruecklich als unbelegt.
 outcome, events, w, _ = drive_loop([
     reply(calls=[("write_file", {"path": "main.py", "content": "print(1)\n"})]),
+    reply(calls=[("finish", {"summary": "Fertig und getestet."})]),
+    reply(calls=[("finish", {"summary": "Fertig und getestet."})]),
+    reply(calls=[("finish", {"summary": "Fertig und getestet."})]),
+])
+fehler = [e["text"] for e in events if e["type"] == "error"]
+check("erster Abschlussversuch wird abgewiesen",
+      sum("Abschluss abgelehnt" in t for t in fehler) == tools.FINISH_BLOCK_LIMIT,
+      fehler)
+check("die Ablehnung nennt die offene Datei",
+      any("main.py" in t for t in fehler if "Abschluss abgelehnt" in t), fehler)
+done = next(e for e in events if e["type"] == "done")
+check("Lauf endet trotzdem", outcome == "ok", outcome)
+check("ohne Ausführung nicht als geprüft markiert", done.get("verified") is False, done)
+check("ungeprüfte Datei wird beim Namen genannt",
+      any("Ungeprüft geblieben" in t and "main.py" in t for t in fehler), fehler)
+
+# Umgekehrt: check_syntax hebt die Sperre auf - aber nur fuer die Syntax, und
+# das muss anders klingen als ein echter Lauf.
+outcome, events, w, _ = drive_loop([
+    reply(calls=[("write_file", {"path": "main.py", "content": "print(1)\n"})]),
+    reply(calls=[("check_syntax", {"path": "main.py"})]),
     reply(calls=[("finish", {"summary": "Fertig."})]),
 ])
 done = next(e for e in events if e["type"] == "done")
-check("ohne Ausführung nicht als geprüft markiert", done.get("verified") is False, done)
-check("Hinweis auf fehlende Ausführung",
-      any("nicht ausgeführt" in e["text"] for e in events if e["type"] == "error"),
-      [e["text"] for e in events if e["type"] == "error"])
+check("check_syntax hebt die Sperre auf", outcome == "ok", outcome)
+check("nach check_syntax keine Ablehnung mehr",
+      not any("Abschluss abgelehnt" in e["text"]
+              for e in events if e["type"] == "error"), events)
+check("Beleg steht im Protokoll",
+      any("Belegt durch" in e["text"] and "check_syntax" in e["text"]
+          for e in events if e["type"] == "status"),
+      [e["text"] for e in events if e["type"] == "status"])
+check("nur Syntax belegt wird als solches gemeldet",
+      any("nur die Syntax" in e["text"]
+          for e in events if e["type"] == "status"),
+      [e["text"] for e in events if e["type"] == "status"])
 
 # Schrittgrenze
 outcome, events, w, _ = drive_loop(
@@ -982,6 +1013,7 @@ check("Abbruch nennt den Modelltext",
 outcome, events, w, _ = drive_loop([
     reply('{"tool": "write_file", "arguments": {"path": "main.py", '
           '"content": "print(7)\\n"}}'),
+    reply(calls=[("check_syntax", {"path": "main.py"})]),
     reply(calls=[("finish", {"summary": "über JSON geschrieben"})]),
 ])
 check("JSON-Aufruf wird ausgeführt", w.read("main.py") == "print(7)\n", w.read("main.py"))
@@ -1105,6 +1137,7 @@ check("mechanisch ohne Modellaufruf", counts["chat"] == 0 and counts["ask"] == 0
 
 outcome, events, counts, w = drive_dispatch("baue etwas Neues", [
     reply(calls=[("write_file", {"path": "neu.py", "content": "print('x')\n"})]),
+    reply(calls=[("run_python", {"path": "neu.py"})]),
     reply(calls=[("finish", {"summary": "gebaut"})]),
 ], "auto")
 check("kreativer Auftrag geht in die Werkzeugschleife", outcome == "ok", outcome)

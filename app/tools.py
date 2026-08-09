@@ -13,9 +13,11 @@ from __future__ import annotations
 import ast
 import asyncio
 import fnmatch
+import hashlib
 import json
 import re
 import shlex
+import time
 
 import connectors
 
@@ -29,6 +31,24 @@ MAX_SANDBOX_BYTES = 400_000
 # Ohne dieses Werkzeug kann die Schleife nicht sauber enden - es bleibt
 # deshalb auch dann erlaubt, wenn ein Skill die Werkzeuge einschraenkt.
 ALWAYS = "finish"
+
+# Werkzeuge, die den Projektstand veraendern, und solche, die ihn pruefen.
+# Aus dem Zusammenspiel der beiden Mengen ergibt sich, ob der aktuelle Stand
+# belegt ist oder nur behauptet.
+MODIFYING = {"write_file", "edit_file", "rename_symbol", "delete_file",
+             "move_file"}
+CHECKING = {"check_syntax", "run_python", "run_command"}
+
+# Anfaenge, an denen eine Pruefung als bestanden gilt. Bewusst an den
+# Rueckgabetexten der Werkzeuge festgemacht und nicht am Exit-Code: was das
+# Modell zu sehen bekommt, ist genau das, was hier gewertet wird.
+GREEN_PREFIXES = ("Lauf erfolgreich", "Befehl erfolgreich")
+GREEN_SUFFIX_SYNTAX = ": Syntax in Ordnung."
+
+# So oft darf 'finish' abgewiesen werden, bevor der Lauf trotzdem enden darf -
+# dann aber ausdruecklich als unbelegt. Ohne diesen Deckel koennte ein Modell,
+# das die Pruefung nicht hinbekommt, die Schleife bis zum Schrittlimit drehen.
+FINISH_BLOCK_LIMIT = 2
 
 
 def _tool(name, description, properties, required):
@@ -205,6 +225,13 @@ def _clip(text: str) -> str:
     return text[:MAX_OUTPUT] + f"\n… gekürzt ({len(text)} Zeichen insgesamt)"
 
 
+def _kurz(value, limit: int = 120) -> str:
+    """Argumentwert fuers Protokoll. Ein ganzer Dateiinhalt gehoert da nicht
+    hinein - der steht ohnehin als Fingerabdruck daneben."""
+    text = str(value).replace("\n", "⏎")
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
 class Toolbox:
     """Fuehrt Werkzeugaufrufe gegen ein Projektverzeichnis aus.
 
@@ -223,6 +250,22 @@ class Toolbox:
         self.pushed: list[str] = []
         self.fetched: list[str] = []
         self.finished: str | None = None
+
+        # --- Belegfuehrung -------------------------------------------------
+        # Dateien, die seit der letzten bestandenen Pruefung veraendert wurden.
+        # Solange hier etwas drinsteht, ist der Stand unbelegt.
+        self.unverified: set[str] = set()
+        # Lueckenloses Protokoll aller Aufrufe. Das ist die Nachvollziehbarkeit:
+        # was wurde aufgerufen, mit welchen Argumenten, was kam heraus, und wie
+        # sah die Datei vorher und nachher aus.
+        self.protokoll: list[dict] = []
+        # Bestandene Pruefungen mit dem, was sie abgedeckt haben.
+        self.belege: list[dict] = []
+        # Letzter bekannter Inhalts-Fingerabdruck je Datei.
+        self._hashes: dict[str, str | None] = {}
+        self.finish_blocked = 0
+        # Wird beim Abschluss gesetzt: war der gemeldete Stand geprueft?
+        self.verified = False
 
     def restrict(self, names) -> list[str]:
         """Schraenkt die Werkzeuge ein, etwa weil ein Skill es so vorgibt.
@@ -273,19 +316,104 @@ class Toolbox:
         return [item for item in schema(self.enabled)
                 if item["function"]["name"] in self.allowed]
 
+    def _hash(self, path: str) -> str | None:
+        """Fingerabdruck des Dateiinhalts, oder None wenn es sie nicht gibt.
+
+        Zwoelf Hex-Stellen reichen: das ist kein Schutz gegen Manipulation,
+        sondern ein Beleg dafuer, DASS sich etwas geaendert hat und was.
+        """
+        try:
+            roh = self.ws.read(path).encode("utf-8", "replace")
+        except Exception:
+            return None
+        return hashlib.sha256(roh).hexdigest()[:12]
+
+    def _ist_gruen(self, name: str, result: str) -> bool:
+        if name == "check_syntax":
+            return result.rstrip().endswith(GREEN_SUFFIX_SYNTAX)
+        return result.startswith(GREEN_PREFIXES)
+
     async def call(self, name: str, arguments: dict) -> str:
-        """Fuehrt ein Werkzeug aus. Fehler werden als Text zurueckgegeben,
-        damit das Modell darauf reagieren kann statt abzubrechen."""
+        """Fuehrt ein Werkzeug aus und schreibt den Vorgang ins Protokoll.
+
+        Fehler werden als Text zurueckgegeben, damit das Modell darauf
+        reagieren kann statt abzubrechen.
+
+        Nebenher wird mitgefuehrt, welche Dateien seit der letzten bestandenen
+        Pruefung veraendert wurden. Genau daran haengt spaeter, ob 'finish'
+        durchgeht - das Modell kann diese Buchhaltung nicht beeinflussen, weil
+        sie hier passiert und nicht in seinem Text.
+        """
         if name not in self.allowed:
             grund = ("ist für diese Aufgabe nicht freigegeben"
                      if name in NAMES else "gibt es nicht")
             return (f"FEHLER: Unbekanntes Werkzeug '{name}' — {grund}. "
                     f"Erlaubt: {sorted(self.allowed)}")
+
+        vorher_written = len(self.written)
+        begonnen = time.monotonic()
         try:
             handler = getattr(self, f"_{name}")
-            return _clip(await handler(arguments))
+            result = _clip(await handler(arguments))
         except Exception as exc:
-            return f"FEHLER: {type(exc).__name__}: {exc}"
+            result = f"FEHLER: {type(exc).__name__}: {exc}"
+
+        ok = not result.startswith("FEHLER")
+        # Welche Dateien angefasst wurden, wird nicht aus den Argumenten
+        # geraten, sondern von den Werkzeugen selbst gemeldet.
+        beruehrt = list(dict.fromkeys(self.written[vorher_written:]))
+
+        aenderungen = []
+        for pfad in beruehrt:
+            alt = self._hashes.get(pfad)
+            neu = self._hash(pfad)
+            self._hashes[pfad] = neu
+            aenderungen.append({"pfad": pfad, "vorher": alt, "nachher": neu})
+
+        if ok and name in MODIFYING:
+            self.unverified.update(beruehrt)
+        elif ok and name in CHECKING and self._ist_gruen(name, result):
+            if name == "check_syntax":
+                # Belegt genau die eine Datei - und nur ihre Syntax.
+                geprueft = {str(arguments.get("path", "")).strip()}
+                self.unverified -= geprueft
+            else:
+                # Der Code ist als Ganzes gelaufen. Das ist ein Beleg ueber den
+                # aktuellen Stand, nicht ueber eine einzelne Datei.
+                # Einschraenkung: sehr grosse Projekte werden fuer die Sandbox
+                # gedeckelt, dann deckt der Lauf nicht jede Datei ab.
+                geprueft = set(self.unverified)
+                self.unverified.clear()
+            if geprueft:
+                self.belege.append({"nr": len(self.protokoll) + 1,
+                                    "werkzeug": name,
+                                    "abgedeckt": sorted(geprueft)})
+
+        self.protokoll.append({
+            "nr": len(self.protokoll) + 1,
+            "werkzeug": name,
+            "argumente": {k: _kurz(v) for k, v in (arguments or {}).items()},
+            "ok": ok,
+            "ms": int((time.monotonic() - begonnen) * 1000),
+            "dateien": aenderungen,
+        })
+        return result
+
+    def bericht(self) -> dict:
+        """Der maschinell erzeugte Beleg zum Lauf.
+
+        Bewusst nicht vom Modell formuliert: was hier steht, stammt aus der
+        Buchfuehrung von call() und laesst sich gegen das Protokoll pruefen.
+        """
+        return {
+            "schritte": len(self.protokoll),
+            "fehlgeschlagen": sum(1 for e in self.protokoll if not e["ok"]),
+            "geaendert": sorted({a["pfad"] for e in self.protokoll
+                                 for a in e["dateien"]}),
+            "belege": list(self.belege),
+            "ungeprueft": sorted(self.unverified),
+            "verifiziert": self.verified,
+        }
 
     # -------------------------------------------------------------- Werkzeuge
 
@@ -445,6 +573,11 @@ class Toolbox:
             return ("FEHLER: Kein Rückwärtsgang möglich — das Projekt hat noch "
                     "keine Historie.")
         self.written.clear()
+        # Der Stand ist wieder der zuletzt eingecheckte. Was vorher als
+        # ungeprueft offen stand, gibt es nicht mehr - es waere falsch, den
+        # Abschluss weiterhin daran zu hindern.
+        self.unverified.clear()
+        self._hashes.clear()
         return (f"Projekt auf Commit {sha} zurückgesetzt. "
                 "Alle Änderungen seitdem sind verworfen.")
 
@@ -597,8 +730,33 @@ class Toolbox:
         return f"Befehl {status}.\nAusgabe:\n{output or '(keine)'}"
 
     async def _finish(self, args) -> str:
-        self.finished = str(args.get("summary", "")).strip() or "Fertig."
-        return self.finished
+        """Abschluss - aber nur gegen Beleg.
+
+        Der haeufigste stille Fehlschlag eines Agenten ist nicht der Absturz,
+        sondern die Erfolgsmeldung ueber ungepruefte Arbeit. Deshalb wird hier
+        abgewiesen, solange seit der letzten Aenderung keine Pruefung
+        bestanden wurde. Die Ablehnung geht als gewoehnliches Werkzeugergebnis
+        zurueck; die Schleife laeuft weiter und das Modell kann nachliefern.
+
+        Nach FINISH_BLOCK_LIMIT Ablehnungen darf der Lauf trotzdem enden -
+        dann aber mit verified=False, und die Oberflaeche sagt das dazu. Ein
+        Agent, der die Pruefung nicht hinbekommt, soll das melden duerfen; er
+        soll es nur nicht als geprueft ausgeben.
+        """
+        summary = str(args.get("summary", "")).strip() or "Fertig."
+        if self.unverified and self.finish_blocked < FINISH_BLOCK_LIMIT:
+            self.finish_blocked += 1
+            offen = ", ".join(sorted(self.unverified))
+            rest = FINISH_BLOCK_LIMIT - self.finish_blocked
+            return ("FEHLER: Abschluss abgelehnt — seit der letzten Änderung "
+                    f"ist keine Prüfung bestanden worden. Ungeprüft: {offen}. "
+                    "Rufe check_syntax auf diesen Dateien auf und lass den "
+                    "Code mit run_python laufen, dann finish erneut. "
+                    f"(Noch {rest} Ablehnung(en), danach wird der Lauf als "
+                    "unbelegt beendet.)")
+        self.finished = summary
+        self.verified = not self.unverified
+        return summary
 
     # ------------------------------------------------------------ Konnektoren
 

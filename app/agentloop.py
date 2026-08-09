@@ -53,7 +53,12 @@ SYSTEM_PROMPT = (
     "- Wiederhole keinen Aufruf, der schon dasselbe Ergebnis geliefert hat.\n"
     "- Der Code laeuft ohne Netzwerk, ohne Eingabe (kein input()) und nur mit "
     "der Standardbibliothek. Er muss von selbst terminieren.\n"
-    "- Behaupte in finish nichts, was du nicht ausgefuehrt hast."
+    "- Behaupte in finish nichts, was du nicht ausgefuehrt hast.\n\n"
+    "Abschluss:\n"
+    "finish wird abgewiesen, solange du nach deiner letzten Aenderung keine "
+    "Pruefung bestanden hast. Das ist keine Ermahnung, sondern eine Sperre im "
+    "Werkzeug - Zureden hilft nicht, nur check_syntax und ein erfolgreicher "
+    "Lauf mit run_python oder run_command."
 )
 
 NUDGE = (
@@ -263,13 +268,38 @@ async def _finish(send, task, toolbox, step, seconds, executed) -> str:
     if getattr(toolbox, "pushed", None):
         await send("status", "Nach außen übertragen: " +
                    "; ".join(toolbox.pushed))
-    if not executed:
-        # Das Modell behauptet Erfolg, ohne den Code laufen gelassen zu haben.
-        # Das gehoert dazugesagt, statt es als geprueft zu verkaufen.
+
+    # Der Beleg stammt aus der Buchfuehrung der Toolbox, nicht aus dem Text
+    # des Modells. Faellt sie aus (aeltere Toolbox im Test), wird auf das
+    # gröbere 'executed' zurueckgefallen, statt nichts zu melden.
+    bericht = toolbox.bericht() if hasattr(toolbox, "bericht") else None
+    verified = bericht["verifiziert"] if bericht else executed
+
+    if bericht and bericht["belege"]:
+        await send("status", "Belegt durch: " + "; ".join(
+            f"Schritt {b['nr']} ({b['werkzeug']}) → {', '.join(b['abgedeckt'])}"
+            for b in bericht["belege"]))
+    if bericht and bericht["ungeprueft"]:
+        # Der Lauf ist durch die Ablehnungsgrenze gerutscht. Das ist der eine
+        # Fall, in dem 'fertig' und 'ungeprueft' zusammen auftreten - und
+        # genau dann muss es dastehen.
+        await send("error", "Ungeprüft geblieben: " +
+                   ", ".join(bericht["ungeprueft"]) +
+                   ". Die Zusammenfassung ist die Einschätzung des Agenten, "
+                   "kein Prüfergebnis.")
+    elif bericht and changed and not any(
+            b["werkzeug"] in ("run_python", "run_command")
+            for b in bericht["belege"]):
+        # Sperre bestanden, aber nur mit check_syntax. Dass eine Datei parst,
+        # heisst nicht, dass sie tut was sie soll - dieser Unterschied darf
+        # nicht in einem einzigen Haken verschwinden.
+        await send("status", "Belegt ist nur die Syntax — der Code wurde nicht "
+                             "ausgeführt.")
+    elif not verified:
         await send("error", "Hinweis: Der Agent hat den Code nicht ausgeführt. "
                             "Die Zusammenfassung ist seine eigene Einschätzung, "
                             "kein Testergebnis.")
 
     await send("done", f"{summary}{commit}", ok=True, exit=0,
-               attempts=step, seconds=seconds, verified=executed)
+               attempts=step, seconds=seconds, verified=verified)
     return "ok"
