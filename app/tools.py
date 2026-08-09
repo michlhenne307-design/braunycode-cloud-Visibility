@@ -21,6 +21,7 @@ import time
 
 import connectors
 import diagnostics
+import testimpact
 
 MAX_OUTPUT = 4000        # Zeichen, die ein Werkzeugergebnis zurueckgeben darf
 MAX_SEARCH_HITS = 25
@@ -138,6 +139,15 @@ def base_schema() -> list[dict]:
               ["path", "old_name", "new_name"]),
 
         # ---------------------------------------------------------- Prüfen
+        _tool("affected_tests",
+              "Nennt die Testdateien, die den geänderten Code über Importe "
+              "erreichen. Ohne Angabe werden die in diesem Lauf geänderten "
+              "Dateien genommen. Damit läuft die kurze Prüfung statt der "
+              "ganzen Suite.",
+              {"paths": {"type": "string",
+                         "description": "Optional, kommagetrennt. Leer lassen "
+                                        "für die selbst geänderten Dateien."}},
+              []),
         _tool("check_syntax",
               "Prüft eine Python-Datei auf Syntaxfehler, ohne sie auszuführen. "
               "Kostet nichts — vor jedem Lauf sinnvoll.",
@@ -599,6 +609,34 @@ class Toolbox:
         self._hashes.clear()
         return (f"Projekt auf Commit {sha} zurückgesetzt. "
                 "Alle Änderungen seitdem sind verworfen.")
+
+    async def _affected_tests(self, args) -> str:
+        roh = str(args.get("paths", "")).strip()
+        if roh:
+            geaendert = [p.strip() for p in roh.split(",") if p.strip()]
+        else:
+            # Der uebliche Fall: was dieser Lauf angefasst hat. Das Modell muss
+            # sich nicht merken, welche Dateien das waren.
+            geaendert = sorted(set(self.written))
+        if not geaendert:
+            return ("Noch nichts geändert — es gibt nichts einzugrenzen. "
+                    "Gib 'paths' an, wenn du trotzdem wissen willst, welche "
+                    "Tests eine bestimmte Datei erreichen.")
+
+        dateien = await asyncio.to_thread(self._alle_python)
+        return await asyncio.to_thread(testimpact.bericht, dateien, geaendert)
+
+    def _alle_python(self) -> dict[str, str]:
+        """Alle lesbaren Python-Dateien des Projekts, fuer den Importgraphen."""
+        dateien: dict[str, str] = {}
+        for rel in self.ws.list_files():
+            if not rel.endswith(".py"):
+                continue
+            try:
+                dateien[rel] = self.ws.read(rel)
+            except Exception:
+                continue          # unlesbar oder binaer - fuer den Graph egal
+        return dateien
 
     async def _check_syntax(self, args) -> str:
         path = str(args.get("path", "")).strip()

@@ -759,7 +759,9 @@ print("\n[22] Werkzeugkasten")
 import tools  # noqa: E402
 
 sch = tools.schema()
-check("vollständiger Werkzeugkasten", len(sch) == 16, len(sch))
+check("vollständiger Werkzeugkasten",
+      {t["function"]["name"] for t in sch} == tools.BASE_NAMES,
+      sorted({t["function"]["name"] for t in sch} ^ tools.BASE_NAMES))
 check("OpenAI-Format", all(t["type"] == "function" and "name" in t["function"]
                           and "parameters" in t["function"] for t in sch))
 check("Pflichtfelder deklariert",
@@ -1419,7 +1421,9 @@ fws = ws_mod.Workspace(tempfile.mkdtemp())
 fws.write("main.py", "print(1)\n")
 
 leer = tools.Toolbox(fws)
-check("ohne Konnektoren nur Basiswerkzeuge", len(leer.schema()) == 16, len(leer.schema()))
+check("ohne Konnektoren nur Basiswerkzeuge",
+      {t["function"]["name"] for t in leer.schema()} == tools.BASE_NAMES,
+      sorted({t["function"]["name"] for t in leer.schema()} ^ tools.BASE_NAMES))
 check("schema() ohne Argument kennt keine Konnektoren",
       {t["function"]["name"] for t in tools.schema()} == tools.BASE_NAMES)
 check("fetch_url nicht aufrufbar",
@@ -1427,7 +1431,8 @@ check("fetch_url nicht aufrufbar",
       .startswith("FEHLER"))
 
 mit = tools.Toolbox(fws, enabled=["fetch_url"])
-check("freigeschalteter Konnektor erscheint", len(mit.schema()) == 17, len(mit.schema()))
+check("freigeschalteter Konnektor erscheint",
+      len(mit.schema()) == len(tools.BASE_NAMES) + 1, len(mit.schema()))
 check("Konnektor steht im Schema",
       "fetch_url" in {t["function"]["name"] for t in mit.schema()})
 check("nicht freigeschalteter Konnektor fehlt",
@@ -1456,7 +1461,7 @@ check("restrict kann keinen Konnektor freischalten",
       "fetch_url" not in weit.allowed and "git_push" not in weit.allowed,
       sorted(weit.allowed))
 check("leeres restrict ändert nichts",
-      len(tools.Toolbox(fws).schema()) == 16)
+      len(tools.Toolbox(fws).schema()) == len(tools.BASE_NAMES))
 
 # Skill im Agentenlauf
 def drive_skill(script, skill, files=None):
@@ -1979,7 +1984,7 @@ verworfen = tbox.restrict(["raed_file", "wrtie_file"])   # beides Tippfehler
 check("unbekannte Werkzeuge werden gemeldet",
       verworfen == ["raed_file", "wrtie_file"], verworfen)
 check("bei nur Tippfehlern wird gar nicht eingeschränkt",
-      len(tbox.schema()) == 16, len(tbox.schema()))
+      len(tbox.schema()) == len(tools.BASE_NAMES), len(tbox.schema()))
 check("der Agent bleibt handlungsfähig", "read_file" in tbox.allowed)
 
 tbox2 = tools.Toolbox(fws)
@@ -2267,6 +2272,95 @@ check("roter Lauf bleibt trotz Befund ungeprüft",
 _erg = asyncio.run(_tb.call("search", {}))
 check("bei reinem Werkzeugfehler kein Befund-Anhang",
       "Befund:" not in _erg, _erg)
+
+
+# ------------------------------------------------------------- Testauswahl
+print("\n[35] Testauswahl über den Importgraphen")
+
+import testimpact  # noqa: E402
+
+_projekt = {
+    "pkg/__init__.py":   "",
+    "pkg/kern.py":       "def rechne(x):\n    return x * 2\n",
+    "pkg/mittel.py":     "from .kern import rechne\ndef doppelt(x):\n    return rechne(x)\n",
+    "app.py":            "import pkg.mittel\n",
+    "einsam.py":         "import json\n",
+    "test_kern.py":      "from pkg.kern import rechne\n",
+    "test_mittel.py":    "from pkg.mittel import doppelt\n",
+    "tests/test_app.py": "import app\n",
+    "test_einsam.py":    "import einsam\n",
+}
+
+check("Modulname aus Pfad", testimpact.modulname("pkg/mod.py") == "pkg.mod")
+check("__init__ wird zum Paket", testimpact.modulname("pkg/__init__.py") == "pkg")
+check("Testdatei an Präfix erkannt", testimpact.ist_test("test_x.py"))
+check("Testdatei an Suffix erkannt", testimpact.ist_test("x_test.py"))
+check("Testdatei am Ordner erkannt", testimpact.ist_test("tests/irgendwas.py"))
+check("normale Datei ist kein Test", not testimpact.ist_test("pkg/kern.py"))
+
+_g = testimpact.graph(_projekt)
+check("relativer Import wird aufgelöst",
+      "pkg/kern.py" in _g["pkg/mittel.py"], _g["pkg/mittel.py"])
+check("punktierter Import wird aufgelöst",
+      "pkg/mittel.py" in _g["app.py"], _g["app.py"])
+check("Fremdimport erzeugt keine Kante", _g["einsam.py"] == set(), _g["einsam.py"])
+
+_t = testimpact.betroffene_tests(_projekt, ["pkg/kern.py"])
+check("Auswahl reicht über zwei Stufen",
+      _t == ["test_kern.py", "test_mittel.py", "tests/test_app.py"], _t)
+_t = testimpact.betroffene_tests(_projekt, ["einsam.py"])
+check("unabhängige Datei zieht nur ihren Test",
+      _t == ["test_einsam.py"], _t)
+check("das ist echte Einsparung, nicht die ganze Suite",
+      len(_t) < len([r for r in _projekt if testimpact.ist_test(r)]), _t)
+
+# Ein Importzyklus darf die Rueckwaertssuche nicht endlos drehen lassen.
+_zyklus = {"a.py": "import b\n", "b.py": "import a\n", "test_a.py": "import a\n"}
+check("Importzyklus hängt nicht",
+      testimpact.betroffene_tests(_zyklus, ["a.py"]) == ["test_a.py"])
+
+# Eine kaputte Datei verliert ihre Kanten - die Auswahl wird dadurch ZU KURZ.
+# Genau das muss dastehen, sonst wirkt eine unvollstaendige Liste wie ein
+# Ergebnis.
+_kaputt = dict(_projekt, **{"pkg/mittel.py": "from .kern import (\n"})
+_bericht = testimpact.bericht(_kaputt, ["pkg/kern.py"])
+check("unlesbare Datei wird beim Namen genannt",
+      "pkg/mittel.py" in _bericht and "ACHTUNG" in _bericht, _bericht)
+check("und die Auswahl wird als unvollständig bezeichnet",
+      "unvollständig" in _bericht, _bericht)
+check("der Graph bricht dabei nicht ab",
+      "test_kern.py" in _bericht, _bericht)
+
+check("Bericht nennt die Grenze der Methode",
+      "importlib" in testimpact.bericht(_projekt, ["pkg/kern.py"]))
+
+_ohne = {"a.py": "x = 1\n"}
+check("Projekt ohne Tests wird als solches gemeldet",
+      "keine erkennbaren Testdateien" in testimpact.bericht(_ohne, ["a.py"]),
+      testimpact.bericht(_ohne, ["a.py"]))
+
+_waise = {"a.py": "x = 1\n", "test_b.py": "import json\n"}
+check("Code ohne erreichenden Test wird benannt",
+      "Kein Test erreicht" in testimpact.bericht(_waise, ["a.py"]),
+      testimpact.bericht(_waise, ["a.py"]))
+
+# Verdrahtung als Werkzeug
+_w = ws_mod.Workspace(tempfile.mkdtemp())
+for _rel, _inhalt in _projekt.items():
+    _w.write(_rel, _inhalt)
+_tb = tools.Toolbox(_w)
+check("ohne Änderung sagt das Werkzeug das",
+      "Noch nichts geändert" in asyncio.run(_tb.call("affected_tests", {})))
+asyncio.run(_tb.call("edit_file", {"path": "pkg/kern.py",
+                                   "old_text": "x * 2", "new_text": "x * 3"}))
+_erg = asyncio.run(_tb.call("affected_tests", {}))
+check("Werkzeug nimmt von selbst die geänderten Dateien",
+      "pkg/kern.py" in _erg and "test_mittel.py" in _erg, _erg)
+_erg = asyncio.run(_tb.call("affected_tests", {"paths": "einsam.py"}))
+check("gezielte Abfrage grenzt richtig ein",
+      "test_einsam.py" in _erg and "test_kern.py" not in _erg, _erg)
+check("affected_tests belegt nichts",
+      _tb.unverified == {"pkg/kern.py"}, _tb.unverified)
 
 
 print(f"\n=== {ok} bestanden, {fail} fehlgeschlagen ===")
