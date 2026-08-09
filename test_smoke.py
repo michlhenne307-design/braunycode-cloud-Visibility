@@ -4,6 +4,7 @@ import json
 import os
 import struct
 import shutil
+import textwrap
 import subprocess
 import sys
 
@@ -2163,6 +2164,110 @@ check("'source' würde das Passwort verfälschen",
       mit_source != "geheim$HOME-passwort", mit_source)
 check("zeilenweises Lesen erhält es wörtlich",
       zeilenweise == "geheim$HOME-passwort", zeilenweise)
+
+# ---------------------------------------------------------------- Diagnostik
+print("\n[34] Diagnostik: Rohausgabe zu Befunden")
+
+import diagnostics  # noqa: E402
+
+# Echte Python-Ausgabe erzeugen statt eine erfundene nachzubauen: sonst testet
+# man nur, dass das eigene Beispiel zum eigenen Muster passt.
+def _stderr_von(code):
+    ordner = tempfile.mkdtemp()
+    ziel = os.path.join(ordner, "prog.py")
+    with open(ziel, "w", encoding="utf-8") as fh:
+        fh.write(textwrap.dedent(code))
+    lauf = subprocess.run([sys.executable, ziel], capture_output=True, text=True)
+    return lauf.stderr.replace(ordner, "/app")
+
+b = diagnostics.parse(_stderr_von("""
+    def teile(a, b):
+        return a / b
+    def start():
+        return teile(1, 0)
+    start()
+"""))
+check("Traceback ergibt genau einen Befund", len(b) == 1, b)
+check("Kategorie aus dem Ausnahmetyp", b and b[0].kategorie == diagnostics.RUNTIME, b)
+check("letzter Rahmen, nicht der erste", b and b[0].zeile == 3, b)
+check("Symbol des letzten Rahmens", b and b[0].symbol == "teile", b)
+check("Containerpfad wird projektrelativ", b and b[0].datei == "prog.py", b)
+
+# Der haeufigste Fehler direkt nach einer Aenderung - und er hat KEINEN
+# Traceback-Kopf. Genau daran ist die erste Fassung gescheitert.
+b = diagnostics.parse(_stderr_von("def f(:\n    pass\n"))
+check("SyntaxError ohne Traceback-Kopf wird erkannt", len(b) == 1, b)
+check("und als SYNTAX eingeordnet", b and b[0].kategorie == diagnostics.SYNTAX, b)
+
+b = diagnostics.parse(_stderr_von("def f():\npass\n"))
+check("IndentationError zählt als SYNTAX",
+      len(b) == 1 and b[0].kategorie == diagnostics.SYNTAX, b)
+
+# Kaputtes Modul beim Import: der SyntaxError steht INNERHALB eines Tracebacks.
+ordner = tempfile.mkdtemp()
+os.makedirs(os.path.join(ordner, "pkg"))
+open(os.path.join(ordner, "pkg", "__init__.py"), "w").close()
+with open(os.path.join(ordner, "pkg", "kaputt.py"), "w") as fh:
+    fh.write("def g(:\n")
+with open(os.path.join(ordner, "prog.py"), "w") as fh:
+    fh.write("import pkg.kaputt\n")
+roh = subprocess.run([sys.executable, os.path.join(ordner, "prog.py")],
+                     capture_output=True, text=True).stderr.replace(ordner, "/app")
+b = diagnostics.parse(roh)
+check("SyntaxError im Traceback zählt nicht doppelt", len(b) == 1, b)
+check("er zeigt auf die kaputte Datei, nicht den Importeur",
+      b and b[0].datei == "pkg/kaputt.py", b)
+
+b = diagnostics.parse(
+    "SyntaxError in app/x.py, Zeile 12: invalid syntax", "check_syntax")
+check("deutsche check_syntax-Meldung wird verstanden",
+      len(b) == 1 and b[0].zeile == 12 and b[0].datei == "app/x.py", b)
+
+b = diagnostics.parse("FEHLER: 'pattern' fehlt.", "tools")
+check("Werkzeugfehler ohne Ausnahmetyp wird TOOL",
+      len(b) == 1 and b[0].kategorie == diagnostics.TOOL, b)
+
+b = diagnostics.parse("FEHLER: ModuleNotFoundError: No module named 'x'", "tools")
+check("Werkzeugfehler mit Ausnahmetyp behält die Kategorie",
+      len(b) == 1 and b[0].kategorie == diagnostics.IMPORT, b)
+
+check("leere Ausgabe ergibt keine Befunde", diagnostics.parse("") == [])
+check("erfolgreiche Ausgabe ergibt keine Befunde",
+      diagnostics.parse("Lauf erfolgreich.\nAusgabe:\nfertig") == [])
+# Freier Text, der wie eine Ausnahme aussieht, darf keinen Befund erfinden.
+check("Fließtext erzeugt keinen Befund",
+      diagnostics.parse("Hinweis: ValueError kann hier auftreten") == [])
+
+f = diagnostics.Finding(kategorie=diagnostics.NAME, schwere=diagnostics.FEHLER,
+                        nachricht="name 'x' is not defined", typ="NameError",
+                        datei="a.py", zeile=9, symbol="f")
+check("Fingerabdruck ohne Zeilennummer", "9" not in f.fingerprint(), f.fingerprint())
+check("Fingerabdruck ohne freien Text",
+      "not defined" not in f.fingerprint(), f.fingerprint())
+check("Fingerabdruck trägt Datei und Symbol",
+      "a.py" in f.fingerprint() and "|f" in f.fingerprint(), f.fingerprint())
+
+# Verdrahtung: der Befund muss beim Modell ankommen, nicht nur im Protokoll.
+async def _rot(_dateien, _entry=None, command=None):
+    return 1, ('Traceback (most recent call last):\n'
+               '  File "/app/main.py", line 3, in teile\n    return a / b\n'
+               'ZeroDivisionError: division by zero')
+
+_w = ws_mod.Workspace(tempfile.mkdtemp())
+_tb = tools.Toolbox(_w, run_sandbox=_rot)
+asyncio.run(_tb.call("write_file", {"path": "main.py", "content": "x = 1\n"}))
+_erg = asyncio.run(_tb.call("run_python", {"path": "main.py"}))
+check("Befund hängt am Werkzeugergebnis", "Befund:" in _erg, _erg[-120:])
+check("Befund nennt Datei und Zeile", "main.py:3" in _erg, _erg[-120:])
+check("Befund steht im Protokoll",
+      any(e["befunde"] for e in _tb.protokoll), _tb.protokoll)
+check("roter Lauf bleibt trotz Befund ungeprüft",
+      _tb.unverified == {"main.py"}, _tb.unverified)
+
+_erg = asyncio.run(_tb.call("search", {}))
+check("bei reinem Werkzeugfehler kein Befund-Anhang",
+      "Befund:" not in _erg, _erg)
+
 
 print(f"\n=== {ok} bestanden, {fail} fehlgeschlagen ===")
 sys.exit(1 if fail else 0)

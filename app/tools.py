@@ -20,6 +20,7 @@ import shlex
 import time
 
 import connectors
+import diagnostics
 
 MAX_OUTPUT = 4000        # Zeichen, die ein Werkzeugergebnis zurueckgeben darf
 MAX_SEARCH_HITS = 25
@@ -261,6 +262,9 @@ class Toolbox:
         self.protokoll: list[dict] = []
         # Bestandene Pruefungen mit dem, was sie abgedeckt haben.
         self.belege: list[dict] = []
+        # Alle erkannten Befunde des Laufs, in Reihenfolge. Grundlage fuer
+        # das Fehlergedaechtnis und fuer die gezielte Reparatur.
+        self.befunde: list = []
         # Letzter bekannter Inhalts-Fingerabdruck je Datei.
         self._hashes: dict[str, str | None] = {}
         self.finish_blocked = 0
@@ -389,6 +393,13 @@ class Toolbox:
                                     "werkzeug": name,
                                     "abgedeckt": sorted(geprueft)})
 
+        # Rohausgabe zu Befunden verdichten. Ein Traceback zwingt das Modell
+        # sonst, sich Datei und Zeile selbst herauszusuchen - und dabei raet
+        # es gern den ersten Rahmen statt den letzten.
+        gescheitert = not ok or (name in CHECKING
+                                 and not self._ist_gruen(name, result))
+        befunde = diagnostics.parse(result, quelle=name) if gescheitert else []
+
         self.protokoll.append({
             "nr": len(self.protokoll) + 1,
             "werkzeug": name,
@@ -396,7 +407,15 @@ class Toolbox:
             "ok": ok,
             "ms": int((time.monotonic() - begonnen) * 1000),
             "dateien": aenderungen,
+            "befunde": [f.to_dict() for f in befunde],
         })
+        self.befunde.extend(befunde)
+
+        # Nur anhaengen, wenn der Befund mehr weiss als die Meldung selbst.
+        # Bei "FEHLER: 'pattern' fehlt." waere die Wiederholung nur Laerm.
+        ergiebig = [f for f in befunde if f.datei or f.typ]
+        if ergiebig:
+            result = f"{result}\n\nBefund:\n{diagnostics.zusammenfassen(ergiebig)}"
         return result
 
     def bericht(self) -> dict:
