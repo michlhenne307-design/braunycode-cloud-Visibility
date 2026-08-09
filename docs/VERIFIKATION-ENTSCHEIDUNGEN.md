@@ -24,7 +24,8 @@ klein aus, weil fast alles in denselben Zweig läuft.
 
 ## Gebaut
 
-Stand: elf Commits auf `claude/ki-firmensystem-iphone-v7yxiu`, 726 Tests.
+Stand: 14 Commits auf `claude/ki-firmensystem-iphone-v7yxiu`, 746 Tests.
+Zahlen altern — maßgeblich ist der Branch, nicht diese Zeile.
 **Nichts davon ist je gegen ein echtes Modell oder eine echte Sandbox
 gelaufen** — das gilt für jede Zeile dieses Abschnitts.
 
