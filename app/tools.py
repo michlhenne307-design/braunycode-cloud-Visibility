@@ -310,6 +310,11 @@ class Toolbox:
         # zu holen frisst bei einem kleinen Modell das halbe Fenster.
         offset = max(1, _als_zahl(args.get("offset"), 1))
         limit = _als_zahl(args.get("limit"), 0)
+        if gesamt == 0:
+            # Sonst schlaegt gleich die Offset-Pruefung zu ("Zeile 1 gibt es
+            # nicht") und das Modell sucht den Fehler beim Pfad statt zu
+            # begreifen, dass die Datei einfach leer ist.
+            return f"{path} ist leer (0 Zeilen)."
         if offset > gesamt:
             # Sonst kaeme ein leerer Rumpf mit umgedrehtem Bereich heraus
             # ("Zeilen 20-19 von 10") - das liest sich wie eine leere Datei.
@@ -354,19 +359,22 @@ class Toolbox:
         if not alt:
             return "FEHLER: 'old_text' ist leer — dafür write_file benutzen."
 
+        # ws.read zuerst: es setzt die Groessengrenze durch. Erst danach die
+        # strikte Pruefung - sonst wuerde eine riesige, ungueltig kodierte
+        # Datei komplett gelesen und dekodiert, nur um anschliessend an der
+        # Groesse zu scheitern.
+        text = self.ws.read(path)
+
         # ws.read ersetzt ungueltige Bytes durch U+FFFD. Beim Zurueckschreiben
         # waeren sie dauerhaft verloren - und zwar in der ganzen Datei, nicht
         # nur an der bearbeiteten Stelle. Ein Werkzeug, das einen Ausschnitt
         # aendern soll, darf den Rest nicht stillschweigend beschaedigen.
-        roh = self.ws.resolve(path)
-        if roh.is_file():
+        if "�" in text:
             try:
-                roh.read_text(encoding="utf-8")
+                self.ws.resolve(path).read_bytes().decode("utf-8")
             except UnicodeDecodeError:
                 return (f"FEHLER: {path} ist nicht UTF-8. edit_file würde beim "
                         "Zurückschreiben Zeichen zerstören.")
-
-        text = self.ws.read(path)
         anzahl = text.count(alt)
         if anzahl == 0:
             return (f"FEHLER: Der Text kommt in {path} nicht vor. "
@@ -461,6 +469,14 @@ class Toolbox:
 
         nur = str(args.get("glob", "")).strip()
         umfeld = min(5, max(0, _als_zahl(args.get("context"), 0)))
+        # In einen Thread: das Durchlesen aller Dateien ist blockierend, und
+        # ein vom Modell gelieferter Ausdruck kann katastrophal zurueckspringen
+        # (ReDoS). Beides wuerde sonst den ganzen Webserver anhalten - auch
+        # /healthz und jede andere laufende Sitzung.
+        return await asyncio.to_thread(self._suchen, pattern, nur, umfeld, query)
+
+    def _suchen(self, pattern, nur: str, umfeld: int, query: str) -> str:
+        """Der blockierende Teil von _search. Laeuft in einem Thread."""
         hits: list[str] = []
         for rel in self.ws.list_files():
             if nur and not _passt(rel, nur):
@@ -511,7 +527,9 @@ class Toolbox:
     async def _outline(self, _args) -> str:
         if self.index_builder is None:
             return "Kein Index verfügbar."
-        index = self.index_builder(self.ws)
+        # Wie in _symbol_info: der Indexaufbau liest alle Dateien und ist
+        # blockierend - im Event-Loop wuerde er jede andere Sitzung anhalten.
+        index = await asyncio.to_thread(self.index_builder, self.ws)
         text = index.overview()
         return text or "(keine Symbole gefunden)"
 
@@ -588,13 +606,11 @@ class Toolbox:
         url = str(args.get("url", "")).strip()
         if not url:
             return "FEHLER: 'url' fehlt."
-        import asyncio
         text = await asyncio.to_thread(connectors.fetch, url)
         self.fetched.append(url)
         return text
 
     async def _git_push(self, args) -> str:
-        import asyncio
         ergebnis = await asyncio.to_thread(
             connectors.git_push, self.ws,
             str(args.get("branch", "")).strip(),

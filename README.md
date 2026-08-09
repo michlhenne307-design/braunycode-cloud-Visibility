@@ -119,6 +119,7 @@ Der Installer schreibt `~/braunycode/brauny.env` (Modus 600, nicht im Repo):
 | `BRAUNY_MAX_STEPS` | `12` | Werkzeugrunden pro Auftrag |
 | `BRAUNY_SKILLS` | `~/braunycode/skills` | Verzeichnis mit den Skill-Dateien |
 | `BRAUNY_FETCH` | `0` | `1` erlaubt dem Agenten, Webseiten zu lesen |
+| `BRAUNY_FETCH_TRUST_ENV` | `0` | `1` beachtet Proxy-Variablen — schwächt den Rebinding-Schutz |
 | `BRAUNY_GIT_REMOTE` | leer | Repository, auf das gepusht werden darf |
 | `BRAUNY_GIT_TOKEN` | leer | Token dafür, bleibt in der 600er-Datei |
 | `BRAUNY_GIT_BRANCH_PREFIX` | `brauny/` | Präfix aller vom Agenten erzeugten Branches |
@@ -346,7 +347,9 @@ Kommandozeilenargument (dort läse ihn jedes `ps`) und nie in `.git/config`
 (dort bliebe er auf der Platte). Sollte er trotzdem je in einer Ausgabe
 auftauchen, ersetzt ihn ein letzter Filter durch `***`.
 
-Gepusht wird ausschließlich auf `brauny/<name>` — **nie auf `main`**.
+Gepusht wird ausschließlich auf `brauny/<name>` — **nie auf `main`**. Das
+Präfix stammt aus `BRAUNY_GIT_BRANCH_PREFIX`; wer es leert, gibt diesen
+Schutz auf.
 
 ### `fetch_url` — Webseiten lesen
 
@@ -581,7 +584,7 @@ python3 -m venv venv && venv/bin/pip install -r requirements.txt
 venv/bin/python test_smoke.py
 ```
 
-**519 Fälle in 32 Abschnitten, ohne Docker und ohne Ollama.** Modell, Sandbox
+**544 Fälle in 33 Abschnitten, ohne Docker und ohne Ollama.** Modell, Sandbox
 und Werkzeugantworten werden gescriptet hineingereicht.
 
 Abgedeckt sind unter anderem:
@@ -651,7 +654,7 @@ als Text zurück, und der Aufruf des Cloud-Metadaten-Dienstes
 gefälschter Namensauflösung.
 
 **Nicht verifiziert** (Stand dieser Fassung): Es gab noch keinen
-End-to-End-Lauf mit echtem Modell und echtem Docker. Die 519 Tests laufen
+End-to-End-Lauf mit echtem Modell und echtem Docker. Die 544 Tests laufen
 gegen gescriptete Modellantworten — sie belegen, dass die Schleife korrekt
 arbeitet, nicht dass ein bestimmtes Modell gute Ergebnisse liefert. Ob die
 Skills die Ergebnisse eines 7B-Modells **messbar** verbessern, ist nicht

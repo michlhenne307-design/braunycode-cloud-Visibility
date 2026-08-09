@@ -32,6 +32,11 @@ from urllib.parse import urlparse
 FETCH_ENABLED = os.environ.get("BRAUNY_FETCH", "0").strip() == "1"
 FETCH_TIMEOUT = int(os.environ.get("BRAUNY_FETCH_TIMEOUT", "20"))
 FETCH_MAX_BYTES = int(os.environ.get("BRAUNY_FETCH_MAX_BYTES", "200000"))
+# Proxy-Variablen werden bewusst NICHT beachtet: ein Proxy loest den Namen
+# selbst noch einmal auf und koennte an der Vorabpruefung vorbei auf ein
+# internes Ziel verbinden. Wer hinter einem Zwangsproxy sitzt, setzt das
+# hier auf 1 - und nimmt die schwaechere Zusicherung in Kauf.
+FETCH_TRUST_ENV = os.environ.get("BRAUNY_FETCH_TRUST_ENV", "0").strip() == "1"
 
 GIT_REMOTE = os.environ.get("BRAUNY_GIT_REMOTE", "").strip()
 GIT_TOKEN = os.environ.get("BRAUNY_GIT_TOKEN", "").strip()
@@ -107,8 +112,15 @@ def check_url(url: str, resolver=_resolve) -> str:
         raise ConnectorError("Nur http und https sind erlaubt.")
     if not parsed.hostname:
         raise ConnectorError("Adresse ohne Hostnamen.")
-    if parsed.port is not None and parsed.port not in ALLOWED_PORTS:
-        raise ConnectorError(f"Port {parsed.port} ist nicht erlaubt "
+    # parsed.port wirft ValueError bei 'https://beispiel.de:abc'. Ohne diesen
+    # Fang verliesse ein roher ValueError die Konnektor-Grenze, statt als
+    # verstaendliche Meldung beim Modell anzukommen.
+    try:
+        port = parsed.port
+    except ValueError:
+        raise ConnectorError("Ungültige Portangabe in der Adresse.") from None
+    if port is not None and port not in ALLOWED_PORTS:
+        raise ConnectorError(f"Port {port} ist nicht erlaubt "
                              f"(nur {' und '.join(map(str, ALLOWED_PORTS))}).")
 
     for adresse in resolver(parsed.hostname):
@@ -125,12 +137,17 @@ PROXY_VARS = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
 
 
 def proxy_aktiv() -> bool:
-    """Laeuft der ausgehende Verkehr ueber einen Proxy?
+    """Kann ein Proxy zwischen uns und dem Ziel stehen?
 
     Dann ist die Gegenstelle der Proxy - oft 127.0.0.1 - und nicht der
-    Zielserver. Die Peer-Pruefung wuerde jede Anfrage verwerfen.
+    Zielserver; die Peer-Pruefung wuerde jede Anfrage verwerfen.
+
+    Standardmaessig ignoriert fetch die Proxy-Variablen (FETCH_TRUST_ENV=0).
+    Das ist die sichere Einstellung: ein Proxy loest den Namen selbst noch
+    einmal auf und koennte damit an der Pruefung vorbei auf ein internes Ziel
+    verbinden. Auf einem gewoehnlichen Server gibt es ohnehin keinen Proxy.
     """
-    return any(os.environ.get(name) for name in PROXY_VARS)
+    return FETCH_TRUST_ENV and any(os.environ.get(name) for name in PROXY_VARS)
 
 
 def peer_pruefen(antwort) -> None:
@@ -194,7 +211,8 @@ def fetch(url: str, resolver=_resolve) -> str:
     import httpx
 
     geprueft = check_url(url, resolver)
-    with httpx.Client(timeout=FETCH_TIMEOUT, follow_redirects=False) as client:
+    with httpx.Client(timeout=FETCH_TIMEOUT, follow_redirects=False,
+                      trust_env=FETCH_TRUST_ENV) as client:
         with client.stream("GET", geprueft,
                            headers={"User-Agent": "BraunyCode"}) as antwort:
             # Zweite Verteidigungslinie gegen DNS-Rebinding: erst pruefen,
@@ -251,6 +269,15 @@ def git_push(ws, branch: str = "", message: str = "") -> str:
     if not (GIT_REMOTE and GIT_TOKEN):
         raise ConnectorError("git_push ist nicht konfiguriert "
                              "(BRAUNY_GIT_REMOTE und BRAUNY_GIT_TOKEN).")
+    # Der Remote wird woertlich in .git/config geschrieben. Steckt darin ein
+    # Token wie https://ghp_xyz@host/repo.git, liegt es dauerhaft auf der
+    # Platte - und scrub() entfernt nur BRAUNY_GIT_TOKEN, nicht dieses.
+    # Zugangsdaten kommen ausschliesslich aus BRAUNY_GIT_TOKEN.
+    zerlegt = urlparse(GIT_REMOTE)
+    if zerlegt.scheme in ("http", "https") and (zerlegt.username or zerlegt.password):
+        raise ConnectorError(
+            "BRAUNY_GIT_REMOTE enthält Zugangsdaten in der URL. Bitte die "
+            "reine Adresse eintragen — das Token gehört in BRAUNY_GIT_TOKEN.")
     if not ws.git_ready():
         raise ConnectorError("Kein Git-Projekt vorhanden.")
 

@@ -22,6 +22,7 @@ Format (Markdown mit einfachem Kopf):
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -31,6 +32,8 @@ MAX_SKILL_BYTES = 8000
 MAX_SKILLS = 50
 # Nur diese Kopfzeilen werden gelesen; alles andere wird ignoriert.
 FIELDS = ("name", "beschreibung", "ausloeser", "werkzeuge")
+
+log = logging.getLogger("brauny.skills")
 
 FRONTMATTER = re.compile(r"\A---\s*\n(.*?)\n---\s*\n(.*)\Z", re.S)
 WORD = re.compile(r"[a-zäöüß0-9_]+")
@@ -107,8 +110,11 @@ def load(directory) -> list[Skill]:
             # Hochfahren hindern.
             skill = parse(pfad.read_text(encoding="utf-8", errors="replace"),
                           pfad.name)
-        except Exception:
-            # Ein kaputter Skill darf die anderen nicht mitreissen.
+        except Exception as exc:
+            # Ein kaputter Skill darf die anderen nicht mitreissen - aber der
+            # Betreiber soll erfahren, warum einer fehlt.
+            log.warning("Skill-Datei %s uebersprungen: %s: %s",
+                        pfad.name, type(exc).__name__, exc)
             continue
         if skill is not None:
             gefunden.append(skill)
@@ -122,10 +128,16 @@ def score(task: str, skill: Skill) -> int:
     zuenden. Der Name zaehlt doppelt, weil er meist deutlicher ist als ein
     einzelnes Ausloeserwort.
     """
-    woerter = set(WORD.findall((task or "").lower()))
+    klein = (task or "").lower()
+    woerter = set(WORD.findall(klein))
     if not woerter:
         return 0
-    treffer = sum(1 for wort in skill.ausloeser if wort in woerter)
+    # Mehrwortige Ausloeser ("leerer test") stehen nach dem Komma-Split als
+    # EIN Eintrag mit Leerzeichen da und koennen in einer Menge einzelner
+    # Woerter nie vorkommen - sie haetten also nie gezuendet, ohne dass
+    # irgendwo ein Fehler auftaucht. Sie werden deshalb als Wortfolge gesucht.
+    treffer = sum(1 for wort in skill.ausloeser
+                  if (wort in klein if " " in wort else wort in woerter))
     if skill.name in woerter:
         treffer += 2
     return treffer

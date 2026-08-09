@@ -65,9 +65,22 @@ write_files:
       exec > >(tee -a /var/log/braunycode-setup.log) 2>&1
       echo "=== BraunyCode-Einrichtung gestartet: $(date -Is) ==="
 
-      set -a
-      . /etc/braunycode.setup
-      set +a
+      # Die Datei wird ZEILENWEISE gelesen, nicht mit '.' eingebunden.
+      # Ein 'source' wuerde jeden Wert als Bash auswerten: ein Passwort mit
+      # '$' waere still ein anderes (der Nutzer kaeme nicht mehr rein), und
+      # eines mit $(...) oder Backticks wuerde beim Systemstart als root
+      # ausgefuehrt. Genau in diese Datei soll aber ein selbst ausgedachtes
+      # Passwort eingetragen werden.
+      while IFS= read -r zeile || [ -n "$zeile" ]; do
+        case "$zeile" in
+          ''|'#'*) continue ;;
+          BRAUNY_*=*) : ;;
+          *) continue ;;
+        esac
+        schluessel=${zeile%%=*}
+        wert=${zeile#*=}
+        export "$schluessel=$wert"
+      done < /etc/braunycode.setup
 
       if [ -z "${BRAUNY_TOKEN:-}" ] || [ "${#BRAUNY_TOKEN}" -lt 12 ] \
          || [ "$BRAUNY_TOKEN" = "bitte-hier-ein-langes-passwort-eintragen" ]; then
@@ -123,6 +136,11 @@ write_files:
       exit 0
 
 runcmd:
-  - [ bash, -lc, "/usr/local/bin/braunycode-setup.sh || echo 'Einrichtung fehlgeschlagen - siehe /var/log/braunycode-setup.log'" ]
+  # Ohne '|| echo': scheitert die Einrichtung, soll cloud-init das auch
+  # melden. Vorher wurde jeder Fehlschlag in Erfolg umgewandelt - der Server
+  # haette "fertig" gemeldet, obwohl nichts lief. Die Einzelheiten stehen in
+  # /var/log/braunycode-setup.log, und der HTTPS-Schritt ist innerhalb des
+  # Skripts weiterhin nicht toedlich.
+  - [ bash, -lc, "/usr/local/bin/braunycode-setup.sh" ]
 
 final_message: "BraunyCode-Einrichtung beendet. Protokoll: /var/log/braunycode-setup.log"

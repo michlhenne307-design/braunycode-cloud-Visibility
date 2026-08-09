@@ -1169,10 +1169,15 @@ check("fehlendes Verzeichnis -> leere Liste",
       skills_mod.load("/gibt/es/nicht") == [])
 
 sdir = tempfile.mkdtemp()
-open(os.path.join(sdir, "zu_gross.md"), "w").write(
-    "---\nname: gross\n---\n" + "x" * (skills_mod.MAX_SKILL_BYTES + 10))
-open(os.path.join(sdir, "gut.md"), "w").write("---\nname: gut\n---\nText hier.")
-open(os.path.join(sdir, "keine.txt"), "w").write("---\nname: nein\n---\nText.")
+def schreibe(ordner, name, inhalt):
+    """Mit Kontextmanager: sonst haengt der Puffer am Garbage Collector."""
+    with open(os.path.join(ordner, name), "w") as fh:
+        fh.write(inhalt)
+
+schreibe(sdir, "zu_gross.md",
+         "---\nname: gross\n---\n" + "x" * (skills_mod.MAX_SKILL_BYTES + 10))
+schreibe(sdir, "gut.md", "---\nname: gut\n---\nText hier.")
+schreibe(sdir, "keine.txt", "---\nname: nein\n---\nText.")
 geladen = skills_mod.load(sdir)
 check("zu große Datei wird übersprungen", [sk.name for sk in geladen] == ["gut"],
       [sk.name for sk in geladen])
@@ -1347,8 +1352,21 @@ try:
 except connectors.ConnectorError as exc:
     check("Push ohne Commit wird abgelehnt", "keinen Commit" in str(exc), str(exc))
 
+def ohne_remote(fn):
+    """Erzwingt den unkonfigurierten Zustand.
+
+    Ohne das wuerde dieser Test auf einer Maschine mit gesetztem
+    BRAUNY_GIT_REMOTE einen ECHTEN Push auf ein fremdes Repository ausloesen.
+    """
+    orig_r, orig_t = connectors.GIT_REMOTE, connectors.GIT_TOKEN
+    connectors.GIT_REMOTE, connectors.GIT_TOKEN = "", ""
+    try:
+        return fn()
+    finally:
+        connectors.GIT_REMOTE, connectors.GIT_TOKEN = orig_r, orig_t
+
 try:
-    connectors.git_push(pws, "x", "y")
+    ohne_remote(lambda: connectors.git_push(pws, "x", "y"))
     check("Push ohne Konfiguration wirft", False, "kein Fehler")
 except connectors.ConnectorError as exc:
     check("Push ohne Konfiguration wirft", "BRAUNY_GIT_REMOTE" in str(exc), str(exc))
@@ -1473,7 +1491,9 @@ try:
     import yaml  # noqa: E402
 except ImportError:
     yaml = None
-    check("PyYAML für die Prüfung vorhanden", False, "übersprungen")
+    # Kein check(): eine fehlende optionale Abhaengigkeit ist kein Defekt im
+    # Code und darf die Fehlerzahl nicht erhoehen.
+    print("  ÜBERSPR.  PyYAML fehlt — cloud-init-YAML wird nicht geprüft.")
 
 if yaml and ci_text:
     ci = yaml.safe_load(ci_text)
@@ -1879,9 +1899,9 @@ check("Sandbox setzt PYTHONPATH=/app",
 # Und der Nachweis, dass es ohne PYTHONPATH wirklich bricht:
 tiefes = tempfile.mkdtemp()
 os.makedirs(os.path.join(tiefes, "pkg"))
-open(os.path.join(tiefes, "helfer.py"), "w").write("wert = 7\n")
-open(os.path.join(tiefes, "pkg", "start.py"), "w").write(
-    "import helfer\nprint(helfer.wert)\n")
+schreibe(tiefes, "helfer.py", "wert = 7\n")
+schreibe(os.path.join(tiefes, "pkg"), "start.py",
+         "import helfer\nprint(helfer.wert)\n")
 ohne = subprocess.run([sys.executable, os.path.join(tiefes, "pkg", "start.py")],
                       capture_output=True, text=True)
 mit = subprocess.run([sys.executable, os.path.join(tiefes, "pkg", "start.py")],
@@ -1896,8 +1916,7 @@ kaputt_dir = tempfile.mkdtemp()
 with open(os.path.join(kaputt_dir, "latin.md"), "wb") as fh:
     fh.write("---\nname: latin\nbeschreibung: gr\xfc\xdfe\n---\nText.\n"
              .encode("latin-1"))
-open(os.path.join(kaputt_dir, "gut.md"), "w").write(
-    "---\nname: gut\nausloeser: x\n---\nText hier.\n")
+schreibe(kaputt_dir, "gut.md", "---\nname: gut\nausloeser: x\n---\nText hier.\n")
 try:
     geladen = skills_mod.load(kaputt_dir)
     check("Latin-1-Skill legt den Start nicht lahm", True)
@@ -1986,14 +2005,20 @@ for boese in ("169.254.169.254", "127.0.0.1", "10.1.2.3", "::1"):
     except connectors.ConnectorError as exc:
         check(f"Gegenstelle {boese} wird verworfen", "verworfen" in str(exc))
 
-# Hinter einem Proxy ist die Gegenstelle der Proxy selbst - wuerde hier
-# geprueft, waere fetch_url in jedem Netz mit Proxy komplett unbrauchbar.
+# Proxy-Variablen werden standardmäßig ignoriert (trust_env=0). Erst wer sie
+# ausdrücklich einschaltet, bekommt den Proxy-Weg — und damit die schwächere
+# Zusicherung, weil dann die Gegenstelle der Proxy ist.
+check("Proxy-Variablen werden standardmäßig ignoriert",
+      connectors.FETCH_TRUST_ENV is False)
 os.environ["HTTPS_PROXY"] = "http://127.0.0.1:8080"
 try:
-    check("hinter einem Proxy wird nicht geprüft",
+    check("Proxy-Variable allein reicht nicht", not connectors.proxy_aktiv())
+    connectors.FETCH_TRUST_ENV = True
+    check("erst mit trust_env gilt der Proxy", connectors.proxy_aktiv())
+    check("dann wird die Gegenstelle nicht geprüft",
           connectors.peer_pruefen(FakeAntwort("127.0.0.1")) is None)
-    check("proxy_aktiv erkennt die Umgebungsvariable", connectors.proxy_aktiv())
 finally:
+    connectors.FETCH_TRUST_ENV = False
     del os.environ["HTTPS_PROXY"]
 check("ohne Proxy-Variable meldet proxy_aktiv False",
       ohne_proxy(connectors.proxy_aktiv) is False)
@@ -2006,11 +2031,105 @@ check("fehlender Stream blockiert nicht",
       connectors.peer_pruefen(OhneStream()) is None)
 
 # 8. HTTPS braucht offene Ports 80/443.
+# https_text stammt von weiter oben und ist "" wenn die Datei fehlt - dann
+# meldet der Check einen Fehlschlag, statt die ganze Suite abzubrechen.
 check("enable-https.sh öffnet Port 80 und 443",
-      "for port in 80 443" in https_text2 if (https_text2 := HTTPS_PATH.read_text())
-      else False, "fehlt")
-check("Begründung steht dabei",
-      "HTTP-01" in https_text2)
+      "for port in 80 443" in https_text, "fehlt")
+check("Begründung steht dabei", "HTTP-01" in https_text)
+
+print("\n[33] Befunde aus der externen Durchsicht")
+
+# Ungueltige Portangabe: parsed.port wirft ValueError, der frueher roh aus dem
+# Konnektor herausfiel statt als verstaendliche Meldung anzukommen.
+for kaputt in ("https://beispiel.de:abc", "http://beispiel.de:abc/pfad"):
+    try:
+        connectors.check_url(kaputt, lambda _h: {"93.184.216.34"})
+        check(f"ungültiger Port in {kaputt} wird abgewiesen", False, "durchgelassen")
+    except connectors.ConnectorError as exc:
+        check(f"ungültiger Port in {kaputt} wird abgewiesen", "Port" in str(exc), str(exc))
+    except ValueError as exc:
+        check(f"ungültiger Port in {kaputt} wird abgewiesen", False,
+              f"roher ValueError: {exc}")
+
+# Zugangsdaten im Remote landen woertlich in .git/config - scrub() kennt sie
+# nicht, weil sie nicht BRAUNY_GIT_TOKEN sind.
+def mit_remote(url, fn):
+    orig_r, orig_t = connectors.GIT_REMOTE, connectors.GIT_TOKEN
+    connectors.GIT_REMOTE, connectors.GIT_TOKEN = url, "dummy"
+    try:
+        return fn()
+    finally:
+        connectors.GIT_REMOTE, connectors.GIT_TOKEN = orig_r, orig_t
+
+try:
+    mit_remote("https://ghp_fremdes_token@github.com/n/r.git",
+               lambda: connectors.git_push(pws, "x", "y"))
+    check("Remote mit eingebettetem Token wird abgelehnt", False, "durchgelassen")
+except connectors.ConnectorError as exc:
+    check("Remote mit eingebettetem Token wird abgelehnt",
+          "Zugangsdaten" in str(exc), str(exc))
+check("Remote ohne Zugangsdaten bleibt erlaubt",
+      "brauny/" in mit_remote(bare, lambda: connectors.git_push(pws, "sauber", "Test")))
+
+# Sandbox-Rechte: nicht mehr world-writable.
+rechte_dir = sandbox.make_project_dir({"main.py": "x=1\n", "pkg/m.py": "y=2\n"})
+for pfad, art in [(rechte_dir, "Projektverzeichnis"),
+                  (os.path.join(rechte_dir, "pkg"), "Unterverzeichnis")]:
+    modus = os.stat(pfad).st_mode & 0o777
+    check(f"{art} ist nicht world-writable", not modus & 0o002, oct(modus))
+    check(f"{art} ist für den Sandbox-User betretbar", modus & 0o001, oct(modus))
+for datei in ["main.py", os.path.join("pkg", "m.py")]:
+    modus = os.stat(os.path.join(rechte_dir, datei)).st_mode & 0o777
+    check(f"{datei} ist nicht world-writable", not modus & 0o002, oct(modus))
+    check(f"{datei} ist für den Sandbox-User lesbar", modus & 0o004, oct(modus))
+shutil.rmtree(rechte_dir, ignore_errors=True)
+check("Projekt wird nur-lesend eingehängt",
+      '"mode": "ro"' in inspect.getsource(sandbox.start))
+
+# Mehrwortige Ausloeser haetten nie gezuendet.
+mehrwort = skills_mod.parse(
+    "---\nname: mw\nausloeser: leerer test, alpha\n---\nAnleitung hier.\n", "mw.md")
+check("mehrwortiger Auslöser zündet",
+      skills_mod.score("mach einen leerer test daraus", mehrwort) >= 1,
+      skills_mod.score("mach einen leerer test daraus", mehrwort))
+check("einzelnes Wort daraus zündet NICHT allein",
+      skills_mod.score("nur leerer text", mehrwort) == 0,
+      skills_mod.score("nur leerer text", mehrwort))
+check("einwortiger Auslöser bleibt wortweise",
+      skills_mod.score("alphabet lesen", mehrwort) == 0)
+
+# read_file auf einer leeren Datei.
+bws.write("leer.py", "")
+r = asyncio.run(bbox.call("read_file", {"path": "leer.py"}))
+check("leere Datei wird als leer gemeldet", "ist leer" in r, r)
+check("keine irreführende Zeilenmeldung", "gibt es nicht" not in r, r)
+
+# cloud-init: Passwort darf nicht als Bash ausgewertet werden.
+if yaml and ci_text:
+    check("Konfiguration wird NICHT mit '.' eingebunden",
+          ". /etc/braunycode.setup" not in setup, setup[:400])
+    check("Konfiguration wird zeilenweise gelesen",
+          "while IFS= read -r zeile" in setup, setup[:600])
+    check("runcmd verschluckt den Fehlerstatus nicht",
+          "|| echo 'Einrichtung fehlgeschlagen" not in str(ci["runcmd"]),
+          str(ci["runcmd"]))
+
+# Und der Nachweis, dass ein Passwort mit '$' bei 'source' verfälscht würde.
+konf = os.path.join(tempfile.mkdtemp(), "setup")
+with open(konf, "w") as fh:
+    fh.write("BRAUNY_TOKEN=geheim$HOME-passwort\n")
+mit_source = subprocess.run(
+    ["bash", "-c", f'set -a; . "{konf}"; set +a; printf %s "$BRAUNY_TOKEN"'],
+    capture_output=True, text=True).stdout
+zeilenweise = subprocess.run(
+    ["bash", "-c",
+     f'while IFS= read -r z || [ -n "$z" ]; do case "$z" in BRAUNY_*=*) : ;; *) continue ;; esac; '
+     f'k=${{z%%=*}}; w=${{z#*=}}; export "$k=$w"; done < "{konf}"; printf %s "$BRAUNY_TOKEN"'],
+    capture_output=True, text=True).stdout
+check("'source' würde das Passwort verfälschen",
+      mit_source != "geheim$HOME-passwort", mit_source)
+check("zeilenweises Lesen erhält es wörtlich",
+      zeilenweise == "geheim$HOME-passwort", zeilenweise)
 
 print(f"\n=== {ok} bestanden, {fail} fehlgeschlagen ===")
 sys.exit(1 if fail else 0)

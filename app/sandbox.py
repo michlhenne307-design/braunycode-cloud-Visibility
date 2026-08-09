@@ -3,7 +3,6 @@
 import asyncio
 import os
 import shutil
-import stat
 import tempfile
 
 import docker
@@ -46,22 +45,31 @@ def safe_relpath(name: str) -> str:
     return os.path.join(*teile)
 
 
+# Der Sandbox-User (uid 65534) muss lesen und Verzeichnisse betreten koennen -
+# mehr nicht. Frueher stand hier 0o777 bzw. 0o666: damit konnte JEDES lokale
+# Konto den Code aendern, waehrend er ausgefuehrt wurde, oder den
+# Projektinhalt mitlesen. Schreiben braucht die Sandbox nicht; fuer Ausgaben
+# ist /tmp eingehaengt (tmpfs, beschreibbar).
+DIR_MODE = 0o755
+FILE_MODE = 0o644
+
+
 def make_project_dir(files: dict[str, str]) -> str:
     """Legt ein temporäres Projektverzeichnis an, das der Sandbox-User lesen darf."""
     project_dir = tempfile.mkdtemp(prefix="brauny-")
-    os.chmod(project_dir, stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO)
+    os.chmod(project_dir, DIR_MODE)
     for name, content in files.items():
         path = os.path.join(project_dir, safe_relpath(name))
         ordner = os.path.dirname(path)
         if ordner and ordner != project_dir:
             os.makedirs(ordner, exist_ok=True)
-            # Der Sandbox-User ist ein anderer (uid 65534) und muss die
+            # Der Sandbox-User ist ein anderer und muss die
             # Zwischenverzeichnisse betreten koennen.
             for teil in _pfad_kette(project_dir, ordner):
-                os.chmod(teil, stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO)
+                os.chmod(teil, DIR_MODE)
         with open(path, "w", encoding="utf-8") as handle:
             handle.write(content)
-        os.chmod(path, 0o666)
+        os.chmod(path, FILE_MODE)
     return project_dir
 
 
@@ -97,7 +105,9 @@ def start(project_dir: str, command=None):
         IMAGE,
         command or entry_command(),
         working_dir="/app",
-        volumes={project_dir: {"bind": "/app", "mode": "rw"}},
+        # Nur-lesend einhaengen: der Container soll den Projektstand
+        # ausfuehren, nicht veraendern. Fuer Ausgaben ist /tmp da.
+        volumes={project_dir: {"bind": "/app", "mode": "ro"}},
         detach=True,
         network_disabled=True,
         mem_limit=MEM_LIMIT,
