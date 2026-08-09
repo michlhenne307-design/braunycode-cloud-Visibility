@@ -24,30 +24,52 @@ klein aus, weil fast alles in denselben Zweig läuft.
 
 ## Gebaut
 
-### Stufe 1 — Abschluss nur gegen Beleg (fertig)
+Stand: elf Commits auf `claude/ki-firmensystem-iphone-v7yxiu`, 726 Tests.
+**Nichts davon ist je gegen ein echtes Modell oder eine echte Sandbox
+gelaufen** — das gilt für jede Zeile dieses Abschnitts.
 
-`finish` wird abgewiesen, solange seit der letzten Änderung keine Prüfung
-bestanden wurde. Buchführung in `Toolbox.call()`: `unverified`, `protokoll`
-mit SHA-256 vorher/nachher, `belege`. Nach zwei Ablehnungen endet der Lauf
-trotzdem, dann aber mit `verified=False`.
+| Was | Kern |
+|-----|------|
+| **Abschluss nur gegen Beleg** | `finish` wird abgewiesen, solange seit der letzten Änderung keine Prüfung bestanden wurde. Buchführung in `Toolbox.call()`, SHA-256 vorher/nachher. Nach zwei Ablehnungen endet der Lauf trotzdem — dann aber mit `verified=False` und den offenen Dateien beim Namen. |
+| **Reichweite eines Belegs** | Ein grüner Lauf belegt nur, was er über den Importgraphen erreicht. `pytest test_a.py` sagt nichts über eine gleichzeitig geänderte `b.py`. |
+| **Diagnostik** | Traceback, kopfloser SyntaxError, pytest und die eigenen `FEHLER:`-Zeilen werden zu einem Befund mit festen Feldern. Deterministisch, ohne Modell. |
+| **Gegenbeispiele** | Hypothesis' minimierter Fall wird erkannt und als `PROPERTY` geführt — der Reparatur-Input, den die Vorlage vom SMT-Solver wollte. |
+| **Testauswahl** | `affected_tests` nennt über den Importgraphen rückwärts die Tests, die eine Änderung erreichen. |
+| **Bereitschafts-Gate** | Nennt der Auftrag eine Datei, die es nicht gibt, endet der Lauf **vor** der ersten Änderung mit einer konkreten Rückfrage. |
+| **Abtastverhalten** | Temperatur 0 für Werkzeugaufrufe. Vorher setzte kein Pfad eine — der Lauf übernahm die Vorgabe des Anbieters, meist 0.8. |
+| **Fehlergedächtnis** | Fingerabdruck → was damals half. SQLite, kein Quelltext, nur belegte Läufe schreiben. |
+| **Sandbox-Image** | `pytest` und `hypothesis` im Container, der ohne Netz läuft. Scheitert der Bau, wird der Verlust benannt statt verschwiegen. |
 
-Das ist der Kern von "Evidence over Confidence" und der Grund, warum die
-Schichten darunter überhaupt Sinn ergeben.
+### Was dabei an eigenen Fehlern auffiel
+
+Der Wert dieser Schicht zeigt sich weniger an dem, was sie verhindert, als an
+dem, was sie beim Bauen über sich selbst herausgefunden hat:
+
+- `finish` galt als belegt, wenn **irgendein** Lauf grün war — auch über Code,
+  den er nie berührt hat.
+- Ein `SyntaxError` beim Parsen hat keinen `Traceback`-Kopf und wurde
+  übersehen. Ausgerechnet der häufigste Fehler nach einer Änderung.
+- `affected_tests` stand in keiner Skill-Allowlist und wäre überall still
+  gesperrt gewesen. Dieselbe Fehlerklasse gab es hier schon einmal.
+- Die erste Fassung der Skill-Zusicherung war zu grob und mahnte `doku` an,
+  das bewusst nichts ausführen darf.
+- `int(SEED)` bei jedem Aufruf hätte ein Tippfehler in einer Umgebungsvariable
+  zu einem Absturz mitten im Lauf gemacht.
+
+Jeder dieser Punkte wäre still danebengegangen.
 
 
-## Als Nächstes, in dieser Reihenfolge
+## Offen — und warum es hier nicht weitergeht
 
-| # | Was | Warum zuerst |
-|---|-----|--------------|
-| 1 | **Diagnostic Engine** — deterministischer Parser: Compiler-, Linter- und Testausgabe zu einem einheitlichen Finding (`category`, `file`, `line`, `symbol`, `severity`) | gemeinsame Fehlersprache; ohne sie reden die anderen Schichten aneinander vorbei. Bewusst ohne Modell. |
-| 2 | **Diff → Abhängigkeitsgraph → betroffene Tests** | macht die Beleg-Sperre erst scharf: nicht mehr "Syntax ok", sondern "die Tests, die diesen Code berühren, laufen" |
-| 3 | **Eigenschaftsbasierte Tests** (`hypothesis`, 1,4 MB) | liefert **minimierte Gegenbeispiele** ohne Spezifikationssprache |
-| 4 | **Counterexample-getriebene Reparatur** | der Reparaturschritt bekommt das Gegenbeispiel als Vorgabe statt "versuch mal was" |
-| 5 | **Mutationstest** (`mutmut`, 0,1 MB) | misst, ob die Tests überhaupt etwas fangen — sonst ist Grün bedeutungslos |
-| 6 | **Differenzverifikation** mit Korpus (Regression, Golden Files, generiert) | statt einer festen Zahl Zufallseingaben |
-| 7 | **InferencePolicy** — deterministisch fürs Planen und Extrahieren, kontrollierte Vielfalt für Kandidaten | genauer als eine pauschale Temperatur-0-Regel |
-| 8 | **Bereitschafts-Gate** — Rückfrage nur bei entscheidungsrelevanter Lücke | nicht fünf Fragen aus Prinzip |
-| 9 | **Patch-Vergleich** — unser Patch gegen den des Nutzers | das beste verfügbare Lernsignal |
+| # | Was | Was fehlt |
+|---|-----|-----------|
+| 1 | **Differenzverifikation** mit Korpus statt fester Zufallszahl | braucht Ausführung, also die Sandbox |
+| 2 | **Mutationstest** | bewusst nicht im Sandbox-Image: `mutmut` zieht einen Terminal-UI-Stapel mit, 17 Pakete statt 6. Gehört außerhalb der Schleife. |
+| 3 | **Patch-Vergleich** — unserer gegen den des Nutzers | braucht echte Korrekturen aus dem Betrieb |
+
+Alles Weitere hängt an der Maschine. Weiterzubauen hieße, Schichten auf einen
+Grund zu stapeln, der nie getragen hat — genau der Fehler, vor dem das
+Ausgangspapier in seinem letzten Abschnitt warnt.
 
 
 ## Der wichtigste Befund
