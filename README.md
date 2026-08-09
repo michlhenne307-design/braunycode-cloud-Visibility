@@ -115,6 +115,8 @@ Der Installer schreibt `~/braunycode/brauny.env` (Modus 600, nicht im Repo):
 | `BRAUNY_PROVIDER` | `ollama` | `ollama` oder `openai` (jede OpenAI-kompatible API) |
 | `BRAUNY_API_BASE` | leer | Basis-URL der API, z. B. `https://…/v1` |
 | `BRAUNY_API_KEY` | leer | Schlüssel für die API, bleibt in der 600er-Datei |
+| `BRAUNY_MEMORY` | neben dem Projekt | SQLite-Datei des Fehlergedächtnisses. Hält fest, welcher Befund schon einmal auftrat und welche Änderung ihn behoben hat — Werkzeugname und Pfad, **kein Quelltext**. Nur belegte Läufe schreiben hinein. |
+| `BRAUNY_MEMORY_TAGE` | `180` | Ab welchem Alter ein Eintrag nicht mehr gezeigt wird. Ein Fix von vor einem Jahr kann sich auf Code beziehen, den es nicht mehr gibt. |
 | `BRAUNY_SANDBOX_IMAGE` | `braunycode-sandbox:1` | Image der Sandbox. Der Installer baut es aus `deploy/sandbox.Dockerfile` mit pytest und hypothesis, damit der Container ohne Netz Tests ausführen kann. Scheitert der Bau, wird `python:3.11-slim` benutzt — dann sind Testläufe als Beleg nicht möglich. Selbst gesetzt: der Installer baut nichts und nimmt den angegebenen Wert. |
 | `BRAUNY_SEED` | leer | Fester Startwert für reproduzierbare Läufe. Bei Ollama immer wirksam; bei einer fremden API nur setzen, wenn der Anbieter `seed` kennt — manche weisen unbekannte Felder ab. Ein Wert, der keine ganze Zahl ist, wird protokolliert und ignoriert. |
 | `BRAUNY_AGENT` | `auto` | `auto`, `tools` oder `oneshot` — siehe unten |

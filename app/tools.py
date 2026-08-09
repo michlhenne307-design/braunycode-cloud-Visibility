@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import dataclasses
 import fnmatch
 import hashlib
 import json
@@ -21,6 +22,7 @@ import time
 
 import connectors
 import diagnostics
+import memory as memory_mod
 import testimpact
 
 MAX_OUTPUT = 4000        # Zeichen, die ein Werkzeugergebnis zurueckgeben darf
@@ -250,7 +252,8 @@ class Toolbox:
     testbar bleibt.
     """
 
-    def __init__(self, ws, run_sandbox=None, index_builder=None, enabled=None):
+    def __init__(self, ws, run_sandbox=None, index_builder=None, enabled=None,
+                 gedaechtnis=None):
         self.ws = ws
         self.run_sandbox = run_sandbox
         self.index_builder = index_builder
@@ -275,6 +278,9 @@ class Toolbox:
         # Alle erkannten Befunde des Laufs, in Reihenfolge. Grundlage fuer
         # das Fehlergedaechtnis und fuer die gezielte Reparatur.
         self.befunde: list = []
+        # Optional: was frueher schon einmal kaputt war. Fehlt es,
+        # arbeitet alles genauso weiter - nur ohne Vorwissen.
+        self.gedaechtnis = gedaechtnis
         # Letzter bekannter Inhalts-Fingerabdruck je Datei.
         self._hashes: dict[str, str | None] = {}
         self.finish_blocked = 0
@@ -409,6 +415,10 @@ class Toolbox:
         gescheitert = not ok or (name in CHECKING
                                  and not self._ist_gruen(name, result))
         befunde = diagnostics.parse(result, quelle=name) if gescheitert else []
+        # Den Schritt festhalten: erst damit laesst sich spaeter sagen, was
+        # NACH dem Fehler passiert ist und ihn behoben hat.
+        nr = len(self.protokoll) + 1
+        befunde = [dataclasses.replace(f, schritt=nr) for f in befunde]
 
         self.protokoll.append({
             "nr": len(self.protokoll) + 1,
@@ -426,6 +436,14 @@ class Toolbox:
         ergiebig = [f for f in befunde if f.datei or f.typ]
         if ergiebig:
             result = f"{result}\n\nBefund:\n{diagnostics.zusammenfassen(ergiebig)}"
+            # Vorwissen dazustellen, falls dieser Fehler hier schon einmal
+            # auftrat. Als Hinweis, nicht als Anweisung - was damals half,
+            # muss heute nicht richtig sein.
+            if self.gedaechtnis is not None:
+                hinweise = [h for h in
+                            (self.gedaechtnis.hinweis(f) for f in ergiebig) if h]
+                if hinweise:
+                    result = f"{result}\n\n" + "\n".join(hinweise)
         return result
 
     def bericht(self) -> dict:

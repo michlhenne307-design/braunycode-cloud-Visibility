@@ -113,6 +113,9 @@ class Finding:
     # ist. Das ist der Unterschied zwischen "irgendwo stimmt etwas nicht" und
     # einer Reparatur mit konkretem Ziel.
     gegenbeispiel: str | None = None
+    # Der Schritt, in dem der Befund entstanden ist. Erst damit laesst sich
+    # spaeter sagen, WAS danach passiert ist und ihn behoben hat.
+    schritt: int | None = None
     roh: str = field(default="", repr=False)
 
     def fingerprint(self) -> str:

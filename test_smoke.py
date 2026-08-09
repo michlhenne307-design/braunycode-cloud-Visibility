@@ -6,6 +6,7 @@ import struct
 import shutil
 import textwrap
 import subprocess
+import time
 import sys
 
 os.environ["BRAUNY_TOKEN"] = "geheim-test-token"
@@ -2769,6 +2770,125 @@ else:
           _b and _b[0].gegenbeispiel is not None, _roh[-300:])
     check("Livelauf wird als PROPERTY eingeordnet",
           _b and _b[0].kategorie == diagnostics.PROPERTY, _b)
+
+
+# ---------------------------------------------------------- Fehlergedaechtnis
+print("\n[41] Fehlergedächtnis")
+
+import memory as memory_mod  # noqa: E402
+
+def _befund(datei="konto.py", symbol="abheben", typ="AssertionError", text="negativ"):
+    return diagnostics.Finding(
+        kategorie=diagnostics.kategorie_fuer(typ), schwere=diagnostics.FEHLER,
+        typ=typ, nachricht=text, datei=datei, symbol=symbol, schritt=1)
+
+_pfad = os.path.join(tempfile.mkdtemp(), "tiefer", "g.sqlite")
+_g = memory_mod.Gedaechtnis(_pfad)
+check("Datei wird samt Ordner angelegt", os.path.exists(_pfad), _pfad)
+check("frisches Gedächtnis ist leer", _g.anzahl() == 0)
+check("ohne Vorwissen kein Hinweis", _g.hinweis(_befund()) == "")
+
+check("leere Lösung wird abgewiesen", _g.merken(_befund(), "   ") is False)
+check("und landet nicht in der Ablage", _g.anzahl() == 0)
+
+check("echte Lösung wird gemerkt",
+      _g.merken(_befund(), "edit_file(konto.py)") is True)
+_h = _g.hinweis(_befund())
+check("Hinweis nennt die Lösung", "edit_file(konto.py)" in _h, _h)
+# Als Hinweis, nicht als Anweisung: was damals half, muss heute nicht stimmen.
+check("Hinweis ist als ungeprüft gekennzeichnet",
+      "nicht ungeprüft übernehmen" in _h, _h)
+
+# Ein anderer Fehler an derselben Stelle darf NICHT treffen - sonst bekommt
+# das Modell eine Lösung für ein anderes Problem vorgelegt.
+check("anderer Fehlertyp trifft nicht",
+      _g.hinweis(_befund(typ="NameError")) == "")
+check("anderes Symbol trifft nicht",
+      _g.hinweis(_befund(symbol="einzahlen")) == "")
+check("andere Datei trifft nicht",
+      _g.hinweis(_befund(datei="andere.py")) == "")
+
+# Wechselnder Text im selben Fehler muss weiterhin treffen - genau dafür ist
+# der Fingerabdruck ohne den freien Text gebaut.
+check("wechselnde Meldung trifft trotzdem",
+      _g.hinweis(_befund(text="ganz anderer Wortlaut")) != "")
+
+for _i in range(5):
+    _g.merken(_befund(), f"lösung-{_i}")
+check("Anzahl der gezeigten Treffer ist gedeckelt",
+      _g.hinweis(_befund()).count("  - ") <= memory_mod.MAX_TREFFER,
+      _g.hinweis(_befund()))
+
+# Alterung: ein Fix von vor einem Jahr kann sich auf Code beziehen, den es
+# nicht mehr gibt.
+import sqlite3 as _sq  # noqa: E402
+with _sq.connect(_pfad) as _c:
+    _c.execute("UPDATE fehler SET zeitpunkt = ?", (time.time() - 400 * 86400,))
+check("veraltete Einträge werden nicht mehr gezeigt", _g.hinweis(_befund()) == "")
+check("und lassen sich entfernen", _g.aufraeumen() > 0)
+check("danach ist die Ablage leer", _g.anzahl() == 0)
+
+# Kein Quelltext in der Ablage - ein Gedächtnis, das Dateiinhalte mitschreibt,
+# waere ein Datenleck mit Zusatznutzen.
+_g.merken(_befund(), "edit_file(konto.py)")
+with _sq.connect(_pfad) as _c:
+    _inhalt = " ".join(str(z) for z in _c.execute("SELECT * FROM fehler"))
+check("kein Quelltext in der Ablage",
+      "def " not in _inhalt and "return" not in _inhalt, _inhalt)
+
+# Lösung aus dem Protokoll ableiten
+_prot = [
+    {"nr": 1, "werkzeug": "read_file", "ok": True, "dateien": []},
+    {"nr": 2, "werkzeug": "run_python", "ok": True, "dateien": []},
+    {"nr": 3, "werkzeug": "edit_file", "ok": True, "dateien": [{"pfad": "konto.py"}]},
+    {"nr": 4, "werkzeug": "edit_file", "ok": True, "dateien": [{"pfad": "konto.py"}]},
+    {"nr": 5, "werkzeug": "write_file", "ok": False, "dateien": [{"pfad": "x.py"}]},
+]
+_l = memory_mod.loesung_beschreiben(_prot, ab_schritt=2)
+check("nur Schritte NACH dem Fehler", "read_file" not in _l, _l)
+check("Wiederholungen werden zusammengefasst",
+      _l.count("edit_file") == 1, _l)
+check("gescheiterte Schritte zählen nicht", "write_file" not in _l, _l)
+check("Werkzeug und Pfad, kein Inhalt", _l == "edit_file(konto.py)", _l)
+
+# Verdrahtung: Hinweis erscheint im Werkzeugergebnis
+async def _rot(_d, _e=None, command=None):
+    return 1, ('Traceback (most recent call last):\n'
+               '  File "/app/konto.py", line 2, in abheben\n    return g - b\n'
+               'AssertionError: negativ')
+
+_w = ws_mod.Workspace(tempfile.mkdtemp())
+_w.write("konto.py", "def abheben(g, b):\n    return g - b\n")
+_g2 = memory_mod.Gedaechtnis(os.path.join(tempfile.mkdtemp(), "g2.sqlite"))
+
+_tb = tools.Toolbox(_w, run_sandbox=_rot, gedaechtnis=_g2)
+_erg = asyncio.run(_tb.call("run_python", {"path": "konto.py"}))
+check("beim ersten Mal kein Vorwissen", "kam hier schon vor" not in _erg, _erg[-200:])
+check("der Befund trägt seinen Schritt",
+      _tb.befunde and _tb.befunde[0].schritt is not None, _tb.befunde)
+
+_g2.merken(_tb.befunde[0], "edit_file(konto.py)")
+_tb2 = tools.Toolbox(_w, run_sandbox=_rot, gedaechtnis=_g2)
+_erg = asyncio.run(_tb2.call("run_python", {"path": "konto.py"}))
+check("beim zweiten Mal steht das Vorwissen dabei",
+      "kam hier schon vor" in _erg and "edit_file(konto.py)" in _erg, _erg[-300:])
+
+# Ohne Gedächtnis muss alles unverändert funktionieren.
+_tb3 = tools.Toolbox(_w, run_sandbox=_rot)
+_erg = asyncio.run(_tb3.call("run_python", {"path": "konto.py"}))
+check("ohne Gedächtnis läuft es normal weiter",
+      "Befund:" in _erg and "kam hier schon vor" not in _erg, _erg[-200:])
+
+# Ein unbelegter Lauf darf NICHTS merken - sonst wird eine Vermutung als
+# Erfahrung weitergereicht.
+_g3 = memory_mod.Gedaechtnis(os.path.join(tempfile.mkdtemp(), "g3.sqlite"))
+class _Attrappe:
+    gedaechtnis = _g3
+    befunde = [_befund()]
+    protokoll = [{"nr": 2, "werkzeug": "edit_file", "ok": True,
+                  "dateien": [{"pfad": "konto.py"}]}]
+agentloop._merken(_Attrappe())
+check("belegter Lauf merkt sich etwas", _g3.anzahl() == 1, _g3.anzahl())
 
 
 print(f"\n=== {ok} bestanden, {fail} fehlgeschlagen ===")

@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import time
 
+import memory
 import provider
 import readiness
 import tools
@@ -323,6 +325,38 @@ async def _finish(send, task, toolbox, step, seconds, executed) -> str:
                             "Die Zusammenfassung ist seine eigene Einschätzung, "
                             "kein Testergebnis.")
 
+    # Nur ein BELEGTER Lauf darf ins Gedaechtnis. Was am Ende ungeprueft
+    # blieb, hat nichts bewiesen - es zu merken hiesse, kuenftigen Laeufen
+    # eine Vermutung als Erfahrung zu verkaufen.
+    if verified:
+        _merken(toolbox)
+
     await send("done", f"{summary}{commit}", ok=True, exit=0,
                attempts=step, seconds=seconds, verified=verified)
     return "ok"
+
+
+def _merken(toolbox) -> None:
+    """Zu jedem behobenen Befund festhalten, was danach passiert ist.
+
+    Je Fingerabdruck nur der ERSTE Befund: taucht derselbe Fehler dreimal auf,
+    ist das ein Fehler mit einer Loesung, nicht drei. Fehlt das Gedaechtnis
+    oder scheitert das Schreiben, laeuft der Lauf normal zu Ende - ein
+    Gedaechtnis ist eine Hilfe, kein Bestandteil des Ergebnisses.
+    """
+    gedaechtnis = getattr(toolbox, "gedaechtnis", None)
+    if gedaechtnis is None:
+        return
+    gesehen = set()
+    for befund in getattr(toolbox, "befunde", []):
+        schluessel = befund.fingerprint()
+        if schluessel in gesehen or befund.schritt is None:
+            continue
+        gesehen.add(schluessel)
+        loesung = memory.loesung_beschreiben(toolbox.protokoll, befund.schritt)
+        try:
+            gedaechtnis.merken(befund, loesung)
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "Fehlergedächtnis nicht beschreibbar: %s", exc)
+            return

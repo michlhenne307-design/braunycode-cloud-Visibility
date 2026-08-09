@@ -16,6 +16,7 @@ from fastapi.staticfiles import StaticFiles
 
 import agentloop
 import codeindex
+import memory
 import connectors
 import provider
 import refactor
@@ -382,6 +383,26 @@ async def run_agent(send, task, *, ask_fn, run_sandbox, workspace=None,
                ok=False, exit=last_exit, attempts=max_attempts, seconds=elapsed())
 
 
+def _gedaechtnis():
+    """Das Fehlergedaechtnis, oder None wenn es sich nicht anlegen laesst.
+
+    Bewusst nicht toedlich: eine nicht beschreibbare Datei darf keinen Lauf
+    verhindern. Der Agent arbeitet dann ohne Vorwissen weiter - schlechter,
+    aber vollstaendig.
+    """
+    pfad = os.environ.get("BRAUNY_MEMORY")
+    if not pfad:
+        basis = os.environ.get("BRAUNY_WORKSPACE") or os.getcwd()
+        pfad = os.path.join(os.path.dirname(os.path.abspath(basis)),
+                            "gedaechtnis.sqlite")
+    try:
+        return memory.Gedaechtnis(pfad)
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "Fehlergedächtnis nicht verfügbar (%s) — Lauf ohne Vorwissen.", exc)
+        return None
+
+
 async def dispatch(send, task, *, ask_fn, chat_fn, run_sandbox, workspace=None,
                    mode=None, skills=None, enabled_connectors=None):
     """Waehlt den Weg, der zur Aufgabe und zum Modell passt.
@@ -412,7 +433,8 @@ async def dispatch(send, task, *, ask_fn, chat_fn, run_sandbox, workspace=None,
                        else enabled_connectors)
         toolbox = tools.Toolbox(workspace, run_sandbox=run_sandbox,
                                 index_builder=codeindex.CodeIndex.build,
-                                enabled=freigegeben)
+                                enabled=freigegeben,
+                                gedaechtnis=_gedaechtnis())
 
         # Passendes Verfahrenswissen dazustellen, falls eines passt.
         skill = skills_mod.match(task, SKILLS if skills is None else skills)
