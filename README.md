@@ -58,7 +58,9 @@ Browser (Handy/Rechner) ──WebSocket──▶  FastAPI
 | `scripts/make_icons.py` | erzeugt die Icons, reine Standardbibliothek |
 | `systemd/braunycode.service` | Referenz-Unit (wird vom Installer geschrieben) |
 | `test_smoke.py` | Tests ohne Docker/Ollama-Abhängigkeit |
-| `docs/SETUP-iPhone.md` | Schritt-für-Schritt vom leeren Oracle-Account bis zum Betrieb |
+| `deploy/hetzner-cloud-init.yaml` | Unbeaufsichtigte Einrichtung — ganz ohne SSH |
+| `docs/SETUP-Hetzner.md` | Schritt für Schritt, komplett vom Handy machbar |
+| `docs/SETUP-iPhone.md` | Derselbe Weg über den Oracle Free Tier |
 
 ## Voraussetzungen
 
@@ -80,8 +82,22 @@ bash install.sh
 Der Installer richtet alles ein und gibt am Ende Adresse und Zugangs-Token aus.
 Dauer: 10–20 Minuten, überwiegend Modell-Download.
 
-Danach muss noch **in der Oracle Console** eine Ingress-Regel für TCP 8000
-angelegt werden — Details in [`docs/SETUP-iPhone.md`](docs/SETUP-iPhone.md).
+### Ohne Rechner, nur mit dem Handy
+
+Wenn du keinen Rechner für SSH hast: Ein Hetzner-Server kann die komplette
+Installation beim ersten Start **von allein** durchziehen. Du fügst beim
+Erstellen [`deploy/hetzner-cloud-init.yaml`](deploy/hetzner-cloud-init.yaml)
+ein, änderst darin eine Zeile (dein Passwort) und öffnest nach ~20 Minuten die
+Adresse. Kein SSH, keine Kommandozeile.
+
+Schritt für Schritt: [`docs/SETUP-Hetzner.md`](docs/SETUP-Hetzner.md)
+
+### Oracle Cloud Free Tier
+
+Kostenlos, aber mit zwei bekannten Hürden — der Kartenprüfung bei der
+Anmeldung und der oft ausgebuchten ARM-Kapazität. Danach muss noch eine
+Ingress-Regel für TCP 8000 angelegt werden:
+[`docs/SETUP-iPhone.md`](docs/SETUP-iPhone.md).
 
 ### Konfiguration
 

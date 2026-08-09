@@ -24,7 +24,13 @@ command -v sudo >/dev/null || die "sudo wird benoetigt."
 step "Warte auf cloud-init und den apt-Lock"
 # Frisch gebootete Cloud-Images laufen minutenlang mit unattended-upgrades.
 # Ohne dieses Warten scheitert jedes apt mit "Could not get lock".
-sudo cloud-init status --wait >/dev/null 2>&1 || true
+#
+# ACHTUNG: Laeuft dieses Skript SELBST aus cloud-init heraus (unbeaufsichtigte
+# Einrichtung), wartet 'status --wait' auf das Ende von cloud-init - und
+# cloud-init wartet auf uns. Das ist ein Deadlock, deshalb der Schalter.
+if [ "${BRAUNY_SKIP_CLOUDINIT_WAIT:-0}" != "1" ]; then
+  sudo cloud-init status --wait >/dev/null 2>&1 || true
+fi
 for _ in $(seq 1 120); do
   sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || break
   sleep 5
@@ -110,8 +116,17 @@ ENV_FILE="$BRAUNY_HOME/brauny.env"
 if [ -f "$ENV_FILE" ]; then
   step "Bestehende Konfiguration behalten ($ENV_FILE)"
 else
-  step "Zugangs-Token erzeugen"
-  TOKEN="$(head -c 32 /dev/urandom | base64 | tr -d '/+=' | head -c 32)"
+  # Ein vorgegebenes Token ist der einzige Weg, die Installation ohne SSH
+  # durchlaufen zu lassen: bei einer unbeaufsichtigten Einrichtung koennte
+  # sonst niemand das erzeugte Token je lesen.
+  if [ -n "${BRAUNY_TOKEN:-}" ]; then
+    step "Vorgegebenes Zugangs-Token uebernehmen"
+    TOKEN="$BRAUNY_TOKEN"
+    [ "${#TOKEN}" -ge 12 ] || die "BRAUNY_TOKEN ist zu kurz (mindestens 12 Zeichen)."
+  else
+    step "Zugangs-Token erzeugen"
+    TOKEN="$(head -c 32 /dev/urandom | base64 | tr -d '/+=' | head -c 32)"
+  fi
   cat > "$ENV_FILE" <<EOF
 BRAUNY_TOKEN=$TOKEN
 BRAUNY_MODEL=$BRAUNY_MODEL

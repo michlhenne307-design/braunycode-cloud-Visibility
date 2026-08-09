@@ -1441,5 +1441,69 @@ check("dispatch wählt und meldet den Skill",
           for e in events if e["type"] == "status"),
       [e["text"] for e in events if e["type"] == "status"])
 
+print("\n[28] Unbeaufsichtigte Einrichtung (cloud-init)")
+
+CI_PATH = main.BASE_DIR.parent / "deploy" / "hetzner-cloud-init.yaml"
+check("cloud-init-Datei vorhanden", CI_PATH.exists(), CI_PATH)
+ci_text = CI_PATH.read_text() if CI_PATH.exists() else ""
+check("beginnt mit #cloud-config (sonst ignoriert cloud-init sie)",
+      ci_text.startswith("#cloud-config"), ci_text[:30])
+
+try:
+    import yaml  # noqa: E402
+except ImportError:
+    yaml = None
+    check("PyYAML für die Prüfung vorhanden", False, "übersprungen")
+
+if yaml and ci_text:
+    ci = yaml.safe_load(ci_text)
+    check("YAML ist gültig", isinstance(ci, dict), type(ci))
+    dateien = {f["path"]: f["content"] for f in ci.get("write_files", [])}
+    check("Konfigurationsdatei wird angelegt", "/etc/braunycode.setup" in dateien)
+    check("Einrichtungsskript wird angelegt",
+          "/usr/local/bin/braunycode-setup.sh" in dateien)
+
+    conf = dateien.get("/etc/braunycode.setup", "")
+    setup = dateien.get("/usr/local/bin/braunycode-setup.sh", "")
+
+    # Der Platzhalter muss in BEIDEN Dateien wortgleich stehen. Driften sie
+    # auseinander, liefe die Installation mit dem Standard-Passwort durch -
+    # ein oeffentlich erreichbarer Dienst mit bekanntem Token.
+    import re as _re
+    platzhalter = _re.search(r"BRAUNY_TOKEN=(\S+)", conf)
+    check("Platzhalter-Passwort steht in der Konfiguration", bool(platzhalter), conf[:200])
+    if platzhalter:
+        check("Abbruch prüft genau diesen Platzhalter",
+              platzhalter.group(1) in setup, platzhalter.group(1))
+    check("Abbruch prüft auch die Mindestlänge",
+          "-lt 12" in setup, setup[:400])
+
+    # Der Deadlock, der die Einrichtung sonst haengen laesst.
+    check("cloud-init-Warteschleife wird abgeschaltet",
+          "BRAUNY_SKIP_CLOUDINIT_WAIT=1" in setup, setup[:600])
+    check("Installer kennt den Schalter",
+          "BRAUNY_SKIP_CLOUDINIT_WAIT" in (main.BASE_DIR.parent / "install.sh").read_text())
+
+    # Werte duerfen nicht in eine Kommandozeile eingesetzt werden - ein
+    # Passwort mit Anfuehrungszeichen wuerde die Zeile zerlegen.
+    check("Werte werden über env übergeben, nicht interpoliert",
+          "runuser -u brauny -- env" in setup, setup[-500:])
+    check("HOME wird gesetzt (runuser tut das nicht)", "HOME=/home/brauny" in setup)
+
+    benutzer = ci.get("users", [])
+    gruppen = benutzer[0].get("groups", []) if benutzer else []
+    # docker existiert beim Anlegen des Benutzers noch nicht.
+    check("Benutzer wird NICHT in die docker-Gruppe gelegt",
+          "docker" not in gruppen, gruppen)
+    check("Benutzer bekommt sudo", "sudo" in gruppen, gruppen)
+
+installer = (main.BASE_DIR.parent / "install.sh").read_text()
+check("Installer übernimmt ein vorgegebenes Token",
+      'if [ -n "${BRAUNY_TOKEN:-}" ]' in installer)
+check("Installer lehnt zu kurze Token ab",
+      '"${#TOKEN}" -ge 12' in installer, )
+check("Installer läuft weiterhin nicht als root",
+      '[ "$(id -u)" -ne 0 ]' in installer)
+
 print(f"\n=== {ok} bestanden, {fail} fehlgeschlagen ===")
 sys.exit(1 if fail else 0)
