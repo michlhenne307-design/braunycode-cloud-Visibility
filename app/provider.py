@@ -144,6 +144,46 @@ OLLAMA_HOST = _ollama_host()
 MODELL_TIMEOUT = float(os.environ.get("BRAUNY_MODEL_TIMEOUT", "900"))
 
 
+def _ollama_messages(messages) -> list[dict]:
+    """Den Verlauf in die Form bringen, die Ollama erwartet.
+
+    Der Agent baut seinen Verlauf im OpenAI-Format - das ist richtig so, denn
+    dasselbe Gespraech soll auch an eine fremde API gehen koennen. Nur passt
+    dieses Format an zwei Stellen nicht auf /api/chat:
+
+      arguments   OpenAI verlangt einen JSON-TEXT, Ollama ein OBJEKT. Wird ein
+                  Text geschickt, antwortet Ollama mit 400.
+      Zusatzfelder id, type und tool_call_id kennt Ollama nicht; der Name
+                  eines Werkzeugergebnisses heisst dort tool_name.
+
+    Das ist genau die Gegenrichtung des Fehlers, den _parse_arguments
+    behandelt: dort kam ein Text, wo ein Objekt erwartet wurde. Beide Seiten
+    der Uebersetzung gehoeren an dieselbe Stelle - die Grenze zum Anbieter.
+    """
+    raus = []
+    for nachricht in messages:
+        rolle = nachricht.get("role", "user")
+        sauber: dict = {"role": rolle, "content": nachricht.get("content", "") or ""}
+
+        if rolle == "tool":
+            # Ollama fuehrt den Werkzeugnamen unter 'tool_name'.
+            name = nachricht.get("tool_name") or nachricht.get("name")
+            if name:
+                sauber["tool_name"] = name
+
+        aufrufe = nachricht.get("tool_calls")
+        if aufrufe:
+            sauber["tool_calls"] = [
+                {"function": {
+                    "name": (a.get("function") or {}).get("name", ""),
+                    "arguments": _parse_arguments((a.get("function") or {}).get("arguments")),
+                }}
+                for a in aufrufe
+            ]
+        raus.append(sauber)
+    return raus
+
+
 def _chat_ollama(messages, tools, policy=DETERMINISTISCH):
     import httpx
 
@@ -153,7 +193,7 @@ def _chat_ollama(messages, tools, policy=DETERMINISTISCH):
         optionen["seed"] = SEED
     nutzlast = {
         "model": MODEL,
-        "messages": messages,
+        "messages": _ollama_messages(messages),
         "options": optionen,
         "stream": False,
     }
@@ -166,7 +206,18 @@ def _chat_ollama(messages, tools, policy=DETERMINISTISCH):
             json=nutzlast,
             timeout=httpx.Timeout(MODELL_TIMEOUT, connect=10.0),
         )
-        antwort.raise_for_status()
+        # Ollama schreibt den Grund einer Ablehnung in den Rumpf. Ohne ihn
+        # steht in der Oberflaeche nur "400 Bad Request" - wahr, aber
+        # unbrauchbar. Genau so ist hier schon einmal eine Stunde verlorengegangen.
+        if antwort.status_code >= 400:
+            grund = ""
+            try:
+                grund = str(antwort.json().get("error", "")).strip()
+            except Exception:
+                grund = antwort.text[:400].strip()
+            raise ProviderError(
+                f"Ollama lehnt die Anfrage ab (HTTP {antwort.status_code})"
+                + (f": {grund}" if grund else "."))
         daten = antwort.json()
     except httpx.HTTPError as exc:
         raise ProviderError(f"Ollama nicht erreichbar: {exc}") from exc

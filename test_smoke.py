@@ -55,8 +55,10 @@ class OllamaAntwort:
     Eigener Name, weil weiter unten eine andere Klasse 'FakeAntwort' fuer die
     Konnektor-Pruefung steht - die wuerde diese hier sonst verdecken.
     """
-    def __init__(self, daten):
+    def __init__(self, daten, status=200):
         self.daten = daten
+        self.status_code = status
+        self.text = json.dumps(daten)
     def raise_for_status(self):
         return None
     def json(self):
@@ -140,6 +142,84 @@ check("OLLAMA_HOST bekommt ein Schema, auch ohne eines",
       provider.OLLAMA_HOST.startswith("http://"), provider.OLLAMA_HOST)
 check("der Zeitwert für den Modellaufruf ist großzügig",
       provider.MODELL_TIMEOUT >= 600, provider.MODELL_TIMEOUT)
+
+# --- Die Gegenrichtung: was WIR an Ollama schicken --------------------------
+#
+# Im Betrieb abgestuerzt, nachdem das erste Werkzeug schon gelaufen war:
+#
+#   Modellaufruf fehlgeschlagen: ProviderError: Ollama nicht erreichbar:
+#   Client error '400 Bad Request' for url 'http://127.0.0.1:11434/api/chat'
+#
+# Ursache: Der Agent baut seinen Verlauf im OpenAI-Format, dort sind
+# tool_calls[].function.arguments ein JSON-TEXT. Ollama will an derselben
+# Stelle ein OBJEKT und lehnt alles andere ab. Das ist exakt das Spiegelbild
+# des Fehlers weiter oben - dort kam ein Text, wo ein Objekt erwartet wurde.
+#
+# Beide Module waren fuer sich richtig. Kaputt war die Naht dazwischen,
+# deshalb prueft dieser Test beide Seiten zusammen statt jede fuer sich.
+import agentloop as _al  # noqa: E402
+import tools as _tools  # noqa: E402
+
+class _Aufruf:
+    def __init__(self, name, args, call_id="c1"):
+        self.name, self.arguments, self.call_id = name, args, call_id
+
+class _Antwort:
+    text = ""
+
+_echte_nachricht = _al._assistant_message(
+    _Antwort(), [_Aufruf("write_file", {"path": "rechner.py", "content": "x"})])
+check("der Agent schickt Argumente als Text (OpenAI-Format)",
+      isinstance(_echte_nachricht["tool_calls"][0]["function"]["arguments"], str),
+      _echte_nachricht["tool_calls"][0]["function"]["arguments"])
+
+_fuer_ollama = provider._ollama_messages([
+    {"role": "system", "content": "sei gut"},
+    {"role": "user", "content": "mach was"},
+    _echte_nachricht,
+    _tools.format_result("write_file", "Datei geschrieben.", "c1"),
+])
+_assistent = _fuer_ollama[2]
+_werkzeug = _fuer_ollama[3]
+
+check("für Ollama werden die Argumente zum Objekt",
+      _assistent["tool_calls"][0]["function"]["arguments"]
+      == {"path": "rechner.py", "content": "x"},
+      _assistent["tool_calls"][0]["function"]["arguments"])
+check("der Werkzeugname bleibt erhalten",
+      _assistent["tool_calls"][0]["function"]["name"] == "write_file")
+# Genau diese Zusatzfelder kennt Ollama nicht.
+check("'id' und 'type' fallen weg",
+      set(_assistent["tool_calls"][0]) == {"function"}, _assistent["tool_calls"][0])
+check("das Werkzeugergebnis heißt bei Ollama tool_name",
+      _werkzeug.get("tool_name") == "write_file" and "tool_call_id" not in _werkzeug,
+      _werkzeug)
+check("gewöhnliche Nachrichten bleiben unangetastet",
+      _fuer_ollama[0] == {"role": "system", "content": "sei gut"}, _fuer_ollama[0])
+check("eine Nachricht ohne Werkzeugaufruf bekommt auch keinen",
+      "tool_calls" not in _fuer_ollama[1], _fuer_ollama[1])
+check("ein content=None wird zu leerem Text, nicht zu null",
+      provider._ollama_messages([{"role": "user", "content": None}])[0]["content"] == "")
+
+# Und die Ablehnung selbst muss lesbar sein. "400 Bad Request" allein sagt
+# nicht, WAS falsch war - der Grund steht im Rumpf und gehoert in die Meldung.
+class _Abgelehnt:
+    status_code = 400
+    text = '{"error":"invalid message content type: <nil>"}'
+    @staticmethod
+    def json():
+        return {"error": "invalid message content type: <nil>"}
+
+_orig_post = httpx.post
+httpx.post = lambda *a, **k: _Abgelehnt()
+try:
+    provider._chat_ollama([{"role": "user", "content": "x"}], None)
+    check("eine Ablehnung nennt den Grund", False, "keine Ausnahme")
+except provider.ProviderError as _exc:
+    check("eine Ablehnung nennt den Grund",
+          "400" in str(_exc) and "invalid message content type" in str(_exc), _exc)
+finally:
+    httpx.post = _orig_post
 
 print("\n[3] make_project_dir")
 d = sandbox.make_project_dir({"main.py": "print('x')"})
