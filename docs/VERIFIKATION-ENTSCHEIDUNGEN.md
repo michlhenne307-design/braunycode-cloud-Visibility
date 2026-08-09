@@ -38,7 +38,8 @@ gelaufen** — das gilt für jede Zeile dieses Abschnitts.
 | **Bereitschafts-Gate** | Nennt der Auftrag eine Datei, die es nicht gibt, endet der Lauf **vor** der ersten Änderung mit einer konkreten Rückfrage. |
 | **Abtastverhalten** | Temperatur 0 für Werkzeugaufrufe. Vorher setzte kein Pfad eine — der Lauf übernahm die Vorgabe des Anbieters, meist 0.8. |
 | **Fehlergedächtnis** | Fingerabdruck → was damals half. SQLite, kein Quelltext, nur belegte Läufe schreiben. |
-| **Sandbox-Image** | `pytest` und `hypothesis` im Container, der ohne Netz läuft. Scheitert der Bau, wird der Verlust benannt statt verschwiegen. |
+| **Sandbox-Image** | `pytest`, `hypothesis` und `ruff` im Container, der ohne Netz läuft. Scheitert der Bau, wird der Verlust benannt statt verschwiegen. |
+| **Linter-Befunde** | ruff und mypy werden verstanden. Ein undefinierter Name ist ein Fehler, eine unsortierte Importliste nur Stil — getrennte Kategorien, damit das Modell nicht Stil repariert, während der echte Fehler stehen bleibt. |
 
 ### Was dabei an eigenen Fehlern auffiel
 
@@ -66,6 +67,7 @@ Jeder dieser Punkte wäre still danebengegangen.
 | 1 | **Differenzverifikation** mit Korpus statt fester Zufallszahl | braucht Ausführung, also die Sandbox |
 | 2 | **Mutationstest** | bewusst nicht im Sandbox-Image: `mutmut` zieht einen Terminal-UI-Stapel mit, 17 Pakete statt 6. Gehört außerhalb der Schleife. |
 | 3 | **Patch-Vergleich** — unserer gegen den des Nutzers | braucht echte Korrekturen aus dem Betrieb |
+| 4 | **C- und JavaScript-Werkzeuge** in der Diagnostik | das Sandbox-Image hat weder gcc noch node — Parser dafür wären heute toter Code |
 
 Alles Weitere hängt an der Maschine. Weiterzubauen hieße, Schichten auf einen
 Grund zu stapeln, der nie getragen hat — genau der Fehler, vor dem das
