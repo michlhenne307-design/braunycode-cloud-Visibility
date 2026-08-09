@@ -304,6 +304,12 @@ async def _finish(send, task, toolbox, step, seconds, executed) -> str:
         await send("status", "Belegt durch: " + "; ".join(
             f"Schritt {b['nr']} ({b['werkzeug']}) → {', '.join(b['abgedeckt'])}"
             for b in bericht["belege"]))
+    if bericht and bericht.get("ohne_pruefmoeglichkeit"):
+        # Kein Fehler, aber eine Luecke, die niemand stillschweigend
+        # hinnehmen soll: eine Textdatei laesst sich nicht ausfuehren.
+        await send("status", "Nicht durch Ausführung belegbar: " +
+                   ", ".join(bericht["ohne_pruefmoeglichkeit"]) +
+                   " — dafür gibt es keine Prüfung, nur das Diff.")
     if bericht and bericht["ungeprueft"]:
         # Der Lauf ist durch die Ablehnungsgrenze gerutscht. Das ist der eine
         # Fall, in dem 'fertig' und 'ungeprueft' zusammen auftreten - und

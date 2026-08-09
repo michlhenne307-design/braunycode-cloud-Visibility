@@ -821,8 +821,20 @@ check("run_python ohne Sandbox meldet Fehler",
       asyncio.run(tools.Toolbox(tws).call("run_python", {"path": "main.py"}))
       .startswith("FEHLER"))
 
+# finish an einer frischen Toolbox: dieser Test gilt der Zusammenfassung,
+# nicht der Abschluss-Sperre - die hat eigene Tests. In 'box' liegt inzwischen
+# ein geschriebenes neu.py, das run_python(main.py) nie erreicht hat, und die
+# Sperre greift dort zu Recht.
+_frisch = tools.Toolbox(tws)
 check("finish setzt die Zusammenfassung",
-      call("finish", summary="alles gut") == "alles gut" and box.finished == "alles gut")
+      asyncio.run(_frisch.call("finish", {"summary": "alles gut"})) == "alles gut"
+      and _frisch.finished == "alles gut")
+# Und genau der Fall, den die alte Fassung stillschweigend durchgelassen hat:
+# eine geschriebene Python-Datei, die kein Lauf beruehrt hat, ist NICHT belegt.
+check("nie ausgeführte Datei blockiert den Abschluss",
+      "neu.py" in box.unverified, sorted(box.unverified))
+check("und finish wird deshalb abgewiesen",
+      call("finish", summary="alles gut").startswith("FEHLER"))
 
 lang = tools.Toolbox(tws)
 tws.write("gross.py", "x = 1\n" * 4000)
@@ -2889,6 +2901,84 @@ class _Attrappe:
                   "dateien": [{"pfad": "konto.py"}]}]
 agentloop._merken(_Attrappe())
 check("belegter Lauf merkt sich etwas", _g3.anzahl() == 1, _g3.anzahl())
+
+
+# ------------------------------------------------- Reichweite eines Belegs
+print("\n[42] Ein grüner Lauf belegt nur, was er erreicht hat")
+
+# Der Fehler, den diese Zusicherungen verhindern: 'pytest test_a.py' laeuft
+# durch, und die Sperre erklaert damit AUCH eine gleichzeitig geaenderte b.py
+# fuer belegt, die kein Test anfasst. Der Beleg waere echt - er belegte nur
+# das Falsche. Genau dagegen ist die ganze Schicht gebaut.
+
+def _reichweite_projekt():
+    w = ws_mod.Workspace(tempfile.mkdtemp())
+    w.write("a.py", "def f(): return 1\n")
+    w.write("b.py", "def g(): return 2\n")
+    w.write("hilf.py", "X = 3\n")
+    w.write("test_a.py", "import a\nimport hilf\ndef test_f(): assert a.f() == 1\n")
+    return w
+
+async def _gruen(_d, _e=None, command=None):
+    return 0, "1 passed"
+
+def _nach(aenderungen, pruefung):
+    tb = tools.Toolbox(_reichweite_projekt(), run_sandbox=_gruen)
+    for pfad in aenderungen:
+        asyncio.run(tb.call("edit_file", {"path": pfad, "old_text": "3"
+                                          if pfad == "hilf.py" else "return",
+                                          "new_text": "4" if pfad == "hilf.py"
+                                          else "return "}))
+    asyncio.run(tb.call(*pruefung))
+    return tb
+
+_tb = _nach(["a.py", "b.py"], ("run_command", {"command": "python -m pytest test_a.py"}))
+check("gezielter Testlauf belegt nur seinen Ast",
+      _tb.unverified == {"b.py"}, sorted(_tb.unverified))
+check("und finish wird deshalb abgewiesen",
+      asyncio.run(_tb.call("finish", {"summary": "x"})).startswith("FEHLER"))
+
+_tb = _nach(["hilf.py"], ("run_command", {"command": "python -m pytest test_a.py"}))
+check("transitiv importierte Datei gilt als belegt",
+      _tb.unverified == set(), sorted(_tb.unverified))
+
+_tb = _nach(["a.py", "b.py"], ("run_command", {"command": "python -m pytest"}))
+check("ein Lauf ohne Dateiangabe belegt alles",
+      _tb.unverified == set(), sorted(_tb.unverified))
+
+_tb = _nach(["a.py", "b.py"], ("run_python", {"path": "a.py"}))
+check("run_python belegt nur seinen eigenen Ast",
+      _tb.unverified == {"b.py"}, sorted(_tb.unverified))
+
+_tb = _nach(["a.py", "b.py"], ("run_command", {"command": "python -m pytest test_a.py"}))
+asyncio.run(_tb.call("run_python", {"path": "b.py"}))
+check("beide Äste belegt lässt finish durch",
+      not asyncio.run(_tb.call("finish", {"summary": "x"})).startswith("FEHLER"))
+check("und der Lauf gilt als verifiziert", _tb.verified is True)
+
+for _befehl, _erwartet in (
+        ('python -m pytest test_a.py', ["test_a.py"]),
+        ('python -m pytest "test_a.py"', ["test_a.py"]),
+        ("python -m pytest 'test_a.py'::test_f", ["test_a.py"]),
+        ("python -m pytest test_a.py::test_f", ["test_a.py"]),
+        ("python -m pytest", [])):
+    check(f"Befehlszerlegung: {_befehl[17:] or '(ohne Datei)'}",
+          testimpact.dateien_aus_befehl(_befehl, {"test_a.py"}) == _erwartet,
+          testimpact.dateien_aus_befehl(_befehl, {"test_a.py"}))
+
+# Nicht-Python-Dateien: sie koennen von keinem Lauf belegt werden, duerfen den
+# Abschluss also nicht blockieren - aber verschwiegen werden sie auch nicht.
+_w = ws_mod.Workspace(tempfile.mkdtemp())
+_w.write("main.py", "print(1)\n")
+_tb = tools.Toolbox(_w, run_sandbox=_gruen)
+asyncio.run(_tb.call("write_file", {"path": "notiz.txt", "content": "x"}))
+check("Textdatei blockiert den Abschluss nicht", _tb.unverified == set(), _tb.unverified)
+check("sie wird aber getrennt vermerkt",
+      _tb.ungeprueft_sonstige == {"notiz.txt"}, _tb.ungeprueft_sonstige)
+check("und steht im Bericht",
+      _tb.bericht()["ohne_pruefmoeglichkeit"] == ["notiz.txt"], _tb.bericht())
+check("finish geht deshalb durch",
+      not asyncio.run(_tb.call("finish", {"summary": "x"})).startswith("FEHLER"))
 
 
 print(f"\n=== {ok} bestanden, {fail} fehlgeschlagen ===")

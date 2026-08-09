@@ -157,6 +157,50 @@ def betroffen(dateien: dict[str, str], geaendert) -> list[str]:
     return sorted(gesehen)
 
 
+def abgedeckt(dateien: dict[str, str], startpunkte) -> set[str]:
+    """Was ein Lauf ab diesen Einstiegspunkten tatsaechlich erreicht hat.
+
+    Der Importgraph VORWAERTS - das Gegenstueck zu betroffen(). Laeuft
+    'pytest test_a.py' durch, ist damit belegt, was test_a.py importiert, und
+    sonst nichts. Eine gleichzeitig geaenderte Datei, die kein Test anfasst,
+    bleibt ungeprueft, obwohl der Lauf gruen war.
+
+    Genau daran haengt die Ehrlichkeit der Abschluss-Sperre: ein Beleg, der
+    mehr abdeckt als der Lauf tatsaechlich beruehrt hat, ist kein Beleg,
+    sondern eine Behauptung mit Testausgabe daneben.
+    """
+    kanten, _ = _kanten(dateien)
+    start = [rel for rel in startpunkte if rel in kanten]
+    gesehen: set[str] = set(start)
+    arbeit = list(start)
+    while arbeit:
+        rel = arbeit.pop()
+        for ziel in kanten.get(rel, ()):
+            if ziel not in gesehen:
+                gesehen.add(ziel)
+                arbeit.append(ziel)
+    return gesehen
+
+
+def dateien_aus_befehl(befehl, bekannt) -> list[str]:
+    """Die Projektdateien, die in einer Befehlszeile vorkommen.
+
+    'python -m pytest test_a.py' -> ['test_a.py']. Nennt ein Befehl keine
+    einzige Datei ('python -m pytest' ueber alles), ist die Liste leer - der
+    Aufrufer muss dann entscheiden, und die richtige Entscheidung ist: der Lauf
+    deckt alles ab.
+    """
+    bekannt = set(bekannt)
+    treffer = []
+    for teil in befehl if isinstance(befehl, (list, tuple)) else str(befehl).split():
+        # Erst am '::' trennen, dann die Anfuehrungszeichen abziehen:
+        # andersherum bliebe bei "'test_a.py'::test_f" ein Rest am Pfad haengen.
+        wort = str(teil).split("::", 1)[0].strip().strip('"\'')
+        if wort in bekannt and wort not in treffer:
+            treffer.append(wort)
+    return treffer
+
+
 def betroffene_tests(dateien: dict[str, str], geaendert) -> list[str]:
     """Nur die Testdateien aus dem betroffenen Bereich."""
     return [rel for rel in betroffen(dateien, geaendert) if ist_test(rel)]

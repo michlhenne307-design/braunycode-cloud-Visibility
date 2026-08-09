@@ -269,6 +269,10 @@ class Toolbox:
         # Dateien, die seit der letzten bestandenen Pruefung veraendert wurden.
         # Solange hier etwas drinsteht, ist der Stand unbelegt.
         self.unverified: set[str] = set()
+        # Geaenderte Dateien, ueber die keine Ausfuehrung etwas aussagen kann
+        # (Text, Markdown, Konfiguration). Sie blockieren den Abschluss nicht,
+        # werden aber am Ende genannt.
+        self.ungeprueft_sonstige: set[str] = set()
         # Lueckenloses Protokoll aller Aufrufe. Das ist die Nachvollziehbarkeit:
         # was wurde aufgerufen, mit welchen Argumenten, was kam heraus, und wie
         # sah die Datei vorher und nachher aus.
@@ -348,6 +352,33 @@ class Toolbox:
             return None
         return hashlib.sha256(roh).hexdigest()[:12]
 
+    def _abdeckung(self, name: str, arguments: dict) -> set[str]:
+        """Welche offenen Dateien ein gruener Lauf wirklich belegt hat.
+
+        Ueber den Importgraphen vorwaerts, ausgehend von dem, was gestartet
+        wurde. Nennt ein Befehl keine einzige Projektdatei ('python -m pytest'
+        ueber alles), gilt der Lauf als vollstaendig - dann IST alles gelaufen.
+        """
+        try:
+            dateien = self._alle_python()
+        except Exception:
+            # Ohne Graph lieber vollstaendig belegen als gar nicht: sonst
+            # blockierte ein Lesefehler den Abschluss dauerhaft.
+            return set(self.unverified)
+
+        if name == "run_python":
+            start = [str(arguments.get("path", "")).strip()]
+        else:
+            start = testimpact.dateien_aus_befehl(
+                str(arguments.get("command", "")), dateien)
+            if not start:
+                return set(self.unverified)   # Lauf ueber alles
+
+        erreicht = testimpact.abgedeckt(dateien, start)
+        # Nicht-Python-Dateien kann der Graph nicht einordnen. Sie bleiben
+        # offen, statt stillschweigend als belegt zu gelten.
+        return self.unverified & erreicht
+
     def _ist_gruen(self, name: str, result: str) -> bool:
         if name == "check_syntax":
             return result.rstrip().endswith(GREEN_SUFFIX_SYNTAX)
@@ -391,19 +422,29 @@ class Toolbox:
             aenderungen.append({"pfad": pfad, "vorher": alt, "nachher": neu})
 
         if ok and name in MODIFYING:
-            self.unverified.update(beruehrt)
+            # Nur Dateien, ueber die der Importgraph ueberhaupt etwas aussagen
+            # kann. Eine .md oder .txt hat kein Verhalten, das ein Lauf
+            # belegen koennte - sie in die Sperre zu legen hiesse, den Agenten
+            # bei jeder README-Aenderung festzuhalten.
+            self.unverified.update(p for p in beruehrt if p.endswith(".py"))
+            # Verschwiegen wird sie deshalb aber nicht: am Ende steht, was
+            # ausserhalb der Reichweite jeder Pruefung geaendert wurde.
+            self.ungeprueft_sonstige.update(
+                p for p in beruehrt if not p.endswith(".py"))
         elif ok and name in CHECKING and self._ist_gruen(name, result):
             if name == "check_syntax":
                 # Belegt genau die eine Datei - und nur ihre Syntax.
                 geprueft = {str(arguments.get("path", "")).strip()}
                 self.unverified -= geprueft
             else:
-                # Der Code ist als Ganzes gelaufen. Das ist ein Beleg ueber den
-                # aktuellen Stand, nicht ueber eine einzelne Datei.
-                # Einschraenkung: sehr grosse Projekte werden fuer die Sandbox
-                # gedeckelt, dann deckt der Lauf nicht jede Datei ab.
-                geprueft = set(self.unverified)
-                self.unverified.clear()
+                # Ein gruener Lauf belegt NICHT alles, was gerade offen ist -
+                # nur das, was er tatsaechlich erreicht hat. 'pytest test_a.py'
+                # sagt nichts ueber eine gleichzeitig geaenderte b.py, die kein
+                # Test anfasst. Diese Unterscheidung ist der Unterschied
+                # zwischen einem Beleg und einer Behauptung mit Testausgabe
+                # daneben.
+                geprueft = self._abdeckung(name, arguments)
+                self.unverified -= geprueft
             if geprueft:
                 self.belege.append({"nr": len(self.protokoll) + 1,
                                     "werkzeug": name,
@@ -459,6 +500,7 @@ class Toolbox:
                                  for a in e["dateien"]}),
             "belege": list(self.belege),
             "ungeprueft": sorted(self.unverified),
+            "ohne_pruefmoeglichkeit": sorted(self.ungeprueft_sonstige),
             "verifiziert": self.verified,
         }
 
@@ -624,6 +666,7 @@ class Toolbox:
         # ungeprueft offen stand, gibt es nicht mehr - es waere falsch, den
         # Abschluss weiterhin daran zu hindern.
         self.unverified.clear()
+        self.ungeprueft_sonstige.clear()
         self._hashes.clear()
         return (f"Projekt auf Commit {sha} zurückgesetzt. "
                 "Alle Änderungen seitdem sind verworfen.")
