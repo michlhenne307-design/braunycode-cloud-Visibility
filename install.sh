@@ -55,8 +55,29 @@ fi
 sudo usermod -aG docker "$USER"
 sudo systemctl enable --now docker
 
-step "Sandbox-Image vorladen ($SANDBOX_IMAGE)"
-sudo docker pull -q "$SANDBOX_IMAGE"
+# Der Sandbox-Container laeuft ohne Netzwerk - was nicht im Image liegt, kann
+# er nicht nachinstallieren. Ohne Testlaeufer bliebe dem Agenten als Beleg nur
+# "die Datei parst", und das ist der schwaechste aller Belege.
+#
+# Scheitert der Bau (kein Netz zu PyPI, Spiegel nicht erreichbar), wird das
+# Basisimage benutzt und der Verlust ausdruecklich benannt. Die Einrichtung
+# daran scheitern zu lassen waere unverhaeltnismaessig - der Agent
+# funktioniert, er kann nur weniger belegen.
+if [ -z "${BRAUNY_SANDBOX_IMAGE:-}" ] && [ -f "$SRC_DIR/deploy/sandbox.Dockerfile" ]; then
+  step "Sandbox-Image bauen (mit pytest und hypothesis)"
+  if sudo docker build -q -t braunycode-sandbox:1 \
+       -f "$SRC_DIR/deploy/sandbox.Dockerfile" "$SRC_DIR" >/dev/null; then
+    SANDBOX_IMAGE="braunycode-sandbox:1"
+  else
+    warn "Bau des Sandbox-Images fehlgeschlagen — es wird $SANDBOX_IMAGE"
+    warn "benutzt. Der Agent kann dann keine Tests in der Sandbox ausfuehren"
+    warn "und belegt Aenderungen nur ueber Syntax und einfache Laeufe."
+    sudo docker pull -q "$SANDBOX_IMAGE"
+  fi
+else
+  step "Sandbox-Image vorladen ($SANDBOX_IMAGE)"
+  sudo docker pull -q "$SANDBOX_IMAGE"
+fi
 
 # ---------------------------------------------------------------- 3. Ollama
 if command -v ollama >/dev/null 2>&1; then

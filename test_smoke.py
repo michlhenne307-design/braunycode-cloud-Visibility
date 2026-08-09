@@ -2579,5 +2579,78 @@ check("Standard ist deterministisch",
       provider._temperatur("unbekannte-betriebsart") == 0.0)
 
 
+# ------------------------------------------------------------ Sandbox-Image
+print("\n[39] Sandbox-Image")
+
+_WURZEL = os.path.dirname(os.path.abspath(__file__))
+_DOCKERFILE = os.path.join(_WURZEL, "deploy", "sandbox.Dockerfile")
+check("Dockerfile liegt vor", os.path.exists(_DOCKERFILE), _DOCKERFILE)
+
+if os.path.exists(_DOCKERFILE):
+    with open(_DOCKERFILE, encoding="utf-8") as _fh:
+        _df = _fh.read()
+    check("baut auf dem bisherigen Basisimage auf",
+          "FROM python:3.11-slim" in _df)
+    check("bringt einen Testläufer mit", "pytest" in _df)
+    check("bringt Hypothesis mit", "hypothesis" in _df)
+    # Bewusste Entscheidung, kein Versehen: mutmut zieht einen Terminal-UI-
+    # Stapel mit, der in einem Container ohne Netz und ohne Terminal nichts
+    # verloren hat. Wer ihn spaeter doch will, soll diese Zusicherung sehen.
+    check("mutmut bleibt bewusst draußen", "mutmut" not in _df.split("RUN pip")[-1])
+    check("Versionen sind nach oben begrenzt",
+          "<10" in _df and "<7" in _df, _df)
+    # Die Haertung steht in app/sandbox.py. Ein USER hier wuerde dieselbe
+    # Entscheidung an einer zweiten Stelle treffen - genau so laufen zwei
+    # Wahrheiten auseinander.
+    check("kein zweiter Ort für die Benutzer-Entscheidung",
+          not any(z.strip().startswith("USER ") for z in _df.splitlines()))
+    check("prüft sich beim Bauen selbst",
+          "import pytest, hypothesis" in _df)
+
+with open(os.path.join(_WURZEL, "install.sh"), encoding="utf-8") as _fh:
+    _inst = _fh.read()
+check("install.sh baut das Image", "sandbox.Dockerfile" in _inst)
+check("und hat einen Rückfall", "fehlgeschlagen" in _inst and "docker pull" in _inst)
+
+# Den Zweig ausfuehren statt ihn zu lesen: docker und sudo werden ersetzt,
+# beide Ausgaenge einmal gefahren.
+_start = _inst.index("# Der Sandbox-Container laeuft ohne Netzwerk")
+_ende = _inst.index("# ------------------------------------------------"
+                    "---------------- 3. Ollama")
+_block = _inst[_start:_ende]
+
+_RAHMEN = ("set -euo pipefail\n"
+           "step() { :; }\n"
+           "warn() { echo \"WARN $*\"; }\n"
+           "SRC_DIR=\"@SRC@\"\n"
+           "SANDBOX_IMAGE=\"python:3.11-slim\"\n"
+           "sudo() { \"$@\"; }\n"
+           "docker() { case \"$1\" in build) return @CODE@ ;; "
+           "pull) return 0 ;; esac; }\n"
+           "@BLOCK@\n"
+           "echo \"ERGEBNIS: $SANDBOX_IMAGE\"\n")
+
+_src = tempfile.mkdtemp()
+os.makedirs(os.path.join(_src, "deploy"))
+with open(os.path.join(_src, "deploy", "sandbox.Dockerfile"), "w") as _fh:
+    _fh.write("FROM x\n")
+
+def _fahre_zweig(code):
+    _skript = (_RAHMEN.replace("@SRC@", _src).replace("@CODE@", str(code))
+                      .replace("@BLOCK@", _block))
+    return subprocess.run(["bash", "-c", _skript], capture_output=True, text=True)
+
+_r = _fahre_zweig(0)
+check("gelungener Bau setzt das eigene Image",
+      "ERGEBNIS: braunycode-sandbox:1" in _r.stdout, _r.stdout + _r.stderr)
+_r = _fahre_zweig(1)
+check("gescheiterter Bau fällt auf das Basisimage zurück",
+      "ERGEBNIS: python:3.11-slim" in _r.stdout, _r.stdout + _r.stderr)
+check("und der Verlust wird benannt, nicht verschwiegen",
+      "belegt Aenderungen nur" in _r.stdout, _r.stdout)
+check("ein gescheiterter Bau kippt die Einrichtung nicht",
+      _r.returncode == 0, _r.returncode)
+
+
 print(f"\n=== {ok} bestanden, {fail} fehlgeschlagen ===")
 sys.exit(1 if fail else 0)
