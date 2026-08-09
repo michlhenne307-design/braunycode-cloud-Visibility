@@ -3447,6 +3447,15 @@ if _upd_pfad.exists():
     _inst = (main.BASE_DIR.parent / "install.sh").read_text()
     check("der Installer legt ihn als Befehl ab",
           "/usr/local/bin/braunycode-update" in _inst)
+    # Im Betrieb passiert: zwei Aktualisierungen kurz nacheinander, beide
+    # liefen los. Zwei pip-Laeufe in dieselbe Umgebung koennen sie halb
+    # geschrieben hinterlassen - danach startet der Dienst nicht mehr.
+    check("zwei Installationen gleichzeitig sind ausgeschlossen",
+          "flock -n 9" in _inst and "flock 9" in _inst)
+    # Haette der root-Durchgang die Sperre, wartete sein eigener Kindprozess
+    # ewig auf sie.
+    check("die Sperre sitzt nach dem Neustart als unprivilegierter Benutzer",
+          _inst.index('exec sudo -u "$BRAUNY_USER"') < _inst.index('exec 9>"$LOCK"'))
 
 check("die Oberfläche merkt sich den laufenden Auftrag", "brauny.run" in js)
 check("sie hängt sich beim Zurückkommen wieder an",

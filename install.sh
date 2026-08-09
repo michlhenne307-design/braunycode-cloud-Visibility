@@ -70,6 +70,24 @@ fi
 command -v sudo >/dev/null || die "sudo wird benoetigt."
 BRAUNY_HOME="${BRAUNY_HOME:-$HOME/braunycode}"
 
+# Nur eine Installation zur Zeit.
+#
+# Im Betrieb tatsaechlich passiert: zwei Aktualisierungsbefehle kurz
+# nacheinander, und beide liefen los. Sie haetten sich beim Anlegen der
+# Python-Umgebung ins Gehege kommen koennen - zwei pip-Laeufe in dasselbe
+# Verzeichnis hinterlassen im schlechtesten Fall eine halb geschriebene
+# Umgebung, und der Dienst startet danach nicht mehr.
+#
+# Die Sperre kommt bewusst NACH dem Neustart als unprivilegierter Benutzer:
+# haette sie der root-Durchgang gehalten, wuerde der eigene Kindprozess
+# ewig auf sie warten.
+LOCK="${BRAUNY_LOCK:-/tmp/braunycode-install.lock}"
+exec 9>"$LOCK"
+if ! flock -n 9; then
+  warn "Eine andere Einrichtung laeuft gerade - ich warte, bis sie fertig ist."
+  flock 9
+fi
+
 # ---------------------------------------------------------------- 0b. Modell
 # Ein zu grosses Modell laedt minutenlang und faellt dann beim ersten Aufruf
 # in den Swap oder wird vom OOM-Killer beendet. Deshalb wird die Vorgabe am
