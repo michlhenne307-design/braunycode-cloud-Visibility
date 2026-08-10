@@ -48,6 +48,10 @@ MAX_CONCURRENT = max(1, int(os.environ.get("BRAUNY_MAX_CONCURRENT", "2")))
 # Obergrenze fuer einen einzelnen Modellaufruf. Ohne das haengt ein blockiertes
 # Ollama die WebSocket-Verbindung endlos.
 ASK_TIMEOUT = int(os.environ.get("BRAUNY_ASK_TIMEOUT", "300"))
+# Hoechstzahl Ausgabezeilen eines Sandbox-Laufs. Mehr sieht sich niemand an,
+# und im Modellkontext verdraengt eine ausser Rand und Band geratene Ausgabe
+# alles, was zur Loesung noetig waere.
+MAX_SANDBOX_ZEILEN = max(20, int(os.environ.get("BRAUNY_MAX_SANDBOX_ZEILEN", "200")))
 # Schutz gegen Token-Raten: nach so vielen Fehlversuchen innerhalb des
 # Zeitfensters wird die Adresse voruebergehend abgewiesen.
 AUTH_MAX_FAILS = max(1, int(os.environ.get("BRAUNY_AUTH_MAX_FAILS", "5")))
@@ -623,9 +627,34 @@ async def sandbox_runner(send, files: dict, entry: str = "main.py", *, command=N
             sandbox.start, project_dir,
             list(command) if command else sandbox.entry_command(entry))
         try:
+            # Deckel auf die Ausgabe. Im Betrieb passiert: das erzeugte
+            # Programm hatte ein input()-Menue, in der Sandbox kommt keine
+            # Eingabe, die Schleife drehte endlos und schrieb tausende Zeilen
+            # in Sekunden. Jede davon wurde ein Ereignis - das Budget des
+            # ganzen Laufs war aufgebraucht, und der Auftrag brach ab.
+            #
+            # Der Deckel muss HIER sitzen, an der Quelle. Er schuetzt drei
+            # Dinge auf einmal: das Ereignisprotokoll, den Arbeitsspeicher und
+            # vor allem den Modellkontext - die gesammelten Zeilen gehen als
+            # Werkzeugergebnis zurueck ans Modell, und zehntausend Zeilen
+            # "Unbekannte Auswahl" verdraengen dort alles Nuetzliche.
+            gekuerzt = False
             async for line in sandbox.stream_logs(container):
+                if len(lines) >= MAX_SANDBOX_ZEILEN:
+                    gekuerzt = True
+                    break
                 lines.append(line)
                 await send("sandbox", line)
+            if gekuerzt:
+                hinweis = (f"[Gekürzt] Mehr als {MAX_SANDBOX_ZEILEN} Ausgabezeilen. "
+                           "Läuft das Programm in einer Endlosschleife oder "
+                           "wartet es auf eine Eingabe, die es nicht gibt?")
+                lines.append(hinweis)
+                await send("sandbox", hinweis)
+                # Weiterlaufen lassen waere sinnlos: die Ausgabe ist ohnehin
+                # abgeschnitten. Der Container wird im finally aufgeraeumt -
+                # dieselbe Stelle, die auch der Zeitablauf benutzt.
+                return -1, "\n".join(lines)
         except asyncio.TimeoutError:
             await send("error", f"Timeout nach {sandbox.TIMEOUT}s — Container gestoppt.")
             lines.append(f"[Abbruch] Timeout nach {sandbox.TIMEOUT}s "

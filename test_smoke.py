@@ -1609,6 +1609,33 @@ check("kurze Auslöser bleiben wortgenau",
                        skills_mod.Skill(name="x", ausloeser=["code"])) == 0)
 check("die Schwelle steht bei sieben Zeichen", skills_mod.TEILWORT_AB == 7)
 
+# --- Ausgabedeckel an der Quelle ------------------------------------------
+#
+# Zweimal im Betrieb passiert: das erzeugte Programm hatte ein input()-Menue,
+# in der Sandbox kommt keine Eingabe, die Schleife drehte endlos und schrieb
+# tausende Zeilen in Sekunden. Jede wurde ein Ereignis, das Budget des Laufs
+# war aufgebraucht, der Auftrag brach ab - wegen der AUSGABE, nicht wegen des
+# Fehlers.
+#
+# Beim ersten Anlauf sass mein Deckel auf dem falschen Weg (agentloop), waehrend
+# die Flut aus sandbox_runner kam. Deshalb steht er jetzt an der Quelle, wo
+# beide Wege durchmuessen.
+_mq = (main.BASE_DIR / "main.py").read_text()
+check("es gibt einen Deckel für Sandbox-Ausgaben",
+      isinstance(main.MAX_SANDBOX_ZEILEN, int) and main.MAX_SANDBOX_ZEILEN >= 20,
+      main.MAX_SANDBOX_ZEILEN)
+check("er greift beim Lesen des Container-Logs",
+      "len(lines) >= MAX_SANDBOX_ZEILEN" in _mq)
+check("die Kürzung wird gemeldet, nicht verschwiegen", "[Gekürzt]" in _mq)
+check("und sie nennt die wahrscheinliche Ursache",
+      "Endlosschleife" in _mq and "Eingabe" in _mq)
+# Der gekuerzte Text geht als Werkzeugergebnis zurueck ans Modell - dort waere
+# eine ungebremste Ausgabe noch schaedlicher als auf dem Bildschirm.
+check("der Hinweis landet auch im Ergebnis für das Modell",
+      "lines.append(hinweis)" in _mq)
+check("der Deckel liegt weit unter dem Ereignisbudget eines Laufs",
+      main.MAX_SANDBOX_ZEILEN * 4 < 4000, main.MAX_SANDBOX_ZEILEN)
+
 print("\n[26] Konnektoren")
 import connectors  # noqa: E402
 
