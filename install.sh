@@ -339,6 +339,10 @@ if [ -f "$SRC_DIR/deploy/update.sh" ]; then
   step "Aktualisierungsbefehl einrichten (braunycode-update)"
   sudo install -m 0755 "$SRC_DIR/deploy/update.sh" /usr/local/bin/braunycode-update
 fi
+if [ -f "$SRC_DIR/deploy/modell.sh" ]; then
+  step "Modellumschalter einrichten (braunycode-modell)"
+  sudo install -m 0755 "$SRC_DIR/deploy/modell.sh" /usr/local/bin/braunycode-modell
+fi
 
 # ---------------------------------------------------------------- 7. Firewall
 step "Lokale Firewall fuer Port $BRAUNY_PORT oeffnen"

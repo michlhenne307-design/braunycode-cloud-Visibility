@@ -307,5 +307,107 @@ _uebersetzt = _prov._ollama_messages(_kaputt)
 check("die Übersetzung wandelt Text zu Objekt",
       isinstance(_uebersetzt[0]["tool_calls"][0]["function"]["arguments"], dict))
 
+# --- Der API-Weg ----------------------------------------------------------
+#
+# Ein 30B-Modell auf 8 CPU-Kernen braucht Minuten je Schritt, eine API
+# antwortet in Sekunden. Der Weg dorthin war gebaut, aber nie erprobt - und
+# was nie lief, laeuft erfahrungsgemaess beim ersten Mal nicht. Deshalb hier
+# ein OpenAI-kompatibler Endpunkt zum Anfassen.
+
+print("\n[E2E] OpenAI-kompatibler Anbieter (DeepSeek & Co.)")
+
+_gesehen_api = []
+
+class _APIHandler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        laenge = int(self.headers.get("content-length", 0))
+        nutzlast = json.loads(self.rfile.read(laenge) or b"{}")
+        _gesehen_api.append({"pfad": self.path, "body": nutzlast,
+                             "auth": self.headers.get("authorization", "")})
+        # So antwortet eine OpenAI-kompatible API: arguments als JSON-TEXT.
+        antwort = {"choices": [{"message": {
+            "content": "",
+            "tool_calls": [{"id": "call_1", "type": "function",
+                            "function": {"name": "finish",
+                                         "arguments": '{"summary": "fertig"}'}}],
+        }}]}
+        roh = json.dumps(antwort).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(roh)))
+        self.end_headers()
+        self.wfile.write(roh)
+
+_s = socket.socket(); _s.bind(("127.0.0.1", 0)); _api_port = _s.getsockname()[1]; _s.close()
+_api = HTTPServer(("127.0.0.1", _api_port), _APIHandler)
+threading.Thread(target=_api.serve_forever, daemon=True).start()
+
+import provider as _p
+_alt = (_p.PROVIDER, _p.API_BASE, _p.API_KEY, _p.MODEL)
+_p.PROVIDER = "openai"
+_p.API_BASE = f"http://127.0.0.1:{_api_port}/v1"
+_p.API_KEY = "geheim-nicht-loggen"
+_p.MODEL = "deepseek-chat"
+try:
+    _antwort = _p.chat([{"role": "user", "content": "mach was"}],
+                       [{"type": "function", "function": {"name": "finish"}}])
+finally:
+    _p.PROVIDER, _p.API_BASE, _p.API_KEY, _p.MODEL = _alt
+    _api.shutdown()
+
+check("die API wird unter /chat/completions angesprochen",
+      _gesehen_api and _gesehen_api[0]["pfad"].endswith("/chat/completions"),
+      _gesehen_api[0]["pfad"] if _gesehen_api else None)
+check("der Schlüssel geht als Bearer mit",
+      _gesehen_api[0]["auth"] == "Bearer geheim-nicht-loggen", "(nicht ausgegeben)")
+check("das Modell steht in der Anfrage",
+      _gesehen_api[0]["body"].get("model") == "deepseek-chat")
+check("Werkzeuge werden mitgeschickt", "tools" in _gesehen_api[0]["body"])
+check("Argumente als Text werden auch hier zu einem Objekt",
+      _antwort.tool_calls and _antwort.tool_calls[0].arguments == {"summary": "fertig"},
+      _antwort.tool_calls[0].arguments if _antwort.tool_calls else None)
+check("die Aufruf-Kennung der API wird übernommen",
+      _antwort.tool_calls[0].call_id == "call_1", _antwort.tool_calls[0].call_id)
+
+# Ein Schluessel darf niemals in einer Fehlermeldung landen.
+_fehler_text = ""
+_api2 = HTTPServer(("127.0.0.1", 0), type("H", (BaseHTTPRequestHandler,), {
+    "log_message": lambda *a: None,
+    "do_POST": lambda s: (s.send_response(401), s.send_header("content-length", "2"),
+                          s.end_headers(), s.wfile.write(b"{}")),
+}))
+threading.Thread(target=_api2.serve_forever, daemon=True).start()
+_alt = (_p.PROVIDER, _p.API_BASE, _p.API_KEY)
+_p.PROVIDER, _p.API_BASE = "openai", f"http://127.0.0.1:{_api2.server_port}/v1"
+_p.API_KEY = "streng-geheimes-token-xyz"
+try:
+    _p.chat([{"role": "user", "content": "x"}])
+except _p.ProviderError as _e:
+    _fehler_text = str(_e)
+finally:
+    _p.PROVIDER, _p.API_BASE, _p.API_KEY = _alt
+    _api2.shutdown()
+check("eine Ablehnung nennt den Statuscode", "401" in _fehler_text, _fehler_text[:80])
+check("und verrät dabei nie den Schlüssel",
+      "streng-geheimes-token-xyz" not in _fehler_text, "(Schlüssel stand drin!)")
+
+# Der Umschaltbefehl selbst.
+_ms = (HIER / "deploy" / "modell.sh")
+check("es gibt einen Modellumschalter", _ms.exists(), str(_ms))
+if _ms.exists():
+    _mst = _ms.read_text()
+    check("er kennt lokal und deepseek",
+          "lokal|ollama)" in _mst and "deepseek)" in _mst)
+    check("er gibt den Schlüssel nie aus",
+          "Schlüssel: gesetzt" in _mst and "cut -d= -f2-" in _mst)
+    check("er schützt die Datei nach dem Schreiben", "chmod 600" in _mst)
+    check("er startet den Dienst neu", "systemctl restart braunycode" in _mst)
+    check("er benennt, dass Code an den Anbieter geht",
+          "an den Anbieter" in _mst)
+
+
 print(f"\n=== {ok} bestanden, {fail} fehlgeschlagen ===")
 sys.exit(1 if fail else 0)
