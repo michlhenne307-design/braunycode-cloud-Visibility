@@ -1636,6 +1636,81 @@ check("der Hinweis landet auch im Ergebnis für das Modell",
 check("der Deckel liegt weit unter dem Ereignisbudget eines Laufs",
       main.MAX_SANDBOX_ZEILEN * 4 < 4000, main.MAX_SANDBOX_ZEILEN)
 
+# --- Nicht nur Python ------------------------------------------------------
+#
+# Aus dem Betrieb, an einem Next.js-Projekt: der Agent hat versucht,
+# Python-Module zu importieren, bis der Lauf abbrach. Kein Modellfehler - er
+# KONNTE an TypeScript nichts belegen, weil check_syntax nur Python verstand.
+# Wer nur einen Hammer hat, sucht Naegel.
+import syntax as _syn  # noqa: E402
+import tempfile as _tf  # noqa: E402
+
+_sdir = pathlib.Path(_tf.mkdtemp()) if "pathlib" in dir() else None
+import pathlib as _pl  # noqa: E402
+_sdir = _pl.Path(_tf.mkdtemp())
+
+def _syn_pruefe(name, code):
+    f = _sdir / name
+    f.write_text(code)
+    return _syn.pruefen(name, code, str(f))
+
+check("Python wird weiterhin geprüft", _syn_pruefe("a.py", "x = 1\n")[0] is True)
+check("und ein Python-Fehler erkannt", _syn_pruefe("b.py", "def f(\n")[0] is False)
+check("JSON wird geprüft", _syn_pruefe("c.json", '{"a": 1}')[0] is True)
+check("und ein JSON-Fehler erkannt", _syn_pruefe("d.json", '{"a": }')[0] is False)
+
+# Ohne node ist keine JS/TS-Pruefung moeglich - dann MUSS 'weiss nicht'
+# herauskommen, nicht 'in Ordnung'. Das ist der Kern: eine ehrliche
+# Fehlanzeige statt eines erfundenen Hakens.
+_orig_node = _syn.NODE
+_syn.NODE = None
+try:
+    _ohne = _syn_pruefe("e.tsx", "kaputt <<<\n")
+finally:
+    _syn.NODE = _orig_node
+check("ohne node gilt TypeScript als ungeprüft, nicht als in Ordnung",
+      _ohne[0] is None and "keine Prüfung" in _ohne[1], _ohne)
+
+check("eine unbekannte Sprache wird als ungeprüft gemeldet",
+      _syn_pruefe("f.rs", "fn main() {}")[0] is None)
+check("und sagt dazu, dass damit nichts belegt ist",
+      "nicht belegt" in _syn_pruefe("g.rs", "fn main() {}")[1])
+
+if _syn.NODE:
+    check("TypeScript wird geprüft",
+          _syn_pruefe("h.ts", "const a: number = 1;\n")[0] is True)
+    check("TSX mit JSX wird geprüft",
+          _syn_pruefe("i.tsx", "export default () => <div>x</div>\n")[0] is True)
+    check("ein TSX-Syntaxfehler wird gefunden",
+          _syn_pruefe("j.tsx", "export default () => <div>x</div\n")[0] is False)
+    check("und nennt Zeile und Spalte",
+          "Zeile" in _syn_pruefe("k.ts", "const a: number = ;\n")[1])
+
+# Bei 'node -e' beginnt argv NICHT bei [2] wie bei einer Skriptdatei. Mit [2]
+# war die Datei undefined und die Pruefung meldete ewig "Parser nicht bereit",
+# obwohl alles installiert war.
+_synq = (main.BASE_DIR / "syntax.py").read_text()
+check("das Node-Skript liest sein Argument richtig",
+      "process.argv[process.argv.length - 1]" in _synq)
+# require() sucht nicht im globalen npm-Ordner - ohne NODE_PATH bleibt
+# typescript unsichtbar.
+check("der globale Modulpfad wird mitgegeben", "NODE_PATH" in _synq)
+check("es wird nur geparst, nicht typgeprüft",
+      "parseDiagnostics" in _synq and "--noEmit" not in _synq)
+
+_tq2 = (main.BASE_DIR / "tools.py").read_text()
+check("check_syntax benutzt die Sprachweiche", "syntax.pruefen(" in _tq2)
+check("ein ungeprüfter Fall gilt nicht als bestanden",
+      'return f"HINWEIS: {meldung}"' in _tq2)
+
+# Und die Sandbox muss JS ueberhaupt ausfuehren koennen, sonst bleibt jeder
+# Beleg bei einem Web-Projekt bei "sieht gut aus".
+_df2 = (main.BASE_DIR.parent / "deploy" / "sandbox.Dockerfile").read_text()
+check("die Sandbox bringt node mit", "node:20-slim" in _df2)
+check("die Sandbox bringt npm mit", "npm-cli.js" in _df2)
+check("und TypeScript, weil sie ohne Netz läuft", "typescript@5" in _df2)
+check("das Image prüft node beim Bauen", "node --version" in _df2)
+
 print("\n[26] Konnektoren")
 import connectors  # noqa: E402
 
@@ -2846,7 +2921,12 @@ for _s in _skills:
         # in die Abschluss-Sperre und kommt nicht wieder heraus.
         check(f"{_s.name}: ändert Code, also auch check_syntax",
               "check_syntax" in _erlaubt, sorted(_erlaubt))
-    if _erlaubt & tools.MODIFYING and _erlaubt & {"run_python", "run_command"}:
+    # Frueher stand hier "aendert UND fuehrt aus". Das war zu grob: es traf
+    # auch den Web-Skill, und affected_tests laeuft ueber den PYTHON-
+    # Importgraphen - fuer ein TypeScript-Projekt hat es nichts zu sagen.
+    # Massgeblich ist deshalb run_python: wer Python ausfuehren darf, arbeitet
+    # an Python und soll wissen, welche Tests seine Aenderung erreicht.
+    if _erlaubt & tools.MODIFYING and "run_python" in _erlaubt:
         # Nur wer auch ausfuehren darf. 'doku' aendert Docstrings, kann aber
         # bewusst nichts starten - eine Testliste waere dort Information, mit
         # der es nichts anfangen kann. Die erste Fassung dieser Zusicherung war

@@ -23,6 +23,7 @@ import time
 import connectors
 import diagnostics
 import memory as memory_mod
+import syntax
 import testimpact
 
 MAX_OUTPUT = 4000        # Zeichen, die ein Werkzeugergebnis zurueckgeben darf
@@ -704,13 +705,28 @@ class Toolbox:
         return dateien
 
     async def _check_syntax(self, args) -> str:
+        """Prueft die Syntax - fuer Python, JSON und die TypeScript-Familie.
+
+        Frueher konnte hier nur Python geprueft werden. An einem
+        TypeScript-Projekt hiess das: keine Pruefung, also kein Beleg, also
+        wich das Modell auf Python aus, weil das das Einzige war, womit es
+        etwas zeigen konnte. Wer nur einen Hammer hat, sucht Naegel.
+
+        'Weiss nicht' bleibt ausdruecklich ein eigenes Ergebnis und wird NICHT
+        als bestanden gemeldet - sonst waere die Ausweitung ein Rueckschritt.
+        """
         path = str(args.get("path", "")).strip()
         code = self.ws.read(path)
         try:
-            ast.parse(code)
-        except SyntaxError as exc:
-            return f"SyntaxError in {path}, Zeile {exc.lineno}: {exc.msg}"
-        return f"{path}: Syntax in Ordnung."
+            auf_platte = str(self.ws.resolve(path))
+        except Exception:
+            auf_platte = ""
+        bestanden, meldung = syntax.pruefen(path, code, auf_platte)
+        if bestanden is None:
+            # Kein "in Ordnung" - der Aufrufer erkennt am fehlenden Schluss,
+            # dass hier nichts belegt wurde.
+            return f"HINWEIS: {meldung}"
+        return meldung
 
     async def _search(self, args) -> str:
         query = str(args.get("query", "")).strip()

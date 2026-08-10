@@ -125,6 +125,11 @@ export NEEDRESTART_MODE=a
 sudo -E apt-get update -qq
 sudo -E apt-get -y -qq -o Dpkg::Options::=--force-confold upgrade
 sudo -E apt-get install -y -qq python3-venv python3-pip curl git tmux ca-certificates
+# Node auch ausserhalb der Sandbox: die schnelle Syntaxpruefung laeuft im
+# Dienst selbst, ohne Container. Ohne node koennte sie fuer JavaScript und
+# TypeScript nur sagen "keine Pruefung verfuegbar" - und ein Agent, der nicht
+# pruefen kann, behauptet.
+sudo -E apt-get install -y -qq nodejs npm || warn "node fehlt — JS/TS-Syntaxprüfung eingeschränkt."
 
 # ---------------------------------------------------------------- 2. Docker
 if command -v docker >/dev/null 2>&1; then
