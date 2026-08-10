@@ -121,23 +121,46 @@ def load(directory) -> list[Skill]:
     return gefunden
 
 
+# Ab dieser Laenge darf ein Ausloeser auch INNERHALB eines Wortes zaehlen.
+#
+# Deutsch setzt zusammen: "Sicherheitslücken", "Datenverarbeitung",
+# "Programmierung" sind je EIN Wort. Ein rein wortgenauer Abgleich findet
+# darin weder "sicherheit" noch "daten" noch "programm" - im Betrieb ging
+# "Prüfe den Code auf Sicherheitslücken" deshalb an den Review-Skill statt an
+# den Sicherheits-Skill.
+#
+# Kurze Ausloeser bleiben wortgenau, sonst zuendet "test" in "Kontext" und
+# "code" in "Decoder". Sieben Zeichen sind lang genug, dass ein zufaelliges
+# Vorkommen unwahrscheinlich wird, und kurz genug fuer die ueblichen
+# Grundwoerter.
+TEILWORT_AB = 7
+
+
 def score(task: str, skill: Skill) -> int:
     """Wie gut passt der Skill zur Aufgabe?
 
-    Wortweiser Abgleich, kein Teilstring: sonst wuerde 'testen' in 'Kontext'
-    zuenden. Der Name zaehlt doppelt, weil er meist deutlicher ist als ein
-    einzelnes Ausloeserwort.
+    Der Name zaehlt doppelt, weil er meist deutlicher ist als ein einzelnes
+    Ausloeserwort.
     """
     klein = (task or "").lower()
     woerter = set(WORD.findall(klein))
     if not woerter:
         return 0
-    # Mehrwortige Ausloeser ("leerer test") stehen nach dem Komma-Split als
-    # EIN Eintrag mit Leerzeichen da und koennen in einer Menge einzelner
-    # Woerter nie vorkommen - sie haetten also nie gezuendet, ohne dass
-    # irgendwo ein Fehler auftaucht. Sie werden deshalb als Wortfolge gesucht.
-    treffer = sum(1 for wort in skill.ausloeser
-                  if (wort in klein if " " in wort else wort in woerter))
+
+    def zuendet(ausloeser: str) -> bool:
+        # Mehrwortige Ausloeser ("leerer test") stehen nach dem Komma-Split
+        # als EIN Eintrag mit Leerzeichen da und koennen in einer Menge
+        # einzelner Woerter nie vorkommen - sie haetten also nie gezuendet,
+        # ohne dass irgendwo ein Fehler auftaucht.
+        if " " in ausloeser:
+            return ausloeser in klein
+        if ausloeser in woerter:
+            return True
+        if len(ausloeser) >= TEILWORT_AB:
+            return any(ausloeser in wort for wort in woerter)
+        return False
+
+    treffer = sum(1 for wort in skill.ausloeser if zuendet(wort))
     if skill.name in woerter:
         treffer += 2
     return treffer

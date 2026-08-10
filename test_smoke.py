@@ -1488,9 +1488,13 @@ check("leerer Text kein Skill", skills_mod.parse("") is None)
 
 echte = skills_mod.load(main.BASE_DIR.parent / "skills")
 namen = {sk.name for sk in echte}
-check("mitgelieferte Skills geladen", len(echte) == 5, sorted(namen))
-check("Skills heißen wie erwartet",
-      namen == {"tests", "bugfix", "umbau", "review", "doku"}, sorted(namen))
+# Feste Zahl statt fester Liste waere hier falsch herum: dazukommende Skills
+# sind erwuenscht, verschwindende nicht. Geprueft wird deshalb, dass die
+# tragenden noch da sind - nicht, dass es genau diese sind.
+_kern = {"tests", "bugfix", "umbau", "review", "doku",
+         "neubau", "erklaeren", "sicherheit", "daten"}
+check("die tragenden Skills sind alle da", _kern <= namen, sorted(_kern - namen))
+check("es gibt keine namenlosen Skills", all(sk.name for sk in echte))
 check("jeder Skill hat Auslöser", all(sk.ausloeser for sk in echte))
 check("jeder Skill hat eine Anleitung", all(len(sk.anleitung) > 100 for sk in echte))
 check("fehlendes Verzeichnis -> leere Liste",
@@ -1546,14 +1550,64 @@ for sk in echte:
     check(f"Skill '{sk.name}' erlaubt finish",
           "finish" in sk.werkzeuge, sk.werkzeuge)
 
+# Die Regel lautete frueher "jeder Skill ausser review kennt edit_file". Das
+# war die Beobachtung von damals, nicht die Regel: 'review' war schlicht der
+# einzige, der nichts schreiben durfte. Mit erklaeren, sicherheit und daten
+# waeren nun drei Ausnahmen noetig gewesen - ein Zeichen, dass die
+# Formulierung nicht stimmt.
+#
+# Gemeint ist: WER SCHREIBEN DARF, muss auch aendern koennen. Sonst bleibt ihm
+# nur, eine Datei komplett neu zu schreiben, und dabei geht fremder Code
+# verloren, den er gar nicht anfassen sollte.
 schreibende = {"edit_file", "write_file"}
 for sk in echte:
-    if sk.name == "review":
-        check("review darf nichts Schreibendes",
-              not (schreibende & set(sk.werkzeuge)), sk.werkzeuge)
-    else:
-        check(f"Skill '{sk.name}' kennt edit_file",
+    darf_schreiben = bool(schreibende & set(sk.werkzeuge))
+    if darf_schreiben:
+        check(f"Skill '{sk.name}' darf ändern, nicht nur überschreiben",
               "edit_file" in sk.werkzeuge, sk.werkzeuge)
+    else:
+        # Ein nur lesender Skill muss auch wirklich nichts veraendern koennen.
+        check(f"Skill '{sk.name}' ist lesend und bleibt es",
+              not (set(sk.werkzeuge) & tools.MODIFYING), sorted(set(sk.werkzeuge) & tools.MODIFYING))
+
+# --- Trifft der richtige Skill? ------------------------------------------
+#
+# Die Werkzeugliste eines Skills entscheidet mit, was der Agent ueberhaupt
+# tun kann - ein falsch gewaehlter Skill ist deshalb kein Schoenheitsfehler.
+# Diese Saetze stammen aus dem Betrieb oder sind so formuliert, wie jemand
+# wirklich schreibt.
+_erwartungen = [
+    ("Baue ein vollständiges Python-Konsolenprogramm für eine kleine "
+     "Aufgabenverwaltung.", "neubau"),
+    ("Schreib Tests für die Zahlungslogik", "tests"),
+    ("Erkläre mir, was dieses Projekt macht", "erklaeren"),
+    ("Wie funktioniert die Anmeldung?", "erklaeren"),
+    ("Prüfe den Code auf Sicherheitslücken", "sicherheit"),
+    ("Gibt es hier Schwachstellen?", "sicherheit"),
+    ("Der Import stürzt mit einem KeyError ab", "bugfix"),
+    ("Das geht nicht, da kommt eine Fehlermeldung", "bugfix"),
+    ("Benenne die Funktion foo in bar um, ohne Verhalten zu ändern", "umbau"),
+    ("Wandle die CSV in JSON um und zähl die Zeilen", "daten"),
+    ("Schreib eine README für das Projekt", "doku"),
+    ("Mach eine Durchsicht und melde Probleme im Stil", "review"),
+]
+for _text, _erwartet in _erwartungen:
+    _treffer = skills_mod.match(_text, echte)
+    check(f"„{_text[:34]}…\u201c → {_erwartet}",
+          _treffer is not None and _treffer.name == _erwartet,
+          _treffer.name if _treffer else "kein Skill")
+
+# Deutsche Zusammensetzungen sind EIN Wort. Ein rein wortgenauer Abgleich
+# findet in "Sicherheitslücken" weder "sicherheit" noch "lücke" - im Betrieb
+# ging genau dieser Satz an den falschen Skill.
+check("lange Auslöser zünden auch innerhalb eines Wortes",
+      skills_mod.score("Sicherheitsprüfung gewünscht",
+                       skills_mod.Skill(name="x", ausloeser=["sicherheit"])) == 1)
+# Kurze duerfen das nicht, sonst zuendet 'code' in 'Decoder'.
+check("kurze Auslöser bleiben wortgenau",
+      skills_mod.score("Der Decoder läuft",
+                       skills_mod.Skill(name="x", ausloeser=["code"])) == 0)
+check("die Schwelle steht bei sieben Zeichen", skills_mod.TEILWORT_AB == 7)
 
 print("\n[26] Konnektoren")
 import connectors  # noqa: E402

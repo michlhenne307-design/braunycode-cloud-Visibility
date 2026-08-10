@@ -1,7 +1,7 @@
 ---
 name: review
 beschreibung: Code prüfen und Probleme melden, ohne etwas zu ändern
-ausloeser: review, prüfe, prüfen, durchsicht, begutachte, bewerte, schwachstellen, probleme, sicher
+ausloeser: review, prüfe, prüfen, durchsicht, begutachte, bewerte, probleme, qualität, sauber, stil
 werkzeuge: list_files, glob, read_file, search, outline, symbol_info, check_syntax, affected_tests, finish
 ---
 Du prüfst und meldest. Du änderst nichts — `edit_file`, `write_file` und alles
