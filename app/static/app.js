@@ -33,6 +33,7 @@ let startedAt = 0;
 let turn = null;        // aktueller Agenten-Beitrag
 let schritt = null;     // offener Werkzeugaufruf (details-Element)
 let ausgabe = null;     // laufender Ausgabeblock
+let strom = null;       // Textblock, in den das Modell gerade schreibt
 
 /* ----------------------------------------------------------- Hilfsmittel */
 
@@ -97,6 +98,7 @@ function beitragAgentBeginnen() {
   $('stream').appendChild(turn);
   schritt = null;
   ausgabe = null;
+  strom = null;
   nachUnten(true);
 }
 
@@ -107,6 +109,51 @@ function beitragAgentBeenden() {
   turn = null;
   schritt = null;
   ausgabe = null;
+  strom = null;
+}
+
+/* Solange das Modell rechnet, laeuft eine Uhr statt drei stummer Punkte.
+   Auf CPU vergehen Minuten bis zum ersten Zeichen; ohne Anzeige ist das von
+   einem Absturz nicht zu unterscheiden - und wer nicht unterscheiden kann,
+   drueckt irgendwann auf Abbrechen. */
+function puls(sekunden) {
+  if (!turn) return;
+  const punkte = turn.querySelector('.thinking');
+  if (!punkte) return;
+  let uhr = punkte.querySelector('.uhr');
+  if (!uhr) {
+    uhr = el('span', 'uhr');
+    punkte.appendChild(uhr);
+  }
+  uhr.textContent = 'denkt … ' + Math.round(sekunden) + ' s';
+}
+
+/* Text, waehrend er entsteht. Ein eigener Block, damit ein Werkzeugaufruf
+   oder Code danach wieder sauber daneben steht. */
+function stromZeile(stueck) {
+  if (!strom) {
+    strom = el('div', 'say strom', '');
+    anhaengen(strom);
+  }
+  const unten = amEnde();
+  strom.textContent += stueck;
+  nachUnten(unten);
+}
+
+/* Was der Schritt gekostet hat. Ohne Zahlen bleibt "es ist langsam" eine
+   Meinung; mit ihnen sieht man, wohin die Zeit geht. */
+function messwerte(ev) {
+  const teile = [];
+  if (ev.prompt_token) {
+    teile.push(ev.prompt_token + ' Token gelesen (' + ev.prompt_s + ' s)');
+  }
+  if (ev.antwort_token) {
+    const rate = ev.antwort_s > 0 ? (ev.antwort_token / ev.antwort_s).toFixed(1) : '?';
+    teile.push(ev.antwort_token + ' erzeugt (' + ev.antwort_s + ' s, ' + rate + '/s)');
+  }
+  if (ev.geladen_s > 1) teile.push('Modell geladen: ' + ev.geladen_s + ' s');
+  if (!teile.length) return;
+  anhaengen(el('div', 'mess', teile.join(' · ')));
 }
 
 function sagen(text, art) {
@@ -115,9 +162,10 @@ function sagen(text, art) {
 }
 
 function werkzeug(text) {
-  // Ein neuer Aufruf beendet den vorigen und den laufenden Ausgabeblock.
+  // Ein neuer Aufruf beendet den vorigen, den Ausgabeblock und den Textstrom.
   schritt = null;
   ausgabe = null;
+  strom = null;
 
   const d = document.createElement('details');
   d.className = 'step';
@@ -155,6 +203,7 @@ function ausgabezeile(text) {
 function codeblock(text, pfad, versuch) {
   schritt = null;
   ausgabe = null;
+  strom = null;
 
   const b = el('div', 'block');
   const kopf = el('div', 'head');
@@ -182,6 +231,7 @@ function codeblock(text, pfad, versuch) {
 function ergebnis(ev) {
   schritt = null;
   ausgabe = null;
+  strom = null;
 
   const gut = !!ev.ok;
   const v = el('div', 'verdict ' + (gut ? 'ok' : 'fail'));
@@ -386,6 +436,15 @@ function handleEvent(raw, prompt) {
     case 'plan':
       sagen(ev.text || '');
       break;
+    case 'delta':
+      stromZeile(ev.text || '');
+      break;
+    case 'puls':
+      puls(ev.sekunden || 0);
+      break;
+    case 'messung':
+      messwerte(ev);
+      break;
     case 'error':
       schritt = null;
       sagen(ev.text || '', 'error');
@@ -411,6 +470,7 @@ function handleEvent(raw, prompt) {
     default:
       // status und alles Unbekannte: als schlichte Zeile, niemals versteckt.
       schritt = null;
+      strom = null;
       sagen(ev.text || '', 'status');
   }
 }

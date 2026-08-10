@@ -296,6 +296,32 @@ body {
 .thinking i:nth-child(3) { animation-delay: .36s; }
 @keyframes blink { 0%, 60%, 100% { opacity: .25; } 30% { opacity: 1; } }
 
+/* Uhr neben den Punkten: auf CPU vergehen Minuten bis zum ersten Zeichen.
+   Ohne sichtbar laufende Zeit ist Rechnen von Haengen nicht zu unterscheiden. */
+.thinking .uhr {
+  margin-left: 4px;
+  font-size: 12.5px;
+  color: var(--faint);
+  align-self: center;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Text, waehrend er entsteht. */
+.say.strom { color: var(--text); }
+.say.strom::after {
+  content: "▍";
+  color: var(--accent);
+  animation: blink 1.1s step-end infinite;
+}
+
+/* Messwerte eines Schritts - da, aber leise. */
+.mess {
+  font-size: 11.5px;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+  padding-left: 2px;
+}
+
 /* -------------------------------------------------------------- Eingabe */
 
 .composer {

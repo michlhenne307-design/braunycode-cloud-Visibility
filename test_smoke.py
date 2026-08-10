@@ -49,42 +49,108 @@ import provider  # noqa: E402
 
 import httpx  # noqa: E402
 
-class OllamaAntwort:
-    """Minimalnachbau einer httpx-Antwort von Ollama.
+class OllamaStrom:
+    """Nachbau einer stroemenden httpx-Antwort von Ollama.
 
-    Eigener Name, weil weiter unten eine andere Klasse 'FakeAntwort' fuer die
-    Konnektor-Pruefung steht - die wuerde diese hier sonst verdecken.
+    Ollama antwortet zeilenweise als NDJSON: viele Teilstuecke, das letzte
+    mit done=true und den Messwerten.
     """
-    def __init__(self, daten, status=200):
-        self.daten = daten
+    def __init__(self, zeilen, status=200, rumpf=""):
+        self.zeilen = zeilen
         self.status_code = status
-        self.text = json.dumps(daten)
-    def raise_for_status(self):
-        return None
-    def json(self):
-        return self.daten
+        self.text = rumpf
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        return False
+    def read(self):
+        return b""
+    def iter_lines(self):
+        for z in self.zeilen:
+            yield json.dumps(z) if isinstance(z, dict) else z
 
 _letzte_anfrage = {}
 
-def fake_ollama_chat(daten, tools=None):
-    """Setzt httpx.post voruebergehend auf eine feste Ollama-Antwort."""
-    orig = httpx.post
-    def _post(url, json=None, timeout=None, **rest):
+def _strom_setzen(zeilen, status=200, rumpf=""):
+    """Ersetzt httpx.stream und merkt sich, was gesendet wurde."""
+    def _stream(method, url, **kw):
         _letzte_anfrage.clear()
-        _letzte_anfrage.update({"url": url, "body": json})
-        return OllamaAntwort(daten)
-    httpx.post = _post
+        _letzte_anfrage.update({"url": url, "body": kw.get("json")})
+        return OllamaStrom(zeilen, status, rumpf)
+    return _stream
+
+def fake_ollama_chat(daten, tools=None, on_text=None):
+    """Ein Modellaufruf gegen eine erfundene Ollama-Antwort.
+
+    daten: entweder die fertige Nachricht (wird zu einer done-Zeile) oder
+    eine Liste von Teilstuecken, wie sie wirklich ueber die Leitung kommen.
+    """
+    zeilen = daten if isinstance(daten, list) else [{**daten, "done": True}]
+    orig = httpx.stream
+    httpx.stream = _strom_setzen(zeilen)
     try:
-        return provider._chat_ollama([{"role": "user", "content": "x"}], tools)
+        return provider._chat_ollama([{"role": "user", "content": "x"}], tools,
+                                     on_text=on_text)
     finally:
-        httpx.post = orig
+        httpx.stream = orig
 
 r = fake_ollama_chat({"message": {"content": "hallo"}})
 check("Antworttext wird gelesen", r.text == "hallo", r)
 check("ohne tool_calls bleibt die Liste leer", r.tool_calls == [])
 check("die Anfrage geht an /api/chat", _letzte_anfrage["url"].endswith("/api/chat"),
       _letzte_anfrage.get("url"))
-check("es wird nicht gestreamt", _letzte_anfrage["body"]["stream"] is False)
+# Frueher stand hier "es wird nicht gestreamt". Das war der Fehler: bei einem
+# 30B-Modell auf CPU vergehen Minuten bis zum ersten Zeichen, und ohne Strom
+# ist das von einem Absturz nicht zu unterscheiden.
+check("es wird gestreamt", _letzte_anfrage["body"]["stream"] is True)
+
+# Die drei Stellschrauben, die auf dieser Maschine ueber Minuten entscheiden.
+check("das Modell bleibt im Speicher (keep_alive)",
+      _letzte_anfrage["body"].get("keep_alive") == provider.KEEP_ALIVE,
+      _letzte_anfrage["body"].get("keep_alive"))
+check("das Kontextfenster wird gesetzt, nicht geraten",
+      _letzte_anfrage["body"]["options"]["num_ctx"] == provider.NUM_CTX)
+check("die Antwortlaenge hat einen Deckel",
+      _letzte_anfrage["body"]["options"]["num_predict"] == provider.NUM_PREDICT)
+check("das Kontextfenster ist größer als Ollamas Vorgabe von 4096",
+      provider.NUM_CTX > 4096, provider.NUM_CTX)
+
+# Teilstuecke muessen ankommen, waehrend sie entstehen - sonst nuetzt der
+# Strom nichts.
+_gesehen = []
+_r = fake_ollama_chat(
+    [{"message": {"content": "Hallo "}},
+     {"message": {"content": "Welt"}},
+     {"message": {"content": ""}, "done": True,
+      "prompt_eval_count": 1200, "prompt_eval_duration": 40_000_000_000,
+      "eval_count": 80, "eval_duration": 20_000_000_000,
+      "total_duration": 61_000_000_000, "load_duration": 1_000_000_000}],
+    on_text=_gesehen.append)
+check("Teilstücke kommen einzeln an", _gesehen == ["Hallo ", "Welt"], _gesehen)
+check("und ergeben zusammen den ganzen Text", _r.text == "Hallo Welt", _r.text)
+
+# Ohne Zahlen bleibt "es ist langsam" eine Meinung.
+check("die Messwerte werden übernommen",
+      _r.messung.get("prompt_token") == 1200 and _r.messung.get("antwort_token") == 80,
+      _r.messung)
+check("Dauern kommen in Sekunden, nicht in Nanosekunden",
+      _r.messung.get("prompt_s") == 40.0 and _r.messung.get("antwort_s") == 20.0,
+      _r.messung)
+check("die Ladezeit des Modells wird getrennt ausgewiesen",
+      _r.messung.get("geladen_s") == 1.0, _r.messung)
+
+# Eine kaputte Zeile mitten im Strom darf nicht alles Bisherige wegwerfen.
+_r = fake_ollama_chat([{"message": {"content": "gut"}},
+                       "das ist kein json",
+                       {"message": {"content": ""}, "done": True}])
+check("eine unlesbare Zeile im Strom wird übersprungen", _r.text == "gut", _r.text)
+
+# Ein Anzeigefehler darf den Modellaufruf nicht mitreissen.
+def _kaputt(_):
+    raise RuntimeError("Anzeige kaputt")
+_r = fake_ollama_chat({"message": {"content": "trotzdem da"}}, on_text=_kaputt)
+check("ein Fehler beim Anzeigen reißt den Aufruf nicht mit",
+      _r.text == "trotzdem da", _r.text)
 check("Werkzeugaufrufe laufen mit Temperatur 0",
       _letzte_anfrage["body"]["options"]["temperature"] == 0.0)
 check("ohne Werkzeuge steht kein tools-Feld in der Anfrage",
@@ -203,15 +269,9 @@ check("ein content=None wird zu leerem Text, nicht zu null",
 
 # Und die Ablehnung selbst muss lesbar sein. "400 Bad Request" allein sagt
 # nicht, WAS falsch war - der Grund steht im Rumpf und gehoert in die Meldung.
-class _Abgelehnt:
-    status_code = 400
-    text = '{"error":"invalid message content type: <nil>"}'
-    @staticmethod
-    def json():
-        return {"error": "invalid message content type: <nil>"}
-
-_orig_post = httpx.post
-httpx.post = lambda *a, **k: _Abgelehnt()
+_orig_post = httpx.stream
+httpx.stream = _strom_setzen([], status=400,
+                             rumpf='{"error":"invalid message content type: <nil>"}')
 try:
     provider._chat_ollama([{"role": "user", "content": "x"}], None)
     check("eine Ablehnung nennt den Grund", False, "keine Ausnahme")
@@ -219,7 +279,7 @@ except provider.ProviderError as _exc:
     check("eine Ablehnung nennt den Grund",
           "400" in str(_exc) and "invalid message content type" in str(_exc), _exc)
 finally:
-    httpx.post = _orig_post
+    httpx.stream = _orig_post
 
 print("\n[3] make_project_dir")
 d = sandbox.make_project_dir({"main.py": "print('x')"})
@@ -372,6 +432,23 @@ check("das Eingabefeld ist mindestens 16px groß",
       css.split("#prompt {")[1].split("}")[0])
 check("der Startknopf wird beim Laufen zum Abbruch",
       "body.running .send" in css)
+
+# Sichtbarkeit waehrend der Rechenzeit. Ein 30B-Modell auf CPU braucht
+# Minuten bis zum ersten Zeichen; ohne Anzeige haelt man das fuer einen
+# Absturz - genau das ist im Betrieb passiert ("Seit 5min passiert
+# garnichts").
+check("es gibt eine laufende Uhr, nicht nur stumme Punkte",
+      "function puls(" in js and ".thinking .uhr" in css)
+check("Text wird angezeigt, während er entsteht",
+      "function stromZeile(" in js and "case 'delta'" in js)
+check("die Messwerte eines Schritts werden angezeigt",
+      "function messwerte(" in js and "case 'messung'" in js)
+check("Tokens pro Sekunde werden ausgerechnet",
+      "antwort_token / ev.antwort_s" in js)
+# Ein neuer Werkzeugaufruf, Code oder Abschluss muss den Textstrom beenden -
+# sonst wachsen spaetere Stuecke in den alten Block hinein.
+check("ein neuer Abschnitt beendet den Textstrom",
+      js.count("strom = null") >= 5, js.count("strom = null"))
 
 # Beim Umbau tatsaechlich passiert und erst auf einer Bildschirmaufnahme
 # aufgefallen: 'hidden' setzt display:none nur in der Browservorlage. Eine
@@ -2742,17 +2819,13 @@ print("\n[38] Abtastverhalten: deterministisch, wo es genau sein muss")
 
 def _ollama_kwargs(policy=provider.DETERMINISTISCH):
     """Faengt die Nutzlast ab, mit der Ollama tatsaechlich gerufen wird."""
-    gesehen = {}
-    orig = httpx.post
-    def _post(url, json=None, timeout=None, **rest):
-        gesehen.update(json or {})
-        return OllamaAntwort({"message": {"content": "ok"}})
-    httpx.post = _post
+    orig = httpx.stream
+    httpx.stream = _strom_setzen([{"message": {"content": "ok"}, "done": True}])
     try:
         provider._chat_ollama([{"role": "user", "content": "x"}], None, policy)
     finally:
-        httpx.post = orig
-    return gesehen
+        httpx.stream = orig
+    return dict(_letzte_anfrage["body"])
 
 _kw = _ollama_kwargs()
 check("Ollama bekommt Optionen", "options" in _kw, _kw.keys())
@@ -3302,6 +3375,74 @@ if os.path.exists(_DOCKERFILE):
     check("ruff steckt im Sandbox-Image", "ruff" in _rezept, _rezept)
     check("mypy bleibt bewusst draußen", "mypy" not in _rezept, _rezept)
     check("das Image prüft ruff beim Bauen", "ruff --version" in _df)
+
+
+print("\n[45] Textstrom aus dem Arbeitsfaden in den Ereignisloop")
+
+# Der Modellaufruf laeuft in einem Arbeitsfaden, die Anzeige im Ereignisloop.
+# Der erste Entwurf plante je Stueck eine eigene Aufgabe ein - dabei kann das
+# zuletzt erzeugte Stueck ein frueheres ueberholen und der Text steht
+# durcheinander auf dem Bildschirm. Hier wird die Reihenfolge geprueft, nicht
+# nur die Vollstaendigkeit.
+
+def _strom_durchreichen(stuecke, verzoegerung=0.0):
+    gesehen = []
+
+    async def _on_text(s):
+        gesehen.append(s)
+
+    def _falscher_chat(messages, tools=None, policy=None, on_text=None):
+        for teil in stuecke:
+            if verzoegerung:
+                time.sleep(verzoegerung)
+            if on_text:
+                on_text(teil)
+        return provider.Reply(text="".join(stuecke))
+
+    async def _lauf():
+        orig = provider.chat
+        provider.chat = _falscher_chat
+        try:
+            return await main.model_chat([{"role": "user", "content": "x"}],
+                                         None, on_text=_on_text)
+        finally:
+            provider.chat = orig
+
+    antwort = asyncio.run(_lauf())
+    return antwort, gesehen
+
+_stuecke = [f"teil{n}-" for n in range(25)]
+_antwort, _gesehen = _strom_durchreichen(_stuecke)
+check("nichts geht auf dem Weg verloren",
+      "".join(_gesehen) == "".join(_stuecke), "".join(_gesehen)[:80])
+check("die Reihenfolge bleibt erhalten",
+      "".join(_gesehen) == "".join(_stuecke)
+      and _gesehen == sorted(_gesehen, key=lambda s: "".join(_stuecke).index(s)),
+      _gesehen[:4])
+check("die Antwort selbst kommt trotzdem zurück",
+      _antwort.text == "".join(_stuecke), _antwort.text[:40])
+
+# Mit Pausen dazwischen kommen die Stuecke einzeln statt als ein Klumpen -
+# genau dafuer ist der Strom da.
+_antwort, _gesehen = _strom_durchreichen(["eins ", "zwei ", "drei"], verzoegerung=0.03)
+check("mit Pausen kommen die Stücke auch einzeln an",
+      len(_gesehen) >= 2 and "".join(_gesehen) == "eins zwei drei", _gesehen)
+
+# Ohne Rueckruf muss der alte, einfache Weg unveraendert funktionieren.
+def _stiller_chat(messages, tools=None, policy=None, on_text=None):
+    assert on_text is None, "ohne Rueckruf darf keiner durchgereicht werden"
+    return provider.Reply(text="still")
+
+async def _ohne_strom():
+    orig = provider.chat
+    provider.chat = _stiller_chat
+    try:
+        return await main.model_chat([{"role": "user", "content": "x"}])
+    finally:
+        provider.chat = orig
+
+check("ohne Rückruf bleibt es beim einfachen Aufruf",
+      asyncio.run(_ohne_strom()).text == "still")
 
 
 print("\n[44] Laeufe leben auf dem Server, nicht in der Verbindung")

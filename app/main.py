@@ -95,21 +95,73 @@ def extract_code(text: str) -> str:
     return text.strip()
 
 
-async def model_chat(messages, schema=None):
+async def model_chat(messages, schema=None, on_text=None):
     """Ein Modellaufruf mit Zeitlimit, egal ob lokal oder ueber eine API.
 
     wait_for beendet den Hintergrund-Thread nicht - der laeuft aus. Es loest
     aber die Verbindung, statt sie unbegrenzt haengen zu lassen.
+
+    on_text bekommt Textstuecke, waehrend sie entstehen. Der Modellaufruf
+    laeuft in einem Arbeitsfaden; von dort darf nicht in den Ereignisloop
+    geschrieben werden.
+
+    Die Bruecke ist bewusst EIN Ausgeber, der der Reihe nach leert - nicht je
+    Stueck eine eigene Aufgabe. Aufgaben laufen in der Reihenfolge, in der der
+    Loop sie drannimmt, und das letzte Stueck wird am Ende direkt abgewartet:
+    damit koennte es vor einem frueheren erscheinen und der Text waere
+    durcheinander. Ein Ausgeber, eine Warteschlange, keine Ueberholspur.
     """
+    if on_text is None:
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(provider.chat, messages, schema),
+                timeout=ASK_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            raise TimeoutError(
+                f"Das Modell hat nach {ASK_TIMEOUT}s nicht geantwortet."
+            ) from None
+
+    loop = asyncio.get_running_loop()
+    puffer: list[str] = []
+    wecker = asyncio.Event()
+    fertig = False
+
+    def bruecke(stueck: str):
+        """Laeuft im Arbeitsfaden."""
+        puffer.append(stueck)
+        loop.call_soon_threadsafe(wecker.set)
+
+    async def ausliefern():
+        while True:
+            await wecker.wait()
+            wecker.clear()
+            # Alles auf einmal nehmen, was inzwischen da ist: das buendelt von
+            # selbst, ohne feste Groesse und ohne Wartezeit.
+            if puffer:
+                stueck, puffer[:] = "".join(puffer), []
+                await on_text(stueck)
+            if fertig and not puffer:
+                return
+
+    ausgeber = asyncio.create_task(ausliefern())
     try:
         return await asyncio.wait_for(
-            asyncio.to_thread(provider.chat, messages, schema),
+            asyncio.to_thread(provider.chat, messages, schema,
+                              provider.DETERMINISTISCH, bruecke),
             timeout=ASK_TIMEOUT,
         )
     except asyncio.TimeoutError:
         raise TimeoutError(
             f"Das Modell hat nach {ASK_TIMEOUT}s nicht geantwortet."
         ) from None
+    finally:
+        fertig = True
+        wecker.set()
+        try:
+            await ausgeber
+        except Exception:
+            log.exception("Textausgabe fehlgeschlagen - der Lauf geht weiter.")
 
 
 async def ask(prompt: str) -> str:

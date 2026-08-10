@@ -14,6 +14,7 @@ Alle drei Faelle werden erkannt und benannt statt beschoenigt.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -84,6 +85,30 @@ def _summarize(name: str, arguments: dict) -> str:
             text = text[:60] + "…"
         parts.append(f"{key}={text}")
     return f"{name}({', '.join(parts)})"
+
+
+# Wie oft ein Lebenszeichen kommt, waehrend das Modell rechnet.
+PULS_S = float(os.environ.get("BRAUNY_PULS", "3"))
+
+
+async def _mit_puls(send, aufgabe, schritt):
+    """Auf das Modell warten und dabei regelmaessig zeigen, dass es laeuft.
+
+    Auf einer CPU-Maschine vergehen zwischen Auftrag und erstem Zeichen leicht
+    Minuten. Ohne Lebenszeichen ist das von einem Absturz nicht zu
+    unterscheiden - und wer nicht unterscheiden kann, drueckt irgendwann auf
+    Abbrechen.
+
+    shield ist noetig, damit die Zeitueberschreitung des Wartens nicht den
+    Modellaufruf selbst abbricht: hier laeuft nur die Uhr ab, nicht die Arbeit.
+    """
+    begonnen = time.monotonic()
+    while True:
+        try:
+            return await asyncio.wait_for(asyncio.shield(aufgabe), timeout=PULS_S)
+        except asyncio.TimeoutError:
+            await send("puls", "", schritt=schritt,
+                       sekunden=round(time.monotonic() - begonnen, 1))
 
 
 def _assistant_message(reply, calls) -> dict:
@@ -185,15 +210,31 @@ async def run_tool_agent(send, task, *, chat_fn, toolbox, max_steps=MAX_STEPS,
     idle_rounds = 0
     executed = False   # wurde run_python jemals erfolgreich ausgefuehrt
 
+    # Nimmt dieser Aufrufer Textstuecke entgegen, waehrend sie entstehen?
+    # Tests reichen eigene, einfachere chat_fn herein - die duerfen davon
+    # nichts wissen muessen.
+    nimmt_strom = "on_text" in inspect.signature(chat_fn).parameters
+
     for step in range(1, max_steps + 1):
+        async def _strom(stueck: str, _s=step):
+            await send("delta", stueck, step=_s)
+
         try:
-            reply = await chat_fn(messages, schema)
+            if nimmt_strom:
+                aufgabe = asyncio.ensure_future(
+                    chat_fn(messages, schema, on_text=_strom))
+            else:
+                aufgabe = asyncio.ensure_future(chat_fn(messages, schema))
+            reply = await _mit_puls(send, aufgabe, step)
         except Exception as exc:
             await send("error", f"Modellaufruf fehlgeschlagen: "
                                 f"{type(exc).__name__}: {exc}")
             await send("done", "Abgebrochen.", ok=False, exit=-1,
                        attempts=step, seconds=elapsed())
             return "failed"
+
+        if getattr(reply, "messung", None):
+            await send("messung", "", step=step, **reply.messung)
 
         calls = list(reply.tool_calls)
         if not calls:

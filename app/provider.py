@@ -82,6 +82,11 @@ class ToolCall:
 class Reply:
     text: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
+    # Was der Aufruf gekostet hat. Ohne Zahlen bleibt "es ist langsam" eine
+    # Meinung; mit ihnen sieht man, ob die Zeit ins Einlesen des Prompts, ins
+    # Erzeugen oder ins Nachladen des Modells geht - drei ganz verschiedene
+    # Probleme mit drei ganz verschiedenen Loesungen.
+    messung: dict = field(default_factory=dict)
 
 
 class ProviderError(RuntimeError):
@@ -143,6 +148,31 @@ OLLAMA_HOST = _ollama_host()
 # ohnehin der schwierigste ist.
 MODELL_TIMEOUT = float(os.environ.get("BRAUNY_MODEL_TIMEOUT", "900"))
 
+# Wie lange Ollama das Modell nach einem Aufruf im Speicher behaelt. Die
+# Vorgabe dort sind fuenf Minuten. In einer Werkzeugschleife vergeht zwischen
+# zwei Modellaufrufen aber leicht mehr - ein Test laeuft, ein Container
+# startet -, und dann werden 19 GB neu von der Platte geladen. Auf dieser
+# Maschine ist das der teuerste einzelne Posten ueberhaupt.
+KEEP_ALIVE = os.environ.get("BRAUNY_KEEP_ALIVE", "2h")
+
+def _ganzzahl(name: str, vorgabe: int) -> int:
+    """Wie _seed_lesen: einmal beim Laden pruefen statt bei jedem Aufruf
+    abzustuerzen."""
+    roh = os.environ.get(name, "").strip()
+    if not roh:
+        return vorgabe
+    try:
+        wert = int(roh)
+    except ValueError:
+        import logging
+        logging.getLogger(__name__).warning(
+            "%s=%r ist keine ganze Zahl - es gilt %d.", name, roh, vorgabe)
+        return vorgabe
+    return wert if wert > 0 else vorgabe
+
+NUM_CTX = _ganzzahl("BRAUNY_NUM_CTX", 8192)
+NUM_PREDICT = _ganzzahl("BRAUNY_NUM_PREDICT", 1024)
+
 
 def _ollama_messages(messages) -> list[dict]:
     """Den Verlauf in die Form bringen, die Ollama erwartet.
@@ -184,54 +214,123 @@ def _ollama_messages(messages) -> list[dict]:
     return raus
 
 
-def _chat_ollama(messages, tools, policy=DETERMINISTISCH):
-    import httpx
+def _ollama_optionen(policy: str) -> dict:
+    """Die Stellschrauben, die auf einer CPU-Maschine ueber Minuten entscheiden.
 
-    optionen = {"temperature": _temperatur(policy)}
+    num_ctx  Ollama nimmt ohne Angabe 4096 Token. Systemanweisung plus
+             Werkzeugbeschreibungen plus wachsender Verlauf sprengen das
+             schnell - dann wird der Anfang abgeschnitten, und mit ihm die
+             Anweisung, an die der Agent sich halten soll. Zu gross ist
+             allerdings auch schaedlich: der Zwischenspeicher waechst
+             linear mit und frisst genau den Speicher, den das Modell
+             braucht.
+    num_predict  Deckel gegen Ausreisser. Ein Werkzeugaufruf ist kurz; wer
+             hier zweitausend Token schreibt, hat die Aufgabe ohnehin
+             missverstanden, und auf CPU kostet jedes davon Sekunden.
+    """
+    optionen = {
+        "temperature": _temperatur(policy),
+        "num_ctx": NUM_CTX,
+        "num_predict": NUM_PREDICT,
+    }
     if SEED is not None:
         # Lokal und bekannt - hier ist ein fester Startwert unbedenklich.
         optionen["seed"] = SEED
+    return optionen
+
+
+def _fehler_aus_antwort(status: int, roh) -> ProviderError:
+    """Ollama schreibt den Grund einer Ablehnung in den Rumpf.
+
+    Ohne ihn steht in der Oberflaeche nur "400 Bad Request" - wahr, aber
+    unbrauchbar. Genau daran ist hier schon einmal eine Stunde verlorengegangen.
+    """
+    grund = ""
+    try:
+        grund = str(json.loads(roh).get("error", "")).strip()
+    except Exception:
+        grund = str(roh)[:400].strip()
+    return ProviderError(f"Ollama lehnt die Anfrage ab (HTTP {status})"
+                         + (f": {grund}" if grund else "."))
+
+
+def _chat_ollama(messages, tools, policy=DETERMINISTISCH, on_text=None):
+    import httpx
+
     nutzlast = {
         "model": MODEL,
         "messages": _ollama_messages(messages),
-        "options": optionen,
-        "stream": False,
+        "options": _ollama_optionen(policy),
+        # Immer stroemen. Nicht wegen der Geschwindigkeit - die aendert sich
+        # dadurch nicht -, sondern weil sonst minutenlang nichts zu sehen ist
+        # und niemand unterscheiden kann, ob gerechnet wird oder etwas haengt.
+        "stream": True,
+        # Der wichtigste Wert auf dieser Maschine. Ohne ihn wirft Ollama das
+        # Modell nach fuenf Minuten Ruhe aus dem Speicher - und laedt beim
+        # naechsten Schritt 19 GB von der Platte nach. Genau das passiert in
+        # einer Werkzeugschleife staendig, weil zwischen zwei Modellaufrufen
+        # ein Test laufen kann.
+        "keep_alive": KEEP_ALIVE,
     }
     if tools:
         nutzlast["tools"] = tools
 
+    text_teile: list[str] = []
+    roh_calls: list[dict] = []
+    messung: dict = {}
+
     try:
-        antwort = httpx.post(
-            f"{OLLAMA_HOST}/api/chat",
-            json=nutzlast,
-            timeout=httpx.Timeout(MODELL_TIMEOUT, connect=10.0),
-        )
-        # Ollama schreibt den Grund einer Ablehnung in den Rumpf. Ohne ihn
-        # steht in der Oberflaeche nur "400 Bad Request" - wahr, aber
-        # unbrauchbar. Genau so ist hier schon einmal eine Stunde verlorengegangen.
-        if antwort.status_code >= 400:
-            grund = ""
-            try:
-                grund = str(antwort.json().get("error", "")).strip()
-            except Exception:
-                grund = antwort.text[:400].strip()
-            raise ProviderError(
-                f"Ollama lehnt die Anfrage ab (HTTP {antwort.status_code})"
-                + (f": {grund}" if grund else "."))
-        daten = antwort.json()
+        with httpx.stream("POST", f"{OLLAMA_HOST}/api/chat", json=nutzlast,
+                          timeout=httpx.Timeout(MODELL_TIMEOUT, connect=10.0)) as antwort:
+            if antwort.status_code >= 400:
+                antwort.read()
+                raise _fehler_aus_antwort(antwort.status_code, antwort.text)
+
+            for zeile in antwort.iter_lines():
+                zeile = zeile.strip()
+                if not zeile:
+                    continue
+                try:
+                    stueck = json.loads(zeile)
+                except json.JSONDecodeError:
+                    # Eine kaputte Zeile mitten im Strom ist kein Grund, den
+                    # ganzen bereits erzeugten Text wegzuwerfen.
+                    continue
+
+                if stueck.get("error"):
+                    raise ProviderError(f"Ollama meldet: {stueck['error']}")
+
+                nachricht = stueck.get("message") or {}
+                neu = nachricht.get("content") or ""
+                if neu:
+                    text_teile.append(neu)
+                    if on_text is not None:
+                        try:
+                            on_text(neu)
+                        except Exception:
+                            # Ein Fehler beim Anzeigen darf den Modellaufruf
+                            # nicht mitreissen.
+                            pass
+                roh_calls.extend(nachricht.get("tool_calls") or [])
+
+                if stueck.get("done"):
+                    messung = {
+                        "prompt_token": stueck.get("prompt_eval_count", 0),
+                        "prompt_s": round(stueck.get("prompt_eval_duration", 0) / 1e9, 2),
+                        "antwort_token": stueck.get("eval_count", 0),
+                        "antwort_s": round(stueck.get("eval_duration", 0) / 1e9, 2),
+                        "gesamt_s": round(stueck.get("total_duration", 0) / 1e9, 2),
+                        "geladen_s": round(stueck.get("load_duration", 0) / 1e9, 2),
+                    }
+    except ProviderError:
+        raise
     except httpx.HTTPError as exc:
         raise ProviderError(f"Ollama nicht erreichbar: {exc}") from exc
-    except json.JSONDecodeError as exc:
-        raise ProviderError(f"Ollama antwortete kein JSON: {exc}") from exc
 
-    if daten.get("error"):
-        raise ProviderError(f"Ollama meldet: {daten['error']}")
-
-    message = daten.get("message") or {}
-    text = message.get("content") or ""
+    text = "".join(text_teile)
 
     calls = []
-    for item in message.get("tool_calls") or []:
+    for item in roh_calls:
         function = (item or {}).get("function") or {}
         name = function.get("name") or ""
         # Ein Aufruf ohne Namen ist nicht ausfuehrbar. Ihn stillschweigend
@@ -243,7 +342,7 @@ def _chat_ollama(messages, tools, policy=DETERMINISTISCH):
             name=name,
             arguments=_parse_arguments(function.get("arguments")),
         ))
-    return Reply(text=text, tool_calls=calls)
+    return Reply(text=text, tool_calls=calls, messung=messung)
 
 
 # ------------------------------------------------------------------ OpenAI-kompatibel
@@ -292,7 +391,7 @@ def _chat_openai(messages, tools, policy=DETERMINISTISCH):
 
 # ------------------------------------------------------------------ Fassade
 
-def chat(messages, tools=None, policy=DETERMINISTISCH) -> Reply:
+def chat(messages, tools=None, policy=DETERMINISTISCH, on_text=None) -> Reply:
     """Blockierender Modellaufruf. Aufrufer legen ihn in einen Thread.
 
     policy waehlt das Abtastverhalten: DETERMINISTISCH fuer alles, was genau
@@ -300,7 +399,7 @@ def chat(messages, tools=None, policy=DETERMINISTISCH) -> Reply:
     nur dort, wo mehrere Vorschlaege verglichen werden sollen.
     """
     if PROVIDER == "ollama":
-        return _chat_ollama(messages, tools, policy)
+        return _chat_ollama(messages, tools, policy, on_text=on_text)
     if PROVIDER in OPENAI_ALIASES:
         return _chat_openai(messages, tools, policy)
     raise ProviderError(f"Unbekannter Anbieter: {PROVIDER!r}")
