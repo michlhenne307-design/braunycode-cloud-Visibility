@@ -2,7 +2,7 @@
 name: tests
 beschreibung: Tests schreiben und wirklich laufen lassen
 ausloeser: test, tests, testen, testfall, testfälle, pytest, unittest, abdeckung
-werkzeuge: list_files, glob, read_file, search, outline, edit_file, write_file, check_syntax, affected_tests, run_python, run_command, finish
+werkzeuge: list_files, glob, read_file, search, outline, edit_file, write_file, check_syntax, affected_tests, run_python, run_command, finish, git_push
 ---
 1. Lies zuerst den Code, den du testen sollst. Rate nie, was er tut.
 2. Schreibe die Tests in eine eigene Datei `test_<modul>.py`. Nur

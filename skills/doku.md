@@ -2,7 +2,7 @@
 name: doku
 beschreibung: README und Docstrings schreiben, die stimmen
 ausloeser: doku, dokumentation, readme, docstring, docstrings, kommentare, dokumentiere, kommentiere
-werkzeuge: list_files, glob, read_file, search, outline, symbol_info, edit_file, write_file, check_syntax, finish
+werkzeuge: list_files, glob, read_file, search, outline, symbol_info, edit_file, write_file, check_syntax, finish, git_push
 ---
 Dokumentation, die etwas anderes behauptet als der Code tut, ist schlimmer als
 keine. Deshalb: erst lesen, dann schreiben.

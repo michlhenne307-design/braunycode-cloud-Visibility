@@ -2,7 +2,7 @@
 name: neubau
 beschreibung: Etwas Neues von Grund auf bauen, in kleinen lauffähigen Schritten
 ausloeser: baue, bau, erstelle, schreibe, entwickle, programmiere, neu, anlegen, projekt, programm, skript, werkzeug, anwendung, konsolenprogramm, verwaltung, rechner, spiel
-werkzeuge: list_files, read_file, outline, write_file, edit_file, check_syntax, affected_tests, run_python, run_command, finish
+werkzeuge: list_files, read_file, outline, write_file, edit_file, check_syntax, affected_tests, run_python, run_command, finish, git_push
 ---
 1. Schau zuerst mit `list_files`, was schon da ist. Ein neues Programm in ein
    bestehendes Projekt zu setzen ist etwas anderes als in ein leeres.

@@ -1778,7 +1778,60 @@ try:
     ohne_remote(lambda: connectors.git_push(pws, "x", "y"))
     check("Push ohne Konfiguration wirft", False, "kein Fehler")
 except connectors.ConnectorError as exc:
-    check("Push ohne Konfiguration wirft", "BRAUNY_GIT_REMOTE" in str(exc), str(exc))
+    # Der Token ist die harte Voraussetzung. BRAUNY_GIT_REMOTE braucht nur,
+    # wer den ganzen Arbeitsordner auf ein festes Ziel schiebt - ein geklontes
+    # Teilprojekt bringt seinen Remote selbst mit.
+    check("Push ohne Konfiguration wirft", "BRAUNY_GIT_TOKEN" in str(exc), str(exc))
+
+# --- Push pro Projekt -----------------------------------------------------
+#
+# Ein Arbeitsordner enthaelt mehrere geklonte Projekte, und jedes gehoert in
+# SEIN Repository. Alles gemeinsam auf einen festen Remote zu schieben waere
+# fuer genau einen Fall richtig und fuer alle anderen falsch.
+
+def _mit_token(fn, remote="", token="tok"):
+    orig_r, orig_t = connectors.GIT_REMOTE, connectors.GIT_TOKEN
+    connectors.GIT_REMOTE, connectors.GIT_TOKEN = remote, token
+    try:
+        return fn()
+    finally:
+        connectors.GIT_REMOTE, connectors.GIT_TOKEN = orig_r, orig_t
+
+check("ein Token allein schaltet git_push frei",
+      _mit_token(lambda: "git_push" in connectors.available()))
+
+# Ein Ordner ohne .git ist kein Projekt.
+pws.write("normal.txt", "kein repo")
+try:
+    _mit_token(lambda: connectors.git_push(pws, "b", "m", projekt="."))
+    check("ein Ordner ohne eigenes Repo wird abgelehnt", False, "kein Fehler")
+except connectors.ConnectorError as exc:
+    check("ein Ordner ohne eigenes Repo wird abgelehnt",
+          "kein Git-Projekt" in str(exc) or "keinen Remote" in str(exc), str(exc))
+
+# Der Ordnername kommt vom Modell - er darf den Arbeitsordner nicht verlassen.
+try:
+    _mit_token(lambda: connectors.git_push(pws, "b", "m", projekt="../../../etc"))
+    check("Pfad-Ausbruch beim Projektnamen wird verhindert", False, "kein Fehler")
+except Exception as exc:
+    check("Pfad-Ausbruch beim Projektnamen wird verhindert",
+          not isinstance(exc, SystemExit), type(exc).__name__)
+
+_cq = (main.BASE_DIR / "connectors.py").read_text()
+check("der Projektpfad läuft über ws.resolve", "ws.resolve(projekt)" in _cq)
+check("ein Remote mit Zugangsdaten wird abgelehnt, nicht benutzt",
+      _cq.count("enthält Zugangsdaten in der URL") >= 2)
+check("der Token steht nie in der Kommandozeile",
+      "credential.helper" in _cq and "BRAUNY_GIT_TOKEN=$" not in _cq)
+check("ohne Änderungen gilt der Push nicht als Fehler",
+      "nothing to commit" in _cq)
+check("es wird ein Autor gesetzt, sonst bricht git ab",
+      "user.name=BraunyCode" in _cq)
+# Der Zweig traegt ein Praefix: so landet nichts versehentlich auf main.
+check("gepusht wird auf einen eigenen Zweig, nicht auf main",
+      "GIT_BRANCH_PREFIX + safe_branch(branch" in _cq)
+_tq = (main.BASE_DIR / "tools.py").read_text()
+check("das Werkzeug kennt den Projektordner", '"projekt"' in _tq)
 check("fetch abgeschaltet meldet das deutlich",
       blocked("https://93.184.216.34/") is False and
       not connectors.FETCH_ENABLED)

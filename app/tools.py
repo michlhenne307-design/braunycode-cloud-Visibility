@@ -192,7 +192,11 @@ def connector_schema() -> dict[str, dict]:
             "Committet den Projektstand und schiebt ihn auf den eingerichteten "
             "Git-Remote.",
             {"branch": {"type": "string", "description": "Gewünschter Branch-Name"},
-             "message": {"type": "string", "description": "Commit-Nachricht"}},
+             "message": {"type": "string", "description": "Commit-Nachricht"},
+             "projekt": {"type": "string",
+                         "description": "Unterordner eines geklonten Projekts. "
+                                        "Dann geht der Push auf dessen eigenen "
+                                        "Remote statt auf den allgemeinen."}},
             ["message"]),
     }
 
@@ -890,7 +894,8 @@ class Toolbox:
         ergebnis = await asyncio.to_thread(
             connectors.git_push, self.ws,
             str(args.get("branch", "")).strip(),
-            str(args.get("message", "")).strip())
+            str(args.get("message", "")).strip(),
+            str(args.get("projekt", "")).strip())
         self.pushed.append(ergebnis.splitlines()[0] if ergebnis else "gepusht")
         return ergebnis
 
