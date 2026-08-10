@@ -150,7 +150,7 @@ def starte_falschen_ollama(modell: FalschesModell):
 
 # --------------------------------------------------------------- Lauf
 
-def fahre(drehbuch, aufgabe="Schreibe rechner.py mit addiere(a, b)"):
+def fahre(drehbuch, aufgabe="Schreibe rechner.py mit addiere(a, b)", max_steps=8):
     """Laesst die echte Werkzeugschleife gegen das falsche Modell laufen."""
     modell = FalschesModell(drehbuch)
     server, port = starte_falschen_ollama(modell)
@@ -181,7 +181,7 @@ def fahre(drehbuch, aufgabe="Schreibe rechner.py mit addiere(a, b)"):
 
     async def lauf():
         return await agentloop.run_tool_agent(send, aufgabe, chat_fn=chat_fn,
-                                              toolbox=tools.Toolbox(ws), max_steps=8)
+                                              toolbox=tools.Toolbox(ws), max_steps=max_steps)
 
     try:
         ergebnis = asyncio.run(lauf())
@@ -306,6 +306,53 @@ _kaputt = [{"role": "assistant", "content": "",
 _uebersetzt = _prov._ollama_messages(_kaputt)
 check("die Übersetzung wandelt Text zu Objekt",
       isinstance(_uebersetzt[0]["tool_calls"][0]["function"]["arguments"], dict))
+
+# --- Wer nur liest, baut nichts -------------------------------------------
+#
+# Aus dem Betrieb: dreissig Runden, ausschliesslich 'grep', keine geschriebene
+# Zeile. Jede Suche fuer sich plausibel, zusammen dreissig Minuten fuer nichts.
+# Am Ende meldete der Lauf nur "Schrittgrenze erreicht" - ohne zu sagen, WARUM
+# nichts entstanden ist.
+
+print("\n[E2E] Endloses Suchen wird gebremst")
+
+import agentloop as _al3
+_nur_lesen = [{"tool": "list_files", "args": {}} for _ in range(40)]
+# Bewusst hohe Schrittgrenze: geprueft wird die Lesebremse, nicht sie.
+_erg3, _ev3, _m3, _o3 = fahre(_nur_lesen, aufgabe="Bau irgendwas ins Projekt",
+                              max_steps=40)
+
+_texte = " ".join(e.get("text", "") for e in _ev3)
+check("es wird zwischendurch deutlich nachgefasst",
+      "ohne eine Änderung" in _texte, _texte[-200:])
+_hinweis = [n for n in _m3.gesehen
+            for m in n.get("messages", [])
+            if m.get("role") == "user" and "nur gelesen" in (m.get("content") or "")]
+check("und die Aufforderung geht wirklich ans Modell", bool(_hinweis))
+
+_done3 = [e for e in _ev3 if e["type"] == "done"][-1]
+check("der Lauf wird abgebrochen, statt die Schrittgrenze auszusitzen",
+      "ohne eine einzige" in _done3["text"], _done3["text"][:120])
+check("und er sagt, was der Mensch anders machen soll",
+      "unbestimmt" in _done3["text"] or "genauer" in _done3["text"],
+      _done3["text"][:160])
+check("er behauptet keinen Erfolg", _done3.get("ok") is False)
+# Frueher lief das bis zur Schrittgrenze durch - jetzt frueher.
+check("es wird deutlich vor der Schrittgrenze abgebrochen",
+      _done3.get("attempts", 99) <= _al3.LESE_GRENZE * 2 + 1, _done3.get("attempts"))
+
+# Sobald wieder etwas geschrieben wird, zaehlt der Zaehler von vorn - sonst
+# waere ein Projekt mit viel Leseanteil nach einmal Suchen gesperrt.
+_gemischt = ([{"tool": "list_files", "args": {}}] * 5
+             + [{"tool": "write_file", "args": {"path": "a.py", "content": "x = 1\n"}}]
+             + [{"tool": "list_files", "args": {}}] * 5
+             + [{"tool": "check_syntax", "args": {"path": "a.py"}},
+                {"tool": "finish", "args": {"summary": "fertig"}}])
+_erg4, _ev4, _m4, _o4 = fahre(_gemischt, max_steps=20)
+_done4 = [e for e in _ev4 if e["type"] == "done"][-1]
+check("Lesen zwischen echten Änderungen ist kein Problem",
+      "ohne eine einzige" not in _done4["text"], _done4["text"][:120])
+
 
 # --- Der API-Weg ----------------------------------------------------------
 #

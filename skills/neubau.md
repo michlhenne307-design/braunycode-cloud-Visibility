@@ -4,6 +4,8 @@ beschreibung: Etwas Neues von Grund auf bauen, in kleinen lauffähigen Schritten
 ausloeser: baue, bau, erstelle, schreibe, entwickle, programmiere, neu, anlegen, projekt, programm, skript, werkzeug, anwendung, konsolenprogramm, verwaltung, rechner, spiel
 werkzeuge: list_files, read_file, outline, write_file, edit_file, check_syntax, affected_tests, run_python, run_command, finish, git_push
 ---
+0. **Fang früh an zu schreiben.** Ein erster Entwurf, der sich
+   korrigieren lässt, ist mehr wert als weiteres Suchen.
 1. Schau zuerst mit `list_files`, was schon da ist. Ein neues Programm in ein
    bestehendes Projekt zu setzen ist etwas anderes als in ein leeres.
 2. Baue **klein und lauffähig**, nicht groß und fertig. Erst eine Datei mit

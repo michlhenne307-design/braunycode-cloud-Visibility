@@ -95,6 +95,19 @@ PULS_S = float(os.environ.get("BRAUNY_PULS", "3"))
 # nicht das Ereignisbudget des ganzen Auftrags verbrauchen.
 MAX_AUSGABE_ZEILEN = int(os.environ.get("BRAUNY_MAX_AUSGABE", "200"))
 
+# Nach so vielen Runden ohne eine einzige Aenderung wird deutlich nachgefasst,
+# nach doppelt so vielen abgebrochen.
+#
+# Anlass ist ein echter Lauf: dreissig Runden, ausschliesslich 'grep', keine
+# geschriebene Zeile. Das Modell hat sich im Lesen verlaufen - jede einzelne
+# Suche war fuer sich plausibel, zusammen waren es dreissig Minuten fuer
+# nichts. Ein Agent, der nur liest, ist kein Agent.
+#
+# Die Grenze ist mit Absicht nicht klein: ein fremdes Projekt zu verstehen
+# braucht ein paar Blicke. Sie greift erst, wenn aus Schauen Suchen ohne Ende
+# geworden ist.
+LESE_GRENZE = int(os.environ.get("BRAUNY_LESE_GRENZE", "8"))
+
 
 async def _mit_puls(send, aufgabe, schritt):
     """Auf das Modell warten und dabei regelmaessig zeigen, dass es laeuft.
@@ -213,6 +226,7 @@ async def run_tool_agent(send, task, *, chat_fn, toolbox, max_steps=MAX_STEPS,
     schema = toolbox.schema()
     repeats: dict[str, int] = {}
     idle_rounds = 0
+    nur_gelesen = 0    # Runden hintereinander ohne jede Aenderung
     executed = False   # wurde run_python jemals erfolgreich ausgefuehrt
 
     # Nimmt dieser Aufrufer Textstuecke entgegen, waehrend sie entstehen?
@@ -330,6 +344,36 @@ async def run_tool_agent(send, task, *, chat_fn, toolbox, max_steps=MAX_STEPS,
                     f"{repeats[fingerprint]}-mal aufgerufen. Das Ergebnis "
                     "aendert sich nicht. Mach etwas anderes oder rufe finish auf."})
                 repeats[fingerprint] = 0
+
+        # Nur gelesen und nichts getan? Einmal deutlich nachfassen, dann
+        # abbrechen. Sonst laeuft die Schrittgrenze ab, ohne dass jemand
+        # erfaehrt, WARUM nichts entstanden ist.
+        namen = {c.name for c in calls}
+        if namen & (tools.MODIFYING | {"finish"}):
+            nur_gelesen = 0
+        else:
+            nur_gelesen += 1
+            if nur_gelesen == LESE_GRENZE:
+                await send("status",
+                           f"{nur_gelesen} Runden ohne eine Änderung — "
+                           "ich fasse nach.")
+                messages.append({"role": "user", "content":
+                    f"Du hast jetzt {nur_gelesen} Runden lang nur gelesen und "
+                    "gesucht, ohne eine einzige Datei zu ändern. Das reicht. "
+                    "Entscheide dich jetzt: schreibe die erste Datei oder "
+                    "ändere die erste Stelle — auch wenn du noch nicht alles "
+                    "weißt. Ein erster Schritt, der sich korrigieren lässt, "
+                    "ist mehr wert als weitere Suche. Kommst du wirklich nicht "
+                    "weiter, rufe finish auf und schreibe hinein, was dir "
+                    "fehlt."})
+            elif nur_gelesen >= LESE_GRENZE * 2:
+                await send("done",
+                           f"Nach {nur_gelesen} Runden ohne eine einzige "
+                           "Änderung abgebrochen. Der Auftrag war "
+                           "wahrscheinlich zu unbestimmt — sag genauer, welche "
+                           "Datei oder welcher Bereich geändert werden soll.",
+                           ok=False, exit=-1, attempts=step, seconds=elapsed())
+                return "failed"
 
         messages = trim(messages)
 
