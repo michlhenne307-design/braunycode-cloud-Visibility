@@ -12,6 +12,7 @@ umschaltbar ueber eine Zeile in der Konfiguration.
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 from dataclasses import dataclass, field
@@ -255,7 +256,23 @@ def _fehler_aus_antwort(status: int, roh) -> ProviderError:
 
 
 def _chat_ollama(messages, tools, policy=DETERMINISTISCH, on_text=None):
+    """on_text muss GEWOEHNLICH sein, nicht asynchron.
+
+    Dieser Aufruf laeuft in einem Arbeitsfaden ohne Ereignisloop - eine
+    Koroutine liesse sich hier gar nicht abwarten. Uebergibt jemand trotzdem
+    eine, entstuende bei jedem Textstueck ein Objekt, das niemand ausfuehrt:
+    kein Fehler, keine Ausgabe, nur eine RuntimeWarning irgendwo im Log. Genau
+    das ist beim Bauen des Ende-zu-Ende-Tests passiert.
+
+    Deshalb lieber sofort und laut.
+    """
     import httpx
+
+    if on_text is not None and inspect.iscoroutinefunction(on_text):
+        raise ProviderError(
+            "on_text muss eine gewoehnliche Funktion sein, keine Koroutine - "
+            "der Modellaufruf laeuft in einem Arbeitsfaden ohne Ereignisloop. "
+            "Die Bruecke dorthin baut main.model_chat.")
 
     nutzlast = {
         "model": MODEL,
