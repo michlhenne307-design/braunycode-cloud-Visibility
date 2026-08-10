@@ -2873,6 +2873,25 @@ check("bei reinem Werkzeugfehler kein Befund-Anhang",
       "Befund:" not in _erg, _erg)
 
 
+# Dieselbe Verdrahtung fuer TypeScript. Ein Parser, der die Ausgabe versteht,
+# nuetzt nichts, solange der Befund nicht am Ergebnis haengt - und tsc laeuft
+# ueber run_command, nicht ueber run_python.
+async def _rot_tsc(_dateien, _entry=None, command=None):
+    return 2, ("src/summe.ts(12,5): error TS2322: Type 'string' is not "
+               "assignable to type 'number'.")
+
+_w2 = ws_mod.Workspace(tempfile.mkdtemp())
+_tb2 = tools.Toolbox(_w2, run_sandbox=_rot_tsc)
+asyncio.run(_tb2.call("write_file", {"path": "src/summe.ts",
+                                     "content": "export const x = 1;\n"}))
+_erg2 = asyncio.run(_tb2.call("run_command", {"command": "npx tsc --noEmit"}))
+check("auch ein tsc-Fehler hängt als Befund am Ergebnis",
+      "Befund:" in _erg2, _erg2[-160:])
+check("und nennt Datei und Zeile", "src/summe.ts:12" in _erg2, _erg2[-160:])
+check("ein roter tsc-Lauf belegt die Datei nicht",
+      _tb2.unverified == {"src/summe.ts"}, _tb2.unverified)
+
+
 # ------------------------------------------------------------- Testauswahl
 print("\n[35] Testauswahl über den Importgraphen")
 
@@ -3346,6 +3365,123 @@ check("mehrere FAILED-Zeilen ergeben mehrere Befunde",
 check("bestandener Lauf ergibt keinen Befund",
       diagnostics.parse("2 passed in 0.10s") == [])
 
+# --- JavaScript und TypeScript ---------------------------------------------
+#
+# Bis hierher konnte der Agent nur Python-Fehler benennen. Vor jeder anderen
+# Ausgabe stand er wie vor einer Textwand: er sah, DASS etwas rot ist, aber
+# nicht was oder wo - und wich auf Python aus. Die Vorlagen unten sind echte
+# Ausgaben der Werkzeuge, nicht nachgebaute Wunschformate.
+
+_TSC_AUSGABE = """src/summe.ts(12,5): error TS2322: Type 'string' is not \
+assignable to type 'number'.
+src/summe.ts(3,10): error TS1005: ';' expected."""
+_b = diagnostics.parse(_TSC_AUSGABE, "run_command")
+check("tsc-Fehler werden erkannt", len(_b) == 2, _b)
+check("ein Typfehler heisst Typfehler",
+      _b and _b[0].kategorie == diagnostics.TYPE and _b[0].typ == "TS2322", _b)
+check("Datei und Zeile stehen daneben",
+      _b and _b[0].datei == "src/summe.ts" and _b[0].zeile == 12, _b)
+# TS1xxx sind Parse-Fehler. Sie als Typfehler zu melden hiesse, das Modell
+# suchte einen Typ, wo ein Semikolon fehlt.
+check("TS1005 ist ein Syntaxfehler, kein Typfehler",
+      len(_b) == 2 and _b[1].kategorie == diagnostics.SYNTAX, _b)
+check("die Meldung bleibt erhalten",
+      _b and "not assignable" in _b[0].nachricht, _b)
+
+check("eine saubere tsc-Ausgabe ergibt keinen Befund",
+      diagnostics.parse("") == [] and diagnostics.parse("Found 0 errors.") == [])
+
+# eslint, stylish - der Dateiname steht als eigene Zeile ueber den Befunden.
+_ESLINT_AUSGABE = """
+/opt/projekt/src/app.js
+  1:1   error    'React' is not defined                    no-undef
+  4:7   warning  'zaehler' is assigned a value but never used  no-unused-vars
+  9:1   error    Expected indentation of 2 spaces but found 4  indent
+
+✖ 3 problems (2 errors, 1 warning)"""
+_b = diagnostics.parse(_ESLINT_AUSGABE, "run_command")
+check("eslint-Befunde werden erkannt", len(_b) == 3, _b)
+check("der Dateiname aus der Kopfzeile landet an jedem Befund",
+      all(f.datei == "/opt/projekt/src/app.js" for f in _b), _b)
+check("ein undefinierter Name ist ein Namensfehler",
+      _b and _b[0].kategorie == diagnostics.NAME and _b[0].typ == "no-undef", _b)
+# Sonst repariert das Modell Einrueckungen, waehrend der echte Fehler steht.
+check("eine Einrueckungsregel bleibt Stil, auch als 'error'",
+      len(_b) == 3 and _b[2].kategorie == diagnostics.STIL
+      and _b[2].schwere == diagnostics.FEHLER, _b)
+check("eine ungenutzte Variable ist Stil und nur eine Warnung",
+      len(_b) == 3 and _b[1].kategorie == diagnostics.STIL
+      and _b[1].schwere == diagnostics.WARNUNG, _b)
+check("die Zusammenfassungszeile ist kein Befund",
+      all("problems" not in f.nachricht for f in _b), _b)
+
+check("eslint ohne Beanstandung ergibt keinen Befund",
+      diagnostics.parse("/opt/projekt/src/app.js\n") == [])
+
+# jest. Derselbe Fehlschlag steht dreimal drin: in der Liste, als Ueberschrift
+# des Details und in der Zusammenfassung.
+_JEST_AUSGABE = """ FAIL  src/summe.test.js
+  Summe
+    ✕ addiert 1 + 2 zu 3 (3 ms)
+
+  ● Summe › addiert 1 + 2 zu 3
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 3
+    Received: 4
+
+      3 | test('addiert 1 + 2 zu 3', () => {
+    > 4 |   expect(summe(1, 2)).toBe(3);
+        |                       ^
+      5 | });
+
+      at Object.<anonymous> (src/summe.test.js:4:23)
+
+Tests:       1 failed, 1 total"""
+_b = diagnostics.parse(_JEST_AUSGABE, "run_command")
+check("ein jest-Fehlschlag wird erkannt", len(_b) >= 1, _b)
+check("er ist eine Zusicherung",
+      _b and _b[0].kategorie == diagnostics.ASSERTION, _b)
+check("die Testdatei aus der FAIL-Zeile steht daran",
+      _b and _b[0].datei == "src/summe.test.js", _b)
+# Ohne Zeile muesste das Modell die Datei erneut durchlesen, um die Stelle
+# zu finden - sie steht im Stapelauszug direkt darunter.
+check("die Zeile wird aus dem Stapelauszug nachgetragen",
+      _b and _b[0].zeile == 4, _b)
+
+_JEST_EINER = """ FAIL  src/summe.test.js
+  ✕ addiert (3 ms)
+
+  ● addiert
+
+    at Object.<anonymous> (src/summe.test.js:4:23)"""
+# '✕ addiert (3 ms)' und '● addiert' sind derselbe Test. Zwei Befunde daraus
+# zu machen hiesse, das Modell repariert zweimal dieselbe Stelle.
+check("derselbe Test wird nicht doppelt gemeldet",
+      len(diagnostics.parse(_JEST_EINER)) == 1, diagnostics.parse(_JEST_EINER))
+
+# vitest haengt den Testnamen mit '>' an die Datei.
+_VITEST_AUSGABE = """ ✗ src/summe.test.ts > addiert zwei Zahlen
+ FAIL  src/summe.test.ts > addiert zwei Zahlen
+AssertionError: expected 4 to be 3
+
+ Test Files  1 failed (1)
+      Tests  1 failed (1)"""
+_b = diagnostics.parse(_VITEST_AUSGABE, "run_command")
+check("ein vitest-Fehlschlag wird erkannt", len(_b) == 1, _b)
+check("Datei und Testname stehen daran",
+      _b and _b[0].datei == "src/summe.test.ts"
+      and _b[0].symbol == "addiert zwei Zahlen", _b)
+
+check("ein gruener jest-Lauf ergibt keinen Befund",
+      diagnostics.parse(" PASS  src/summe.test.js\n  ✓ addiert (2 ms)\n"
+                        "\nTests:       1 passed, 1 total") == [])
+
+# Ein Python-Traceback darf nicht ploetzlich als JavaScript gelesen werden.
+_b = diagnostics.parse(_stderr_von("raise ValueError('kaputt')"))
+check("Python bleibt Python", _b and _b[0].typ == "ValueError", _b)
+
 # Wenn hypothesis zur Hand ist: frisch erzeugen statt nur die Aufzeichnung.
 try:
     import hypothesis  # noqa: F401
@@ -3567,6 +3703,39 @@ check("und steht im Bericht",
       _tb.bericht()["ohne_pruefmoeglichkeit"] == ["notiz.txt"], _tb.bericht())
 check("finish geht deshalb durch",
       not asyncio.run(_tb.call("finish", {"summary": "x"})).startswith("FEHLER"))
+
+# Der Beleg-Zwang galt lange nur fuer '.py'. Eine geschriebene .ts-Datei fiel
+# damit in denselben Topf wie eine README: nie geprueft, nie blockierend - der
+# Agent durfte fuer die halbe Welt behaupten statt belegen. Genau das war die
+# Beschwerde 'er versteht nur Python'.
+if _syn.unterstuetzt("x.ts"):
+    _w = ws_mod.Workspace(tempfile.mkdtemp())
+    _tb = tools.Toolbox(_w, run_sandbox=_gruen)
+    asyncio.run(_tb.call("write_file", {"path": "seite.ts",
+                                        "content": "export const a = 1;\n"}))
+    check("eine geschriebene .ts-Datei ist ungeprüft",
+          _tb.unverified == {"seite.ts"}, _tb.unverified)
+    check("sie landet nicht im Topf der Unprüfbaren",
+          _tb.ungeprueft_sonstige == set(), _tb.ungeprueft_sonstige)
+    _erg = asyncio.run(_tb.call("finish", {"summary": "fertig"}))
+    check("und finish wird abgewiesen", _erg.startswith("FEHLER"), _erg[:90])
+    check("die Abweisung nennt die Datei", "seite.ts" in _erg, _erg[:200])
+
+    _erg = asyncio.run(_tb.call("check_syntax", {"path": "seite.ts"}))
+    check("check_syntax belegt sie", _tb.unverified == set(), (_erg, _tb.unverified))
+    check("danach geht finish durch",
+          not asyncio.run(_tb.call("finish", {"summary": "x"})).startswith("FEHLER"))
+
+    # Kaputtes TypeScript darf nicht als Beleg zaehlen.
+    _tb2 = tools.Toolbox(_w, run_sandbox=_gruen)
+    asyncio.run(_tb2.call("write_file", {"path": "kaputt.ts",
+                                         "content": "export const a = ;\n"}))
+    asyncio.run(_tb2.call("check_syntax", {"path": "kaputt.ts"}))
+    check("ein Syntaxfehler belegt nichts",
+          _tb2.unverified == {"kaputt.ts"}, _tb2.unverified)
+else:
+    check("ohne node bleibt .ts unprüfbar - und blockiert deshalb nicht",
+          not _syn.unterstuetzt("x.ts"))
 
 
 # --------------------------------------------------------- Linter-Ausgabe

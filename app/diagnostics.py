@@ -95,6 +95,43 @@ _WERKZEUGFEHLER = re.compile(r"^FEHLER: (?:(?P<typ>\w+Error|\w+Exception): )?(?P
 
 # ruff, kurzes Format: 'datei.py:1:8: F401 [*] `os` imported but unused'.
 # Bei kaputter Syntax steht dort statt eines Regelcodes 'invalid-syntax'.
+# --- JavaScript und TypeScript ---------------------------------------------
+#
+# Ohne diese Muster war jede Ausgabe von tsc, eslint, jest oder vitest fuer
+# den Agenten nur eine Textwand. Er konnte den Fehler nicht benennen, also
+# auch nicht gezielt reparieren - und wich auf Python aus, wo er wenigstens
+# etwas erkannte.
+
+# tsc:  app/page.tsx(12,5): error TS2322: Type 'string' is not assignable ...
+_TSC = re.compile(
+    r"^(?P<datei>[^\s(][^(]*?)\((?P<zeile>\d+),(?P<spalte>\d+)\):\s+"
+    r"(?P<art>error|warning)\s+(?P<code>TS\d+):\s+(?P<text>.+)$")
+
+# eslint (stylish):  Zeile Spalte  error  Text  regel/name
+# Der Dateiname steht als eigene Zeile davor.
+_ESLINT_DATEI = re.compile(r"^(?P<datei>(?:/|\.{0,2}/)?[\w./\\-]+\.(?:[jt]sx?|mjs|cjs))$")
+_ESLINT_ZEILE = re.compile(
+    r"^\s*(?P<zeile>\d+):(?P<spalte>\d+)\s+(?P<art>error|warning)\s+"
+    r"(?P<text>.+?)(?:\s\s+(?P<regel>[\w@/-]+))?$")
+
+# jest und vitest melden DENSELBEN Fehlschlag mehrfach: einmal in der Liste
+# ('✕ name (3 ms)'), einmal als Ueberschrift des Details ('● name') und
+# einmal in der Zusammenfassung. Ungefiltert waeren das drei Befunde fuer
+# einen kaputten Test - der Agent wuerde dreimal dieselbe Stelle reparieren.
+_TESTFALL = re.compile(r"^\s*(?:●|✕|×)\s+(?P<name>.+?)\s*$")
+# Dateikopf: jest schreibt 'FAIL src/x.test.js' ohne Namen, vitest haengt
+# den Testnamen mit '>' an.
+_FAIL_KOPF = re.compile(
+    r"^\s*(?:❯\s*)?FAIL\s+(?P<datei>[\w./\\-]+\.(?:[jt]sx?|mjs|cjs))"
+    r"\s*(?:[>›]\s*(?P<name>.*))?$")
+# Die Laufzeit haengt nur an einer der beiden Schreibweisen - ohne sie
+# abzuschneiden waeren '✕ addiert (3 ms)' und '● addiert' zwei Tests.
+_DAUER = re.compile(r"\s*\((?:<\s*)?\d+(?:[.,]\d+)?\s*(?:ms|s|m)\)\s*$")
+# Ortsangabe darunter:  at Object.<anonymous> (src/x.test.ts:12:5)
+_JS_ORT = re.compile(
+    r"(?:at\s.*?\(|^\s*at\s)(?P<datei>[\w./\\-]+\.(?:[jt]sx?|mjs|cjs)):"
+    r"(?P<zeile>\d+):(?P<spalte>\d+)")
+
 _RUFF = re.compile(
     r"^(?P<datei>[\w./\\-]+\.py):(?P<zeile>\d+):(?P<spalte>\d+): "
     # Der Doppelpunkt nach dem Code ist OPTIONAL: bei Regelcodes steht keiner
@@ -110,6 +147,15 @@ _MYPY = re.compile(
 
 # ruff-Regelcodes, die echte Fehler sind - nicht Stil.
 _RUFF_NAME = ("F821", "F822", "F823")
+
+# eslint-Regeln, die ein echtes Namensproblem melden. Bewusst kurz: der Rest
+# der ueber 200 Kernregeln ist Formatierung oder Projektvorliebe, und die
+# Schwere steht ohnehin getrennt daneben.
+_ESLINT_NAME = ("no-undef", "no-const-assign", "no-redeclare", "no-dupe-keys",
+                "no-dupe-args", "no-dupe-class-members", "no-func-assign",
+                "no-class-assign", "no-import-assign")
+_ESLINT_IMPORT = ("import/no-unresolved", "import/named", "import/default",
+                  "import/namespace")
 
 
 def _rel(pfad: str) -> str:
@@ -323,6 +369,140 @@ def _ruff_kategorie(code: str) -> tuple[str, str]:
     return STIL, WARNUNG
 
 
+def _eslint_kategorie(regel: str) -> str:
+    """eslint-Regel -> Kategorie.
+
+    Die Kategorie sagt, WELCHER ART der Befund ist; wie schlimm er ist, steht
+    getrennt davon in 'schwere'. Eine unbekannte Regel bleibt deshalb STYLE,
+    auch wenn das Projekt sie auf 'error' gestellt hat - sonst wuerde eine
+    Anfuehrungszeichen-Regel so aussehen wie ein undefinierter Name.
+    """
+    if regel in _ESLINT_IMPORT:
+        return IMPORT
+    # '@typescript-eslint/no-undef' traegt denselben Regelnamen wie das
+    # Original, nur mit Praefix.
+    if regel.rsplit("/", 1)[-1] in _ESLINT_NAME:
+        return NAME
+    return STIL
+
+
+def _test_merken(tests: dict[str, Finding], name: str, datei: str,
+                 quelle: str, roh: str) -> None:
+    """Einen Testfehlschlag ablegen - je Testnamen genau einmal.
+
+    Der erste Treffer gewinnt, eine spaeter bekannte Datei wird nachgetragen:
+    vitest nennt sie im Kopf, jest erst im Stapelauszug.
+    """
+    vorher = tests.get(name)
+    if vorher is None:
+        tests[name] = Finding(
+            kategorie=ASSERTION, schwere=FEHLER, typ="TestFailure",
+            nachricht=f"Test fehlgeschlagen: {name}",
+            datei=_rel(datei) if datei else None, symbol=name,
+            quelle=quelle, roh=roh)
+    elif vorher.datei is None and datei:
+        tests[name] = replace(vorher, datei=_rel(datei))
+
+
+def _javascript(text: str, quelle: str) -> list[Finding]:
+    """Befunde aus tsc, eslint, jest und vitest.
+
+    Aufgeteilt wie bei Python: ein Typfehler ist ein Typfehler, eine
+    Stilregel ist Stil. Das Modell soll nicht anfangen, Einrueckungen zu
+    reparieren, waehrend der echte Fehler stehen bleibt.
+    """
+    befunde: list[Finding] = []
+    # Testfehlschlaege ueber den Namen zusammenfassen, weil beide Werkzeuge
+    # denselben Fehlschlag mehrfach ausgeben.
+    tests: dict[str, Finding] = {}
+    testdatei = ""      # zuletzt genannte Testdatei, fuer die '●'-Zeilen
+    lintdatei = ""      # Dateikopf von eslint
+    koepfe: list[str] = []   # 'FAIL datei' ohne Testnamen
+
+    for zeile in text.splitlines():
+        blank = zeile.rstrip()
+        if not blank.strip():
+            continue
+
+        treffer = _TSC.match(blank.strip())
+        if treffer:
+            code = treffer.group("code")
+            # TS1xxx sind Parse-Fehler, alles darueber sind Typfehler.
+            art = SYNTAX if code.startswith("TS1") else TYPE
+            befunde.append(Finding(
+                kategorie=art, typ=code,
+                datei=_rel(treffer.group("datei").strip()),
+                zeile=int(treffer.group("zeile")),
+                nachricht=treffer.group("text").strip(),
+                schwere=FEHLER if treffer.group("art") == "error" else WARNUNG,
+                quelle=quelle, roh=blank.strip()))
+            continue
+
+        treffer = _FAIL_KOPF.match(blank)
+        if treffer:
+            testdatei = treffer.group("datei")
+            name = (treffer.group("name") or "").strip()
+            if name:
+                _test_merken(tests, name, testdatei, quelle, blank.strip())
+            else:
+                # jest nennt hier nur die Datei; der Testname kommt weiter
+                # unten mit '●'. Als Notnagel merken, falls er ausbleibt.
+                koepfe.append(testdatei)
+            continue
+
+        treffer = _TESTFALL.match(blank)
+        if treffer:
+            name = _DAUER.sub("", treffer.group("name")).strip()
+            if len(name) > 2:
+                _test_merken(tests, name, testdatei, quelle, blank.strip())
+            continue
+
+        # eslint nennt die Datei in einer eigenen Zeile und die Befunde darunter.
+        treffer = _ESLINT_DATEI.match(blank.strip())
+        if treffer:
+            lintdatei = treffer.group("datei")
+            continue
+
+        treffer = _ESLINT_ZEILE.match(blank)
+        if treffer and lintdatei:
+            regel = (treffer.group("regel") or "").strip()
+            fehler = treffer.group("art") == "error"
+            befunde.append(Finding(
+                # Eine ungenutzte Variable ist Stil, ein undefinierter Name
+                # ein echter Fehler - dieselbe Trennung wie bei ruff.
+                kategorie=_eslint_kategorie(regel),
+                typ=regel or "eslint",
+                datei=_rel(lintdatei), zeile=int(treffer.group("zeile")),
+                nachricht=treffer.group("text").strip(),
+                schwere=FEHLER if fehler else WARNUNG,
+                quelle=quelle, roh=blank.strip()))
+            continue
+
+    if tests:
+        befunde.extend(tests.values())
+    elif koepfe:
+        # Nur der Dateikopf war zu sehen. 'In dieser Datei ist ein Test
+        # kaputt' ist duenn, aber deutlich mehr als gar kein Befund.
+        for datei in dict.fromkeys(koepfe):
+            befunde.append(Finding(
+                kategorie=ASSERTION, schwere=FEHLER, typ="TestFailure",
+                nachricht=f"Test fehlgeschlagen in {datei}",
+                datei=_rel(datei), quelle=quelle, roh=f"FAIL {datei}"))
+
+    # Ort nachtragen, wo einer fehlt: bei jest steht die Zeile erst im
+    # Stapelauszug darunter. Finding ist eingefroren, also ersetzen statt
+    # zuweisen.
+    ort = _JS_ORT.search(text) if befunde else None
+    if ort is None:
+        return befunde
+    return [befund if (befund.datei and befund.zeile is not None) else replace(
+        befund,
+        datei=befund.datei or _rel(ort.group("datei")),
+        zeile=befund.zeile if befund.zeile is not None
+              else int(ort.group("zeile")))
+        for befund in befunde]
+
+
 def _linter(text: str, quelle: str) -> list[Finding]:
     """Befunde von ruff und mypy.
 
@@ -426,6 +606,12 @@ def parse(text: str, quelle: str = "sandbox") -> list[Finding]:
     befunde = _kopfloser_syntaxfehler(text, quelle)
     if befunde:
         return befunde
+
+    # tsc, eslint, jest und vitest - dieselbe Rolle wie ruff/mypy/pytest,
+    # nur fuer die andere Haelfte der Welt.
+    befunde = _javascript(text, quelle)
+    if befunde:
+        return _anhaengen(befunde, faelle)
 
     # ruff und mypy schreiben zeilenweise und ohne Traceback.
     befunde = _linter(text, quelle)

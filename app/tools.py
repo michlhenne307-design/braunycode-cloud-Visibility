@@ -427,15 +427,19 @@ class Toolbox:
             aenderungen.append({"pfad": pfad, "vorher": alt, "nachher": neu})
 
         if ok and name in MODIFYING:
-            # Nur Dateien, ueber die der Importgraph ueberhaupt etwas aussagen
-            # kann. Eine .md oder .txt hat kein Verhalten, das ein Lauf
-            # belegen koennte - sie in die Sperre zu legen hiesse, den Agenten
-            # bei jeder README-Aenderung festzuhalten.
-            self.unverified.update(p for p in beruehrt if p.endswith(".py"))
-            # Verschwiegen wird sie deshalb aber nicht: am Ende steht, was
+            # Was geprueft werden KANN, muss auch geprueft werden. Hier stand
+            # frueher '.py': eine geschriebene .ts-Datei kam damit ungeprueft
+            # durch 'finish', obwohl check_syntax sie laengst lesen kann - der
+            # Agent durfte also fuer die halbe Welt behaupten statt belegen.
+            # Eine .md hat dagegen kein Verhalten, das eine Pruefung belegen
+            # koennte; sie zu sperren hiesse, ihn bei jeder README festzuhalten.
+            # Fehlt der TypeScript-Parser auf der Maschine, sagt 'unterstuetzt'
+            # das von selbst - dann sperrt hier nichts, was niemand pruefen kann.
+            pruefbar = {p for p in beruehrt if syntax.unterstuetzt(p)}
+            self.unverified.update(pruefbar)
+            # Verschwiegen wird der Rest deshalb nicht: am Ende steht, was
             # ausserhalb der Reichweite jeder Pruefung geaendert wurde.
-            self.ungeprueft_sonstige.update(
-                p for p in beruehrt if not p.endswith(".py"))
+            self.ungeprueft_sonstige.update(set(beruehrt) - pruefbar)
         elif ok and name in CHECKING and self._ist_gruen(name, result):
             if name == "check_syntax":
                 # Belegt genau die eine Datei - und nur ihre Syntax.
