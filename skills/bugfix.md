@@ -1,8 +1,8 @@
 ---
 name: bugfix
 beschreibung: Fehler erst reproduzieren, dann beheben, dann nachweisen
-ausloeser: fehler, bug, kaputt, absturz, exception, traceback, funktioniert, behebe, repariere, stimmt
-werkzeuge: list_files, glob, read_file, search, outline, symbol_info, edit_file, write_file, check_syntax, run_python, run_command, undo, finish
+ausloeser: fehler, bug, kaputt, absturz, abgestürzt, stürzt, exception, traceback, funktioniert nicht, behebe, repariere, stimmt, error, fehlermeldung, geht nicht, klappt nicht, schlägt fehl, wirft, warum nicht
+werkzeuge: list_files, glob, read_file, search, outline, symbol_info, edit_file, write_file, check_syntax, affected_tests, run_python, run_command, run_gates, undo, finish, git_push
 ---
 Die Reihenfolge ist der ganze Punkt. Halte sie ein.
 

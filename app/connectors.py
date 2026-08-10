@@ -62,7 +62,10 @@ def available() -> list[str]:
     namen = []
     if FETCH_ENABLED:
         namen.append("fetch_url")
-    if GIT_REMOTE and GIT_TOKEN:
+    # Ein Token genuegt: geklonte Projektordner bringen ihren eigenen Remote
+    # mit. BRAUNY_GIT_REMOTE braucht nur, wer den ganzen Arbeitsordner auf ein
+    # festes Ziel schieben will.
+    if GIT_TOKEN:
         namen.append("git_push")
     return namen
 
@@ -71,7 +74,7 @@ def describe() -> dict:
     """Fuer /healthz - ohne Token und ohne die volle Remote-URL."""
     return {
         "fetch_url": FETCH_ENABLED,
-        "git_push": bool(GIT_REMOTE and GIT_TOKEN),
+        "git_push": bool(GIT_TOKEN),
         "git_remote_host": urlparse(GIT_REMOTE).hostname if GIT_REMOTE else None,
     }
 
@@ -258,7 +261,74 @@ def _run(args, cwd, env=None):
     return ergebnis.returncode, scrub(ergebnis.stdout + ergebnis.stderr)
 
 
-def git_push(ws, branch: str = "", message: str = "") -> str:
+def _projekt_remote(ws, projekt: str) -> tuple[str, str]:
+    """Ein geklontes Teilprojekt im Arbeitsordner und sein eigener Remote.
+
+    Der Grund: Ein Arbeitsordner enthaelt mehrere Projekte, und jedes gehoert
+    in SEIN Repository. Alles gemeinsam auf einen festen Remote zu schieben
+    waere fuer genau einen Fall richtig und fuer alle anderen falsch.
+
+    Der Ordnername kommt vom Modell. Er wird deshalb ueber ws.resolve gefuehrt,
+    das den Arbeitsordner nicht verlaesst - sonst waere '../../..' ein Weg zu
+    jedem Git-Projekt auf der Maschine.
+    """
+    ordner = ws.resolve(projekt)
+    if not (ordner / ".git").exists():
+        raise ConnectorError(
+            f"'{projekt}' ist kein Git-Projekt. Nur ein geklonter Ordner mit "
+            "eigenem Remote kann einzeln gepusht werden.")
+
+    code, ausgabe = _run(["git", "remote", "get-url", "origin"], str(ordner))
+    if code != 0 or not ausgabe.strip():
+        raise ConnectorError(f"'{projekt}' hat keinen Remote 'origin'.")
+    remote = ausgabe.strip().splitlines()[0].strip()
+
+    # Steckt im origin bereits ein Token, liegt es dauerhaft in .git/config.
+    # Dann wird nicht heimlich damit gepusht, sondern gesagt, was los ist.
+    zerlegt = urlparse(remote)
+    if zerlegt.scheme in ("http", "https") and (zerlegt.username or zerlegt.password):
+        raise ConnectorError(
+            f"Der Remote von '{projekt}' enthält Zugangsdaten in der URL. "
+            "Bitte bereinigen — das Token gehört in BRAUNY_GIT_TOKEN.")
+    return str(ordner), remote
+
+
+def _projekt_push(ws, projekt: str, branch: str, message: str) -> str:
+    """Committet und pusht EIN geklontes Teilprojekt auf dessen eigenen Remote."""
+    wurzel, remote = _projekt_remote(ws, projekt)
+
+    _run(["git", "add", "-A"], wurzel)
+    # Ohne Autor bricht git ab, wenn auf der Maschine keiner gesetzt ist.
+    code, ausgabe = _run(
+        ["git", "-c", "user.name=BraunyCode", "-c", "user.email=brauny@localhost",
+         "commit", "-m", message or "Änderung durch BraunyCode"], wurzel)
+    # "nothing to commit" ist kein Fehler - dann gibt es schlicht nichts zu tun.
+    if code != 0 and "nothing to commit" not in ausgabe:
+        raise ConnectorError(f"Commit fehlgeschlagen: {ausgabe.strip()[:300]}")
+    nichts_neues = "nothing to commit" in ausgabe
+
+    ziel = GIT_BRANCH_PREFIX + safe_branch(branch or message or "arbeit")
+    helper = ('!f() { echo username=$BRAUNY_GIT_USER; '
+              'echo password=$BRAUNY_GIT_TOKEN; }; f')
+    env = {**os.environ,
+           "GIT_TERMINAL_PROMPT": "0",
+           "GIT_ASKPASS": "",
+           "BRAUNY_GIT_USER": GIT_USER,
+           "BRAUNY_GIT_TOKEN": GIT_TOKEN}
+
+    code, ausgabe = _run(
+        ["git", "-c", f"credential.helper={helper}", "push", "--force-with-lease",
+         remote, f"HEAD:refs/heads/{ziel}"], wurzel, env)
+    if code != 0:
+        raise ConnectorError(f"Push fehlgeschlagen: {ausgabe.strip()[:400]}")
+
+    host = urlparse(remote).hostname or "Remote"
+    hinweis = " (keine neuen Änderungen)" if nichts_neues else ""
+    return (f"'{projekt}' auf {host} gepusht, Branch '{ziel}'{hinweis}.\n"
+            f"{ausgabe.strip()[:400]}")
+
+
+def git_push(ws, branch: str = "", message: str = "", projekt: str = "") -> str:
     """Schiebt den Projektstand auf den konfigurierten Remote.
 
     Der Token steht nur in der Umgebung des Kindprozesses und wird ueber einen
@@ -266,9 +336,18 @@ def git_push(ws, branch: str = "", message: str = "") -> str:
     jeden sichtbar, der 'ps' aufruft) und nie in .git/config (dort bliebe er
     auf der Platte stehen).
     """
-    if not (GIT_REMOTE and GIT_TOKEN):
-        raise ConnectorError("git_push ist nicht konfiguriert "
-                             "(BRAUNY_GIT_REMOTE und BRAUNY_GIT_TOKEN).")
+    if not GIT_TOKEN:
+        raise ConnectorError("git_push ist nicht konfiguriert (BRAUNY_GIT_TOKEN).")
+
+    # Ein benannter Projektordner geht auf SEINEN eigenen Remote. Das ist der
+    # Normalfall, sobald mehr als ein Projekt im Arbeitsordner liegt.
+    if projekt.strip():
+        return _projekt_push(ws, projekt.strip(), branch, message)
+
+    if not GIT_REMOTE:
+        raise ConnectorError(
+            "Ohne Projektangabe braucht es BRAUNY_GIT_REMOTE. Oder nenne den "
+            "Projektordner - dann wird dessen eigener Remote benutzt.")
     # Der Remote wird woertlich in .git/config geschrieben. Steckt darin ein
     # Token wie https://ghp_xyz@host/repo.git, liegt es dauerhaft auf der
     # Platte - und scrub() entfernt nur BRAUNY_GIT_TOKEN, nicht dieses.

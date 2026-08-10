@@ -4,7 +4,9 @@ import json
 import os
 import struct
 import shutil
+import textwrap
 import subprocess
+import time
 import sys
 
 os.environ["BRAUNY_TOKEN"] = "geheim-test-token"
@@ -45,36 +47,239 @@ check("laesst keine Backticks uebrig",
 print("\n[2] Anbieter liest beide ollama-Client-Formen")
 import provider  # noqa: E402
 
-class FakeFunction:
-    name = "read_file"
-    arguments = '{"path": "main.py"}'
-class FakeCall:
-    function = FakeFunction()
-class AttrResp:
-    class message:
-        content = "attr-stil"
-        tool_calls = [FakeCall()]
+import httpx  # noqa: E402
 
-def fake_ollama_chat(response):
-    """Setzt ollama.chat voruebergehend auf eine feste Antwort."""
-    import ollama
-    orig = ollama.chat
-    ollama.chat = lambda **kw: response
+class OllamaStrom:
+    """Nachbau einer stroemenden httpx-Antwort von Ollama.
+
+    Ollama antwortet zeilenweise als NDJSON: viele Teilstuecke, das letzte
+    mit done=true und den Messwerten.
+    """
+    def __init__(self, zeilen, status=200, rumpf=""):
+        self.zeilen = zeilen
+        self.status_code = status
+        self.text = rumpf
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        return False
+    def read(self):
+        return b""
+    def iter_lines(self):
+        for z in self.zeilen:
+            yield json.dumps(z) if isinstance(z, dict) else z
+
+_letzte_anfrage = {}
+
+def _strom_setzen(zeilen, status=200, rumpf=""):
+    """Ersetzt httpx.stream und merkt sich, was gesendet wurde."""
+    def _stream(method, url, **kw):
+        _letzte_anfrage.clear()
+        _letzte_anfrage.update({"url": url, "body": kw.get("json")})
+        return OllamaStrom(zeilen, status, rumpf)
+    return _stream
+
+def fake_ollama_chat(daten, tools=None, on_text=None):
+    """Ein Modellaufruf gegen eine erfundene Ollama-Antwort.
+
+    daten: entweder die fertige Nachricht (wird zu einer done-Zeile) oder
+    eine Liste von Teilstuecken, wie sie wirklich ueber die Leitung kommen.
+    """
+    zeilen = daten if isinstance(daten, list) else [{**daten, "done": True}]
+    orig = httpx.stream
+    httpx.stream = _strom_setzen(zeilen)
     try:
-        return provider._chat_ollama([{"role": "user", "content": "x"}], None)
+        return provider._chat_ollama([{"role": "user", "content": "x"}], tools,
+                                     on_text=on_text)
     finally:
-        ollama.chat = orig
+        httpx.stream = orig
 
-r = fake_ollama_chat({"message": {"content": "dict-stil"}})
-check("dict-Zugriff", r.text == "dict-stil", r)
-check("dict ohne tool_calls", r.tool_calls == [])
+r = fake_ollama_chat({"message": {"content": "hallo"}})
+check("Antworttext wird gelesen", r.text == "hallo", r)
+check("ohne tool_calls bleibt die Liste leer", r.tool_calls == [])
+check("die Anfrage geht an /api/chat", _letzte_anfrage["url"].endswith("/api/chat"),
+      _letzte_anfrage.get("url"))
+# Frueher stand hier "es wird nicht gestreamt". Das war der Fehler: bei einem
+# 30B-Modell auf CPU vergehen Minuten bis zum ersten Zeichen, und ohne Strom
+# ist das von einem Absturz nicht zu unterscheiden.
+check("es wird gestreamt", _letzte_anfrage["body"]["stream"] is True)
 
-r = fake_ollama_chat(AttrResp())
-check("attribut-Zugriff", r.text == "attr-stil", r)
-check("Werkzeugaufruf erkannt", len(r.tool_calls) == 1 and
-      r.tool_calls[0].name == "read_file", r.tool_calls)
-check("JSON-Argumente geparst",
+# Die drei Stellschrauben, die auf dieser Maschine ueber Minuten entscheiden.
+check("das Modell bleibt im Speicher (keep_alive)",
+      _letzte_anfrage["body"].get("keep_alive") == provider.KEEP_ALIVE,
+      _letzte_anfrage["body"].get("keep_alive"))
+check("das Kontextfenster wird gesetzt, nicht geraten",
+      _letzte_anfrage["body"]["options"]["num_ctx"] == provider.NUM_CTX)
+check("die Antwortlaenge hat einen Deckel",
+      _letzte_anfrage["body"]["options"]["num_predict"] == provider.NUM_PREDICT)
+check("das Kontextfenster ist größer als Ollamas Vorgabe von 4096",
+      provider.NUM_CTX > 4096, provider.NUM_CTX)
+
+# Teilstuecke muessen ankommen, waehrend sie entstehen - sonst nuetzt der
+# Strom nichts.
+_gesehen = []
+_r = fake_ollama_chat(
+    [{"message": {"content": "Hallo "}},
+     {"message": {"content": "Welt"}},
+     {"message": {"content": ""}, "done": True,
+      "prompt_eval_count": 1200, "prompt_eval_duration": 40_000_000_000,
+      "eval_count": 80, "eval_duration": 20_000_000_000,
+      "total_duration": 61_000_000_000, "load_duration": 1_000_000_000}],
+    on_text=_gesehen.append)
+check("Teilstücke kommen einzeln an", _gesehen == ["Hallo ", "Welt"], _gesehen)
+check("und ergeben zusammen den ganzen Text", _r.text == "Hallo Welt", _r.text)
+
+# Ohne Zahlen bleibt "es ist langsam" eine Meinung.
+check("die Messwerte werden übernommen",
+      _r.messung.get("prompt_token") == 1200 and _r.messung.get("antwort_token") == 80,
+      _r.messung)
+check("Dauern kommen in Sekunden, nicht in Nanosekunden",
+      _r.messung.get("prompt_s") == 40.0 and _r.messung.get("antwort_s") == 20.0,
+      _r.messung)
+check("die Ladezeit des Modells wird getrennt ausgewiesen",
+      _r.messung.get("geladen_s") == 1.0, _r.messung)
+
+# Eine kaputte Zeile mitten im Strom darf nicht alles Bisherige wegwerfen.
+_r = fake_ollama_chat([{"message": {"content": "gut"}},
+                       "das ist kein json",
+                       {"message": {"content": ""}, "done": True}])
+check("eine unlesbare Zeile im Strom wird übersprungen", _r.text == "gut", _r.text)
+
+# Ein Anzeigefehler darf den Modellaufruf nicht mitreissen.
+def _kaputt(_):
+    raise RuntimeError("Anzeige kaputt")
+_r = fake_ollama_chat({"message": {"content": "trotzdem da"}}, on_text=_kaputt)
+check("ein Fehler beim Anzeigen reißt den Aufruf nicht mit",
+      _r.text == "trotzdem da", _r.text)
+check("Werkzeugaufrufe laufen mit Temperatur 0",
+      _letzte_anfrage["body"]["options"]["temperature"] == 0.0)
+check("ohne Werkzeuge steht kein tools-Feld in der Anfrage",
+      "tools" not in _letzte_anfrage["body"])
+
+fake_ollama_chat({"message": {"content": ""}}, tools=[{"type": "function"}])
+check("uebergebene Werkzeuge werden mitgeschickt",
+      _letzte_anfrage["body"].get("tools") == [{"type": "function"}])
+
+# Der Absturz aus dem echten Betrieb, wortwoertlich:
+#
+#   ValidationError: 1 validation error for Message
+#   tool_calls.0.function.arguments
+#     Input should be a valid dictionary
+#     [type=dict_type, input_value='{}', input_type=str]
+#
+# qwen3-coder schickt 'arguments' als JSON-TEXT. Das Paket 'ollama' verlangt
+# an der Stelle ein dict und brach ab, bevor _parse_arguments ueberhaupt lief.
+r = fake_ollama_chat({"message": {"content": "", "tool_calls": [
+    {"function": {"name": "list_files", "arguments": "{}"}}]}})
+check("Argumente als Text '{}' stürzen nicht mehr ab",
+      len(r.tool_calls) == 1 and r.tool_calls[0].arguments == {}, r.tool_calls)
+check("und der Werkzeugname kommt an", r.tool_calls[0].name == "list_files")
+
+r = fake_ollama_chat({"message": {"tool_calls": [
+    {"function": {"name": "read_file", "arguments": '{"path": "main.py"}'}}]}})
+check("gefüllte JSON-Textargumente werden geparst",
       r.tool_calls[0].arguments == {"path": "main.py"}, r.tool_calls[0].arguments)
+
+r = fake_ollama_chat({"message": {"tool_calls": [
+    {"function": {"name": "read_file", "arguments": {"path": "a.py"}}}]}})
+check("Argumente als echtes dict bleiben unverändert",
+      r.tool_calls[0].arguments == {"path": "a.py"}, r.tool_calls[0].arguments)
+
+# Ein Aufruf ohne Namen ist nicht ausfuehrbar. Ihn zu uebergehen ist besser,
+# als spaeter ueber einen leeren Werkzeugnamen zu stolpern.
+r = fake_ollama_chat({"message": {"tool_calls": [
+    {"function": {"arguments": "{}"}},
+    {"function": {"name": "list_files", "arguments": "{}"}}]}})
+check("ein Aufruf ohne Namen wird übergangen",
+      [c.name for c in r.tool_calls] == ["list_files"], r.tool_calls)
+
+try:
+    fake_ollama_chat({"error": "model 'gibtsnicht' not found"})
+    check("Fehlermeldung von Ollama wird weitergereicht", False, "keine Ausnahme")
+except provider.ProviderError as exc:
+    check("Fehlermeldung von Ollama wird weitergereicht",
+          "gibtsnicht" in str(exc), exc)
+
+_prov_src = open(provider.__file__, encoding="utf-8").read()
+check("das Paket 'ollama' wird nicht mehr importiert",
+      "import ollama" not in _prov_src)
+check("stattdessen wird die HTTP-Schnittstelle benutzt", "/api/chat" in _prov_src)
+check("OLLAMA_HOST bekommt ein Schema, auch ohne eines",
+      provider.OLLAMA_HOST.startswith("http://"), provider.OLLAMA_HOST)
+check("der Zeitwert für den Modellaufruf ist großzügig",
+      provider.MODELL_TIMEOUT >= 600, provider.MODELL_TIMEOUT)
+
+# --- Die Gegenrichtung: was WIR an Ollama schicken --------------------------
+#
+# Im Betrieb abgestuerzt, nachdem das erste Werkzeug schon gelaufen war:
+#
+#   Modellaufruf fehlgeschlagen: ProviderError: Ollama nicht erreichbar:
+#   Client error '400 Bad Request' for url 'http://127.0.0.1:11434/api/chat'
+#
+# Ursache: Der Agent baut seinen Verlauf im OpenAI-Format, dort sind
+# tool_calls[].function.arguments ein JSON-TEXT. Ollama will an derselben
+# Stelle ein OBJEKT und lehnt alles andere ab. Das ist exakt das Spiegelbild
+# des Fehlers weiter oben - dort kam ein Text, wo ein Objekt erwartet wurde.
+#
+# Beide Module waren fuer sich richtig. Kaputt war die Naht dazwischen,
+# deshalb prueft dieser Test beide Seiten zusammen statt jede fuer sich.
+import agentloop as _al  # noqa: E402
+import tools as _tools  # noqa: E402
+
+class _Aufruf:
+    def __init__(self, name, args, call_id="c1"):
+        self.name, self.arguments, self.call_id = name, args, call_id
+
+class _Antwort:
+    text = ""
+
+_echte_nachricht = _al._assistant_message(
+    _Antwort(), [_Aufruf("write_file", {"path": "rechner.py", "content": "x"})])
+check("der Agent schickt Argumente als Text (OpenAI-Format)",
+      isinstance(_echte_nachricht["tool_calls"][0]["function"]["arguments"], str),
+      _echte_nachricht["tool_calls"][0]["function"]["arguments"])
+
+_fuer_ollama = provider._ollama_messages([
+    {"role": "system", "content": "sei gut"},
+    {"role": "user", "content": "mach was"},
+    _echte_nachricht,
+    _tools.format_result("write_file", "Datei geschrieben.", "c1"),
+])
+_assistent = _fuer_ollama[2]
+_werkzeug = _fuer_ollama[3]
+
+check("für Ollama werden die Argumente zum Objekt",
+      _assistent["tool_calls"][0]["function"]["arguments"]
+      == {"path": "rechner.py", "content": "x"},
+      _assistent["tool_calls"][0]["function"]["arguments"])
+check("der Werkzeugname bleibt erhalten",
+      _assistent["tool_calls"][0]["function"]["name"] == "write_file")
+# Genau diese Zusatzfelder kennt Ollama nicht.
+check("'id' und 'type' fallen weg",
+      set(_assistent["tool_calls"][0]) == {"function"}, _assistent["tool_calls"][0])
+check("das Werkzeugergebnis heißt bei Ollama tool_name",
+      _werkzeug.get("tool_name") == "write_file" and "tool_call_id" not in _werkzeug,
+      _werkzeug)
+check("gewöhnliche Nachrichten bleiben unangetastet",
+      _fuer_ollama[0] == {"role": "system", "content": "sei gut"}, _fuer_ollama[0])
+check("eine Nachricht ohne Werkzeugaufruf bekommt auch keinen",
+      "tool_calls" not in _fuer_ollama[1], _fuer_ollama[1])
+check("ein content=None wird zu leerem Text, nicht zu null",
+      provider._ollama_messages([{"role": "user", "content": None}])[0]["content"] == "")
+
+# Und die Ablehnung selbst muss lesbar sein. "400 Bad Request" allein sagt
+# nicht, WAS falsch war - der Grund steht im Rumpf und gehoert in die Meldung.
+_orig_post = httpx.stream
+httpx.stream = _strom_setzen([], status=400,
+                             rumpf='{"error":"invalid message content type: <nil>"}')
+try:
+    provider._chat_ollama([{"role": "user", "content": "x"}], None)
+    check("eine Ablehnung nennt den Grund", False, "keine Ausnahme")
+except provider.ProviderError as _exc:
+    check("eine Ablehnung nennt den Grund",
+          "400" in str(_exc) and "invalid message content type" in str(_exc), _exc)
+finally:
+    httpx.stream = _orig_post
 
 print("\n[3] make_project_dir")
 d = sandbox.make_project_dir({"main.py": "print('x')"})
@@ -120,7 +325,7 @@ print("\n[5] HTTP-Routen")
 client = TestClient(main.app)
 r = client.get("/")
 check("GET / liefert 200", r.status_code == 200, r.status_code)
-check("GET / enthaelt UI", "BraunyCode Control" in r.text)
+check("GET / enthaelt UI", "BraunyCode" in r.text)
 check("GET /static/app.css", client.get("/static/app.css").status_code == 200)
 check("GET /static/app.js", client.get("/static/app.js").status_code == 200)
 r = client.get("/healthz")
@@ -179,8 +384,84 @@ check("index ist standalone-faehig", 'apple-mobile-web-app-capable" content="yes
 check("app.js registriert Service Worker", "serviceWorker" in js and "'/sw.js'" in js)
 check("keine innerHTML-Zuweisung im Frontend (XSS)",
       ".innerHTML" not in js, "innerHTML-Zugriff gefunden")
-for element in ["panel-log", "panel-code", "panel-out", "btn-run", "gate", "token"]:
-    check(f"app.js-Ziel #{element} existiert im HTML", f'id="{element}"' in html)
+# Frueher stand hier eine feste Liste von sechs Bezeichnern. Die musste bei
+# jedem Umbau der Oberflaeche von Hand nachgezogen werden - und genau das
+# vergisst man. Jetzt werden die Ziele aus app.js selbst gelesen: was das
+# Skript anspricht, muss es im HTML auch geben. Das faengt jeden kuenftigen
+# Umbau mit ab, nicht nur diese sechs.
+import re as _re_ui  # noqa: E402
+_ziele = sorted(set(_re_ui.findall(r"\$\('([a-z0-9-]+)'\)", js)))
+check("app.js spricht überhaupt Elemente an", len(_ziele) >= 6, _ziele)
+_fehlend = [z for z in _ziele if f'id="{z}"' not in html]
+check("jedes von app.js angesprochene Element existiert im HTML",
+      not _fehlend, _fehlend)
+
+# --- Gespraechsverlauf statt Formular -------------------------------------
+#
+# Die Oberflaeche war ein Auftragsformular: Textfeld oben, drei Reiter, ein
+# Knopf. Jeder Lauf loeschte den vorigen. Jetzt waechst ein Verlauf mit, in
+# dem Auftrag und Arbeit nebeneinander stehen bleiben.
+css = (main.STATIC_DIR / "app.css").read_text()
+
+check("es gibt einen fortlaufenden Verlauf", 'id="stream"' in html)
+check("die Eingabe sitzt in einem Formular unten",
+      'class="composer"' in html and 'id="composer"' in html)
+check("Absenden laeuft ueber submit, nicht ueber einen Klick-Handler",
+      "'submit'" in js and "preventDefault" in js)
+check("das Eingabefeld wächst mit", "hoeheAnpassen" in js and "scrollHeight" in js)
+
+# Werkzeugaufrufe gehoeren zugeklappt - im Normalfall sind sie Rauschen.
+check("Werkzeugaufrufe sind aufklappbar",
+      "createElement('details')" in js and "'summary'" in js)
+check("die Ausgabe eines Werkzeugs steckt in dessen Klappe",
+      "if (schritt)" in js)
+
+# Der Kern des Programms sind die Belegzeilen am Ende eines Laufs. Landeten
+# die in einer zugeklappten Zeile, waere die Oberflaeche huebsch und nutzlos.
+_zweig = js.split("default:")[-1]
+check("status-Zeilen schließen die offene Klappe, statt darin zu verschwinden",
+      "schritt = null" in _zweig, _zweig[:200])
+
+# Bildschirmtastatur: mit 100vh schiebt sie die Eingabe aus dem Bild.
+check("die Höhe folgt der sichtbaren Fläche (dvh/svh)", "dvh" in css and "svh" in css)
+check("die sicheren Bereiche werden beachtet", "safe-area-inset" in css)
+# Unter 16px zoomen mobile Browser beim Fokus ins Feld - und kommen nicht
+# wieder heraus.
+check("das Eingabefeld ist mindestens 16px groß",
+      "font-size: 16px" in css.split("#prompt {")[1].split("}")[0],
+      css.split("#prompt {")[1].split("}")[0])
+check("der Startknopf wird beim Laufen zum Abbruch",
+      "body.running .send" in css)
+
+# Sichtbarkeit waehrend der Rechenzeit. Ein 30B-Modell auf CPU braucht
+# Minuten bis zum ersten Zeichen; ohne Anzeige haelt man das fuer einen
+# Absturz - genau das ist im Betrieb passiert ("Seit 5min passiert
+# garnichts").
+check("es gibt eine laufende Uhr, nicht nur stumme Punkte",
+      "function puls(" in js and ".thinking .uhr" in css)
+check("Text wird angezeigt, während er entsteht",
+      "function stromZeile(" in js and "case 'delta'" in js)
+check("die Messwerte eines Schritts werden angezeigt",
+      "function messwerte(" in js and "case 'messung'" in js)
+check("Tokens pro Sekunde werden ausgerechnet",
+      "antwort_token / ev.antwort_s" in js)
+# Ein neuer Werkzeugaufruf, Code oder Abschluss muss den Textstrom beenden -
+# sonst wachsen spaetere Stuecke in den alten Block hinein.
+check("ein neuer Abschnitt beendet den Textstrom",
+      js.count("strom = null") >= 5, js.count("strom = null"))
+
+# Beim Umbau tatsaechlich passiert und erst auf einer Bildschirmaufnahme
+# aufgefallen: 'hidden' setzt display:none nur in der Browservorlage. Eine
+# eigene display-Regel auf derselben Klasse ist spezifischer und gewinnt -
+# Anmeldung und Verlauf lagen dauerhaft ueber der Seite. Wer 'hidden'
+# benutzt, um etwas zu verstecken, muss es also selbst durchsetzen.
+_versteckbar = [zeile.split("{")[0].strip()
+                for zeile in css.splitlines()
+                if "display:" in zeile and zeile.strip().startswith(".")]
+check("verstecktes bleibt versteckt: .sheet[hidden] setzt display:none",
+      ".sheet[hidden] { display: none; }" in css, _versteckbar)
+for _id in ("gate", "history"):
+    check(f"#{_id} startet versteckt", f'id="{_id}" hidden' in html)
 
 print("\n[8] WebSocket-Protokoll")
 def ws_exchange(payload, raw=None):
@@ -758,7 +1039,9 @@ print("\n[22] Werkzeugkasten")
 import tools  # noqa: E402
 
 sch = tools.schema()
-check("vollständiger Werkzeugkasten", len(sch) == 16, len(sch))
+check("vollständiger Werkzeugkasten",
+      {t["function"]["name"] for t in sch} == tools.BASE_NAMES,
+      sorted({t["function"]["name"] for t in sch} ^ tools.BASE_NAMES))
 check("OpenAI-Format", all(t["type"] == "function" and "name" in t["function"]
                           and "parameters" in t["function"] for t in sch))
 check("Pflichtfelder deklariert",
@@ -817,8 +1100,20 @@ check("run_python ohne Sandbox meldet Fehler",
       asyncio.run(tools.Toolbox(tws).call("run_python", {"path": "main.py"}))
       .startswith("FEHLER"))
 
+# finish an einer frischen Toolbox: dieser Test gilt der Zusammenfassung,
+# nicht der Abschluss-Sperre - die hat eigene Tests. In 'box' liegt inzwischen
+# ein geschriebenes neu.py, das run_python(main.py) nie erreicht hat, und die
+# Sperre greift dort zu Recht.
+_frisch = tools.Toolbox(tws)
 check("finish setzt die Zusammenfassung",
-      call("finish", summary="alles gut") == "alles gut" and box.finished == "alles gut")
+      asyncio.run(_frisch.call("finish", {"summary": "alles gut"})) == "alles gut"
+      and _frisch.finished == "alles gut")
+# Und genau der Fall, den die alte Fassung stillschweigend durchgelassen hat:
+# eine geschriebene Python-Datei, die kein Lauf beruehrt hat, ist NICHT belegt.
+check("nie ausgeführte Datei blockiert den Abschluss",
+      "neu.py" in box.unverified, sorted(box.unverified))
+check("und finish wird deshalb abgewiesen",
+      call("finish", summary="alles gut").startswith("FEHLER"))
 
 lang = tools.Toolbox(tws)
 tws.write("gross.py", "x = 1\n" * 4000)
@@ -916,16 +1211,47 @@ check("jedes Ergebnis folgt auf seinen Aufruf",
           a["tool_calls"][0]["id"] == t["tool_call_id"] for a, t in paare),
       paare[:1])
 
-# finish ohne Ausfuehrung: das muss ausdruecklich dazugesagt werden
+# finish ohne Pruefung wird abgewiesen - und zwar im Werkzeug, nicht im Prompt.
+# Erst nach FINISH_BLOCK_LIMIT Ablehnungen darf der Lauf enden, dann aber
+# ausdruecklich als unbelegt.
 outcome, events, w, _ = drive_loop([
     reply(calls=[("write_file", {"path": "main.py", "content": "print(1)\n"})]),
+    reply(calls=[("finish", {"summary": "Fertig und getestet."})]),
+    reply(calls=[("finish", {"summary": "Fertig und getestet."})]),
+    reply(calls=[("finish", {"summary": "Fertig und getestet."})]),
+])
+fehler = [e["text"] for e in events if e["type"] == "error"]
+check("erster Abschlussversuch wird abgewiesen",
+      sum("Abschluss abgelehnt" in t for t in fehler) == tools.FINISH_BLOCK_LIMIT,
+      fehler)
+check("die Ablehnung nennt die offene Datei",
+      any("main.py" in t for t in fehler if "Abschluss abgelehnt" in t), fehler)
+done = next(e for e in events if e["type"] == "done")
+check("Lauf endet trotzdem", outcome == "ok", outcome)
+check("ohne Ausführung nicht als geprüft markiert", done.get("verified") is False, done)
+check("ungeprüfte Datei wird beim Namen genannt",
+      any("Ungeprüft geblieben" in t and "main.py" in t for t in fehler), fehler)
+
+# Umgekehrt: check_syntax hebt die Sperre auf - aber nur fuer die Syntax, und
+# das muss anders klingen als ein echter Lauf.
+outcome, events, w, _ = drive_loop([
+    reply(calls=[("write_file", {"path": "main.py", "content": "print(1)\n"})]),
+    reply(calls=[("check_syntax", {"path": "main.py"})]),
     reply(calls=[("finish", {"summary": "Fertig."})]),
 ])
 done = next(e for e in events if e["type"] == "done")
-check("ohne Ausführung nicht als geprüft markiert", done.get("verified") is False, done)
-check("Hinweis auf fehlende Ausführung",
-      any("nicht ausgeführt" in e["text"] for e in events if e["type"] == "error"),
-      [e["text"] for e in events if e["type"] == "error"])
+check("check_syntax hebt die Sperre auf", outcome == "ok", outcome)
+check("nach check_syntax keine Ablehnung mehr",
+      not any("Abschluss abgelehnt" in e["text"]
+              for e in events if e["type"] == "error"), events)
+check("Beleg steht im Protokoll",
+      any("Belegt durch" in e["text"] and "check_syntax" in e["text"]
+          for e in events if e["type"] == "status"),
+      [e["text"] for e in events if e["type"] == "status"])
+check("nur Syntax belegt wird als solches gemeldet",
+      any("nur die Syntax" in e["text"]
+          for e in events if e["type"] == "status"),
+      [e["text"] for e in events if e["type"] == "status"])
 
 # Schrittgrenze
 outcome, events, w, _ = drive_loop(
@@ -982,6 +1308,7 @@ check("Abbruch nennt den Modelltext",
 outcome, events, w, _ = drive_loop([
     reply('{"tool": "write_file", "arguments": {"path": "main.py", '
           '"content": "print(7)\\n"}}'),
+    reply(calls=[("check_syntax", {"path": "main.py"})]),
     reply(calls=[("finish", {"summary": "über JSON geschrieben"})]),
 ])
 check("JSON-Aufruf wird ausgeführt", w.read("main.py") == "print(7)\n", w.read("main.py"))
@@ -1105,6 +1432,7 @@ check("mechanisch ohne Modellaufruf", counts["chat"] == 0 and counts["ask"] == 0
 
 outcome, events, counts, w = drive_dispatch("baue etwas Neues", [
     reply(calls=[("write_file", {"path": "neu.py", "content": "print('x')\n"})]),
+    reply(calls=[("run_python", {"path": "neu.py"})]),
     reply(calls=[("finish", {"summary": "gebaut"})]),
 ], "auto")
 check("kreativer Auftrag geht in die Werkzeugschleife", outcome == "ok", outcome)
@@ -1160,9 +1488,13 @@ check("leerer Text kein Skill", skills_mod.parse("") is None)
 
 echte = skills_mod.load(main.BASE_DIR.parent / "skills")
 namen = {sk.name for sk in echte}
-check("mitgelieferte Skills geladen", len(echte) == 5, sorted(namen))
-check("Skills heißen wie erwartet",
-      namen == {"tests", "bugfix", "umbau", "review", "doku"}, sorted(namen))
+# Feste Zahl statt fester Liste waere hier falsch herum: dazukommende Skills
+# sind erwuenscht, verschwindende nicht. Geprueft wird deshalb, dass die
+# tragenden noch da sind - nicht, dass es genau diese sind.
+_kern = {"tests", "bugfix", "umbau", "review", "doku",
+         "neubau", "erklaeren", "sicherheit", "daten"}
+check("die tragenden Skills sind alle da", _kern <= namen, sorted(_kern - namen))
+check("es gibt keine namenlosen Skills", all(sk.name for sk in echte))
 check("jeder Skill hat Auslöser", all(sk.ausloeser for sk in echte))
 check("jeder Skill hat eine Anleitung", all(len(sk.anleitung) > 100 for sk in echte))
 check("fehlendes Verzeichnis -> leere Liste",
@@ -1218,14 +1550,227 @@ for sk in echte:
     check(f"Skill '{sk.name}' erlaubt finish",
           "finish" in sk.werkzeuge, sk.werkzeuge)
 
+# Die Regel lautete frueher "jeder Skill ausser review kennt edit_file". Das
+# war die Beobachtung von damals, nicht die Regel: 'review' war schlicht der
+# einzige, der nichts schreiben durfte. Mit erklaeren, sicherheit und daten
+# waeren nun drei Ausnahmen noetig gewesen - ein Zeichen, dass die
+# Formulierung nicht stimmt.
+#
+# Gemeint ist: WER SCHREIBEN DARF, muss auch aendern koennen. Sonst bleibt ihm
+# nur, eine Datei komplett neu zu schreiben, und dabei geht fremder Code
+# verloren, den er gar nicht anfassen sollte.
 schreibende = {"edit_file", "write_file"}
 for sk in echte:
-    if sk.name == "review":
-        check("review darf nichts Schreibendes",
-              not (schreibende & set(sk.werkzeuge)), sk.werkzeuge)
-    else:
-        check(f"Skill '{sk.name}' kennt edit_file",
+    darf_schreiben = bool(schreibende & set(sk.werkzeuge))
+    if darf_schreiben:
+        check(f"Skill '{sk.name}' darf ändern, nicht nur überschreiben",
               "edit_file" in sk.werkzeuge, sk.werkzeuge)
+    else:
+        # Ein nur lesender Skill muss auch wirklich nichts veraendern koennen.
+        check(f"Skill '{sk.name}' ist lesend und bleibt es",
+              not (set(sk.werkzeuge) & tools.MODIFYING), sorted(set(sk.werkzeuge) & tools.MODIFYING))
+
+# --- Trifft der richtige Skill? ------------------------------------------
+#
+# Die Werkzeugliste eines Skills entscheidet mit, was der Agent ueberhaupt
+# tun kann - ein falsch gewaehlter Skill ist deshalb kein Schoenheitsfehler.
+# Diese Saetze stammen aus dem Betrieb oder sind so formuliert, wie jemand
+# wirklich schreibt.
+_erwartungen = [
+    ("Baue ein vollständiges Python-Konsolenprogramm für eine kleine "
+     "Aufgabenverwaltung.", "neubau"),
+    ("Schreib Tests für die Zahlungslogik", "tests"),
+    ("Erkläre mir, was dieses Projekt macht", "erklaeren"),
+    ("Wie funktioniert die Anmeldung?", "erklaeren"),
+    ("Prüfe den Code auf Sicherheitslücken", "sicherheit"),
+    ("Gibt es hier Schwachstellen?", "sicherheit"),
+    ("Der Import stürzt mit einem KeyError ab", "bugfix"),
+    ("Das geht nicht, da kommt eine Fehlermeldung", "bugfix"),
+    ("Benenne die Funktion foo in bar um, ohne Verhalten zu ändern", "umbau"),
+    ("Wandle die CSV in JSON um und zähl die Zeilen", "daten"),
+    ("Schreib eine README für das Projekt", "doku"),
+    ("Mach eine Durchsicht und melde Probleme im Stil", "review"),
+]
+for _text, _erwartet in _erwartungen:
+    _treffer = skills_mod.match(_text, echte)
+    check(f"„{_text[:34]}…\u201c → {_erwartet}",
+          _treffer is not None and _treffer.name == _erwartet,
+          _treffer.name if _treffer else "kein Skill")
+
+# Deutsche Zusammensetzungen sind EIN Wort. Ein rein wortgenauer Abgleich
+# findet in "Sicherheitslücken" weder "sicherheit" noch "lücke" - im Betrieb
+# ging genau dieser Satz an den falschen Skill.
+check("lange Auslöser zünden auch innerhalb eines Wortes",
+      skills_mod.score("Sicherheitsprüfung gewünscht",
+                       skills_mod.Skill(name="x", ausloeser=["sicherheit"])) == 1)
+# Kurze duerfen das nicht, sonst zuendet 'code' in 'Decoder'.
+check("kurze Auslöser bleiben wortgenau",
+      skills_mod.score("Der Decoder läuft",
+                       skills_mod.Skill(name="x", ausloeser=["code"])) == 0)
+check("die Schwelle steht bei sieben Zeichen", skills_mod.TEILWORT_AB == 7)
+
+# --- Ausgabedeckel an der Quelle ------------------------------------------
+#
+# Zweimal im Betrieb passiert: das erzeugte Programm hatte ein input()-Menue,
+# in der Sandbox kommt keine Eingabe, die Schleife drehte endlos und schrieb
+# tausende Zeilen in Sekunden. Jede wurde ein Ereignis, das Budget des Laufs
+# war aufgebraucht, der Auftrag brach ab - wegen der AUSGABE, nicht wegen des
+# Fehlers.
+#
+# Beim ersten Anlauf sass mein Deckel auf dem falschen Weg (agentloop), waehrend
+# die Flut aus sandbox_runner kam. Deshalb steht er jetzt an der Quelle, wo
+# beide Wege durchmuessen.
+_mq = (main.BASE_DIR / "main.py").read_text()
+check("es gibt einen Deckel für Sandbox-Ausgaben",
+      isinstance(main.MAX_SANDBOX_ZEILEN, int) and main.MAX_SANDBOX_ZEILEN >= 20,
+      main.MAX_SANDBOX_ZEILEN)
+check("er greift beim Lesen des Container-Logs",
+      "len(lines) >= MAX_SANDBOX_ZEILEN" in _mq)
+check("die Kürzung wird gemeldet, nicht verschwiegen", "[Gekürzt]" in _mq)
+check("und sie nennt die wahrscheinliche Ursache",
+      "Endlosschleife" in _mq and "Eingabe" in _mq)
+# Der gekuerzte Text geht als Werkzeugergebnis zurueck ans Modell - dort waere
+# eine ungebremste Ausgabe noch schaedlicher als auf dem Bildschirm.
+check("der Hinweis landet auch im Ergebnis für das Modell",
+      "lines.append(hinweis)" in _mq)
+check("der Deckel liegt weit unter dem Ereignisbudget eines Laufs",
+      main.MAX_SANDBOX_ZEILEN * 4 < 4000, main.MAX_SANDBOX_ZEILEN)
+
+# --- Nicht nur Python ------------------------------------------------------
+#
+# Aus dem Betrieb, an einem Next.js-Projekt: der Agent hat versucht,
+# Python-Module zu importieren, bis der Lauf abbrach. Kein Modellfehler - er
+# KONNTE an TypeScript nichts belegen, weil check_syntax nur Python verstand.
+# Wer nur einen Hammer hat, sucht Naegel.
+import syntax as _syn  # noqa: E402
+import tempfile as _tf  # noqa: E402
+
+_sdir = pathlib.Path(_tf.mkdtemp()) if "pathlib" in dir() else None
+import pathlib as _pl  # noqa: E402
+_sdir = _pl.Path(_tf.mkdtemp())
+
+def _syn_pruefe(name, code):
+    f = _sdir / name
+    f.write_text(code)
+    return _syn.pruefen(name, code, str(f))
+
+check("Python wird weiterhin geprüft", _syn_pruefe("a.py", "x = 1\n")[0] is True)
+check("und ein Python-Fehler erkannt", _syn_pruefe("b.py", "def f(\n")[0] is False)
+check("JSON wird geprüft", _syn_pruefe("c.json", '{"a": 1}')[0] is True)
+check("und ein JSON-Fehler erkannt", _syn_pruefe("d.json", '{"a": }')[0] is False)
+
+# Ohne node ist keine JS/TS-Pruefung moeglich - dann MUSS 'weiss nicht'
+# herauskommen, nicht 'in Ordnung'. Das ist der Kern: eine ehrliche
+# Fehlanzeige statt eines erfundenen Hakens.
+_orig_node = _syn.NODE
+_syn.NODE = None
+try:
+    _ohne = _syn_pruefe("e.tsx", "kaputt <<<\n")
+finally:
+    _syn.NODE = _orig_node
+check("ohne node gilt TypeScript als ungeprüft, nicht als in Ordnung",
+      _ohne[0] is None and "keine Prüfung" in _ohne[1], _ohne)
+
+check("eine unbekannte Sprache wird als ungeprüft gemeldet",
+      _syn_pruefe("f.rs", "fn main() {}")[0] is None)
+check("und sagt dazu, dass damit nichts belegt ist",
+      "nicht belegt" in _syn_pruefe("g.rs", "fn main() {}")[1])
+
+if _syn.NODE:
+    check("TypeScript wird geprüft",
+          _syn_pruefe("h.ts", "const a: number = 1;\n")[0] is True)
+    check("TSX mit JSX wird geprüft",
+          _syn_pruefe("i.tsx", "export default () => <div>x</div>\n")[0] is True)
+    check("ein TSX-Syntaxfehler wird gefunden",
+          _syn_pruefe("j.tsx", "export default () => <div>x</div\n")[0] is False)
+    check("und nennt Zeile und Spalte",
+          "Zeile" in _syn_pruefe("k.ts", "const a: number = ;\n")[1])
+
+# Bei 'node -e' beginnt argv NICHT bei [2] wie bei einer Skriptdatei. Mit [2]
+# war die Datei undefined und die Pruefung meldete ewig "Parser nicht bereit",
+# obwohl alles installiert war.
+_synq = (main.BASE_DIR / "syntax.py").read_text()
+check("das Node-Skript liest sein Argument richtig",
+      "process.argv[process.argv.length - 1]" in _synq)
+# require() sucht nicht im globalen npm-Ordner - ohne NODE_PATH bleibt
+# typescript unsichtbar.
+check("der globale Modulpfad wird mitgegeben", "NODE_PATH" in _synq)
+check("es wird nur geparst, nicht typgeprüft",
+      "parseDiagnostics" in _synq and "--noEmit" not in _synq)
+
+_tq2 = (main.BASE_DIR / "tools.py").read_text()
+check("check_syntax benutzt die Sprachweiche", "syntax.pruefen(" in _tq2)
+check("ein ungeprüfter Fall gilt nicht als bestanden",
+      'return f"HINWEIS: {meldung}"' in _tq2)
+
+# Und die Sandbox muss JS ueberhaupt ausfuehren koennen, sonst bleibt jeder
+# Beleg bei einem Web-Projekt bei "sieht gut aus".
+_df2 = (main.BASE_DIR.parent / "deploy" / "sandbox.Dockerfile").read_text()
+check("die Sandbox bringt node mit", "node:20-slim" in _df2)
+check("die Sandbox bringt npm mit", "npm-cli.js" in _df2)
+check("und TypeScript, weil sie ohne Netz läuft", "typescript@5" in _df2)
+check("das Image prüft node beim Bauen", "node --version" in _df2)
+
+# --- Der Index sieht jetzt auch TypeScript --------------------------------
+#
+# Aus dem Betrieb: an einer Next.js-Anwendung hat der Agent dreissig Runden
+# lang gegrept. Kein Wunder - der Index kannte nur .py, also gab es fuer ihn
+# in diesem Projekt ueberhaupt keine Struktur, nur Volltext.
+import codeindex as _ci  # noqa: E402
+
+_iw = ws_mod.Workspace(_tf.mkdtemp())
+_iw.write("app/page.tsx",
+          "export default function Page(){ return <main>hi</main> }\n")
+_iw.write("components/nav.tsx",
+          "/** Die Navigation. */\nexport const SiteNav = () => <nav/>;\n")
+_iw.write("lib/typen.ts",
+          "export interface Waffe { name: string }\n"
+          "export type Klasse = \"a\" | \"b\";\n"
+          "export class Held { schlag(){} }\n")
+_iw.write("helfer.py", "def addiere(a, b):\n    \"\"\"Summe.\"\"\"\n    return a + b\n")
+_idx = _ci.CodeIndex.build(_iw)
+_namen = {s.name for s in _idx.symbols}
+
+check("Python bleibt im Index", "addiere" in _namen, sorted(_namen))
+if _syn.NODE and _syn.symbole([("x.ts", __file__)]) is not None:
+    check("React-Komponenten als Pfeilfunktion werden gefunden",
+          "SiteNav" in _namen, sorted(_namen))
+    check("eine default-exportierte Funktion wird gefunden", "Page" in _namen)
+    check("interface, type und class werden gefunden",
+          {"Waffe", "Klasse", "Held"} <= _namen, sorted(_namen))
+    check("Methoden einer Klasse werden gefunden",
+          any(s.qualname == "Held.schlag" for s in _idx.symbols),
+          [s.qualname for s in _idx.symbols])
+    check("JSDoc wird als Beschreibung übernommen",
+          any("Navigation" in s.doc for s in _idx.symbols),
+          [s.doc for s in _idx.symbols if s.doc])
+    check("symbol_info findet ein TypeScript-Symbol",
+          bool(_idx.find("SiteNav")), _idx.find("SiteNav"))
+    # 'def Page()' fuer eine .tsx-Datei legt dem Modell nahe, hier waere Python
+    # im Spiel - genau die Verwechslung, die einen Lauf gekostet hat.
+    _ueber = _idx.overview()
+    check("TypeScript wird nicht als Python dargestellt",
+          "function Page()" in _ueber and "def Page" not in _ueber, _ueber)
+    check("und Python weiterhin als Python", "def addiere" in _ueber, _ueber)
+    check("interface steht nicht doppelt da",
+          "interface Waffe" in _ueber and "def interface" not in _ueber, _ueber)
+
+# Ohne Parser darf der Index nichts erfinden - die Dateien gelten als
+# uebersprungen, nicht als leer.
+_orig2 = _syn.NODE
+_syn.NODE = None
+try:
+    _idx2 = _ci.CodeIndex.build(_iw)
+finally:
+    _syn.NODE = _orig2
+check("ohne Parser werden die TS-Dateien als übersprungen geführt",
+      any("TypeScript-Parser" in grund for _, grund in _idx2.skipped), _idx2.skipped)
+check("und nicht stillschweigend als symbollos ausgegeben",
+      all(not p.endswith((".ts", ".tsx")) for p in _idx2.files), _idx2.files)
+
+_ciq = (main.BASE_DIR / "codeindex.py").read_text()
+check("alle TS-Dateien laufen in EINEM Node-Aufruf",
+      "syntax.symbole(web)" in _ciq and _ciq.count("syntax.symbole") == 1)
 
 print("\n[26] Konnektoren")
 import connectors  # noqa: E402
@@ -1369,7 +1914,60 @@ try:
     ohne_remote(lambda: connectors.git_push(pws, "x", "y"))
     check("Push ohne Konfiguration wirft", False, "kein Fehler")
 except connectors.ConnectorError as exc:
-    check("Push ohne Konfiguration wirft", "BRAUNY_GIT_REMOTE" in str(exc), str(exc))
+    # Der Token ist die harte Voraussetzung. BRAUNY_GIT_REMOTE braucht nur,
+    # wer den ganzen Arbeitsordner auf ein festes Ziel schiebt - ein geklontes
+    # Teilprojekt bringt seinen Remote selbst mit.
+    check("Push ohne Konfiguration wirft", "BRAUNY_GIT_TOKEN" in str(exc), str(exc))
+
+# --- Push pro Projekt -----------------------------------------------------
+#
+# Ein Arbeitsordner enthaelt mehrere geklonte Projekte, und jedes gehoert in
+# SEIN Repository. Alles gemeinsam auf einen festen Remote zu schieben waere
+# fuer genau einen Fall richtig und fuer alle anderen falsch.
+
+def _mit_token(fn, remote="", token="tok"):
+    orig_r, orig_t = connectors.GIT_REMOTE, connectors.GIT_TOKEN
+    connectors.GIT_REMOTE, connectors.GIT_TOKEN = remote, token
+    try:
+        return fn()
+    finally:
+        connectors.GIT_REMOTE, connectors.GIT_TOKEN = orig_r, orig_t
+
+check("ein Token allein schaltet git_push frei",
+      _mit_token(lambda: "git_push" in connectors.available()))
+
+# Ein Ordner ohne .git ist kein Projekt.
+pws.write("normal.txt", "kein repo")
+try:
+    _mit_token(lambda: connectors.git_push(pws, "b", "m", projekt="."))
+    check("ein Ordner ohne eigenes Repo wird abgelehnt", False, "kein Fehler")
+except connectors.ConnectorError as exc:
+    check("ein Ordner ohne eigenes Repo wird abgelehnt",
+          "kein Git-Projekt" in str(exc) or "keinen Remote" in str(exc), str(exc))
+
+# Der Ordnername kommt vom Modell - er darf den Arbeitsordner nicht verlassen.
+try:
+    _mit_token(lambda: connectors.git_push(pws, "b", "m", projekt="../../../etc"))
+    check("Pfad-Ausbruch beim Projektnamen wird verhindert", False, "kein Fehler")
+except Exception as exc:
+    check("Pfad-Ausbruch beim Projektnamen wird verhindert",
+          not isinstance(exc, SystemExit), type(exc).__name__)
+
+_cq = (main.BASE_DIR / "connectors.py").read_text()
+check("der Projektpfad läuft über ws.resolve", "ws.resolve(projekt)" in _cq)
+check("ein Remote mit Zugangsdaten wird abgelehnt, nicht benutzt",
+      _cq.count("enthält Zugangsdaten in der URL") >= 2)
+check("der Token steht nie in der Kommandozeile",
+      "credential.helper" in _cq and "BRAUNY_GIT_TOKEN=$" not in _cq)
+check("ohne Änderungen gilt der Push nicht als Fehler",
+      "nothing to commit" in _cq)
+check("es wird ein Autor gesetzt, sonst bricht git ab",
+      "user.name=BraunyCode" in _cq)
+# Der Zweig traegt ein Praefix: so landet nichts versehentlich auf main.
+check("gepusht wird auf einen eigenen Zweig, nicht auf main",
+      "GIT_BRANCH_PREFIX + safe_branch(branch" in _cq)
+_tq = (main.BASE_DIR / "tools.py").read_text()
+check("das Werkzeug kennt den Projektordner", '"projekt"' in _tq)
 check("fetch abgeschaltet meldet das deutlich",
       blocked("https://93.184.216.34/") is False and
       not connectors.FETCH_ENABLED)
@@ -1385,7 +1983,9 @@ fws = ws_mod.Workspace(tempfile.mkdtemp())
 fws.write("main.py", "print(1)\n")
 
 leer = tools.Toolbox(fws)
-check("ohne Konnektoren nur Basiswerkzeuge", len(leer.schema()) == 16, len(leer.schema()))
+check("ohne Konnektoren nur Basiswerkzeuge",
+      {t["function"]["name"] for t in leer.schema()} == tools.BASE_NAMES,
+      sorted({t["function"]["name"] for t in leer.schema()} ^ tools.BASE_NAMES))
 check("schema() ohne Argument kennt keine Konnektoren",
       {t["function"]["name"] for t in tools.schema()} == tools.BASE_NAMES)
 check("fetch_url nicht aufrufbar",
@@ -1393,7 +1993,8 @@ check("fetch_url nicht aufrufbar",
       .startswith("FEHLER"))
 
 mit = tools.Toolbox(fws, enabled=["fetch_url"])
-check("freigeschalteter Konnektor erscheint", len(mit.schema()) == 17, len(mit.schema()))
+check("freigeschalteter Konnektor erscheint",
+      len(mit.schema()) == len(tools.BASE_NAMES) + 1, len(mit.schema()))
 check("Konnektor steht im Schema",
       "fetch_url" in {t["function"]["name"] for t in mit.schema()})
 check("nicht freigeschalteter Konnektor fehlt",
@@ -1422,7 +2023,7 @@ check("restrict kann keinen Konnektor freischalten",
       "fetch_url" not in weit.allowed and "git_push" not in weit.allowed,
       sorted(weit.allowed))
 check("leeres restrict ändert nichts",
-      len(tools.Toolbox(fws).schema()) == 16)
+      len(tools.Toolbox(fws).schema()) == len(tools.BASE_NAMES))
 
 # Skill im Agentenlauf
 def drive_skill(script, skill, files=None):
@@ -1585,8 +2186,45 @@ check("Installer übernimmt ein vorgegebenes Token",
       'if [ -n "${BRAUNY_TOKEN:-}" ]' in installer)
 check("Installer lehnt zu kurze Token ab",
       '"${#TOKEN}" -ge 12' in installer, )
-check("Installer läuft weiterhin nicht als root",
-      '[ "$(id -u)" -ne 0 ]' in installer)
+# Die Zusicherung lautet nicht mehr "bricht als root ab", sondern "der Agent
+# landet nie als root". Contabo und Hetzner geben ueberhaupt nur root heraus -
+# ein Abbruch haette dort jede Installation unmoeglich gemacht. Geprueft wird
+# jetzt der Ausweg: Benutzer anlegen und sich als dieser neu starten.
+check("Installer erkennt einen Start als root",
+      '[ "$(id -u)" -eq 0 ]' in installer)
+check("und startet sich als unprivilegierter Benutzer neu",
+      'exec sudo -u "$BRAUNY_USER"' in installer)
+check("der Agent selbst laeuft also nie als root",
+      'useradd -m -s /bin/bash "$BRAUNY_USER"' in installer)
+# Ohne diese Sperre startet BRAUNY_USER=root sich selbst endlos neu.
+check("BRAUNY_USER=root wird abgelehnt",
+      '[ "$BRAUNY_USER" != "root" ]' in installer)
+# Eine kaputte sudoers-Datei sperrt den Benutzer dauerhaft aus - deshalb wird
+# sie geprueft, bevor sie zaehlt.
+check("die sudoers-Datei wird vor dem Scharfschalten geprüft",
+      'visudo -cf' in installer)
+# sudo raeumt die Umgebung ab; ohne Weitergabe liefe der zweite Durchgang mit
+# anderen Vorgaben als der erste.
+check("gesetzte BRAUNY_*-Variablen überleben den Neustart",
+      'FORWARD+=("$v=${!v}")' in installer
+      and 'BRAUNY_MODEL BRAUNY_HOME' in installer)
+
+# Das Modell darf nicht fest verdrahtet sein: dieselbe Datei laeuft auf 8 GB
+# und auf 24 GB, und ein zu grosses Modell wird beim ersten Aufruf beendet.
+check("das Modell wird am vorhandenen RAM gewählt",
+      "/proc/meminfo" in installer and "qwen3-coder:30b" in installer)
+check("die kleineren Modelle bleiben als Rückfall erhalten",
+      "qwen2.5-coder:14b" in installer and "qwen2.5-coder:7b" in installer)
+check("eine ausdrückliche Vorgabe schlägt die Erkennung",
+      'if [ -z "${BRAUNY_MODEL:-}" ]' in installer)
+# 19 GB Modell auf 24 GB Maschine: ohne Puffer beendet der OOM-Killer ollama
+# mitten in einer Antwort.
+check("es wird eine Auslagerungsdatei angelegt",
+      "mkswap" in installer and "swapon" in installer)
+check("die Auslagerungsdatei überlebt den Neustart",
+      "/etc/fstab" in installer)
+check("vorhandener Swap wird nicht verdoppelt",
+      "SwapTotal" in installer)
 
 print("\n[30] Mehrdateiige Projekte in der Sandbox")
 
@@ -1945,7 +2583,7 @@ verworfen = tbox.restrict(["raed_file", "wrtie_file"])   # beides Tippfehler
 check("unbekannte Werkzeuge werden gemeldet",
       verworfen == ["raed_file", "wrtie_file"], verworfen)
 check("bei nur Tippfehlern wird gar nicht eingeschränkt",
-      len(tbox.schema()) == 16, len(tbox.schema()))
+      len(tbox.schema()) == len(tools.BASE_NAMES), len(tbox.schema()))
 check("der Agent bleibt handlungsfähig", "read_file" in tbox.allowed)
 
 tbox2 = tools.Toolbox(fws)
@@ -2130,6 +2768,1576 @@ check("'source' würde das Passwort verfälschen",
       mit_source != "geheim$HOME-passwort", mit_source)
 check("zeilenweises Lesen erhält es wörtlich",
       zeilenweise == "geheim$HOME-passwort", zeilenweise)
+
+# ---------------------------------------------------------------- Diagnostik
+print("\n[34] Diagnostik: Rohausgabe zu Befunden")
+
+import diagnostics  # noqa: E402
+
+# Echte Python-Ausgabe erzeugen statt eine erfundene nachzubauen: sonst testet
+# man nur, dass das eigene Beispiel zum eigenen Muster passt.
+def _stderr_von(code):
+    ordner = tempfile.mkdtemp()
+    ziel = os.path.join(ordner, "prog.py")
+    with open(ziel, "w", encoding="utf-8") as fh:
+        fh.write(textwrap.dedent(code))
+    lauf = subprocess.run([sys.executable, ziel], capture_output=True, text=True)
+    return lauf.stderr.replace(ordner, "/app")
+
+b = diagnostics.parse(_stderr_von("""
+    def teile(a, b):
+        return a / b
+    def start():
+        return teile(1, 0)
+    start()
+"""))
+check("Traceback ergibt genau einen Befund", len(b) == 1, b)
+check("Kategorie aus dem Ausnahmetyp", b and b[0].kategorie == diagnostics.RUNTIME, b)
+check("letzter Rahmen, nicht der erste", b and b[0].zeile == 3, b)
+check("Symbol des letzten Rahmens", b and b[0].symbol == "teile", b)
+check("Containerpfad wird projektrelativ", b and b[0].datei == "prog.py", b)
+
+# Der haeufigste Fehler direkt nach einer Aenderung - und er hat KEINEN
+# Traceback-Kopf. Genau daran ist die erste Fassung gescheitert.
+b = diagnostics.parse(_stderr_von("def f(:\n    pass\n"))
+check("SyntaxError ohne Traceback-Kopf wird erkannt", len(b) == 1, b)
+check("und als SYNTAX eingeordnet", b and b[0].kategorie == diagnostics.SYNTAX, b)
+
+b = diagnostics.parse(_stderr_von("def f():\npass\n"))
+check("IndentationError zählt als SYNTAX",
+      len(b) == 1 and b[0].kategorie == diagnostics.SYNTAX, b)
+
+# Kaputtes Modul beim Import: der SyntaxError steht INNERHALB eines Tracebacks.
+ordner = tempfile.mkdtemp()
+os.makedirs(os.path.join(ordner, "pkg"))
+open(os.path.join(ordner, "pkg", "__init__.py"), "w").close()
+with open(os.path.join(ordner, "pkg", "kaputt.py"), "w") as fh:
+    fh.write("def g(:\n")
+with open(os.path.join(ordner, "prog.py"), "w") as fh:
+    fh.write("import pkg.kaputt\n")
+roh = subprocess.run([sys.executable, os.path.join(ordner, "prog.py")],
+                     capture_output=True, text=True).stderr.replace(ordner, "/app")
+b = diagnostics.parse(roh)
+check("SyntaxError im Traceback zählt nicht doppelt", len(b) == 1, b)
+check("er zeigt auf die kaputte Datei, nicht den Importeur",
+      b and b[0].datei == "pkg/kaputt.py", b)
+
+b = diagnostics.parse(
+    "SyntaxError in app/x.py, Zeile 12: invalid syntax", "check_syntax")
+check("deutsche check_syntax-Meldung wird verstanden",
+      len(b) == 1 and b[0].zeile == 12 and b[0].datei == "app/x.py", b)
+
+b = diagnostics.parse("FEHLER: 'pattern' fehlt.", "tools")
+check("Werkzeugfehler ohne Ausnahmetyp wird TOOL",
+      len(b) == 1 and b[0].kategorie == diagnostics.TOOL, b)
+
+b = diagnostics.parse("FEHLER: ModuleNotFoundError: No module named 'x'", "tools")
+check("Werkzeugfehler mit Ausnahmetyp behält die Kategorie",
+      len(b) == 1 and b[0].kategorie == diagnostics.IMPORT, b)
+
+check("leere Ausgabe ergibt keine Befunde", diagnostics.parse("") == [])
+check("erfolgreiche Ausgabe ergibt keine Befunde",
+      diagnostics.parse("Lauf erfolgreich.\nAusgabe:\nfertig") == [])
+# Freier Text, der wie eine Ausnahme aussieht, darf keinen Befund erfinden.
+check("Fließtext erzeugt keinen Befund",
+      diagnostics.parse("Hinweis: ValueError kann hier auftreten") == [])
+
+f = diagnostics.Finding(kategorie=diagnostics.NAME, schwere=diagnostics.FEHLER,
+                        nachricht="name 'x' is not defined", typ="NameError",
+                        datei="a.py", zeile=9, symbol="f")
+check("Fingerabdruck ohne Zeilennummer", "9" not in f.fingerprint(), f.fingerprint())
+check("Fingerabdruck ohne freien Text",
+      "not defined" not in f.fingerprint(), f.fingerprint())
+check("Fingerabdruck trägt Datei und Symbol",
+      "a.py" in f.fingerprint() and "|f" in f.fingerprint(), f.fingerprint())
+
+# Verdrahtung: der Befund muss beim Modell ankommen, nicht nur im Protokoll.
+async def _rot(_dateien, _entry=None, command=None):
+    return 1, ('Traceback (most recent call last):\n'
+               '  File "/app/main.py", line 3, in teile\n    return a / b\n'
+               'ZeroDivisionError: division by zero')
+
+_w = ws_mod.Workspace(tempfile.mkdtemp())
+_tb = tools.Toolbox(_w, run_sandbox=_rot)
+asyncio.run(_tb.call("write_file", {"path": "main.py", "content": "x = 1\n"}))
+_erg = asyncio.run(_tb.call("run_python", {"path": "main.py"}))
+check("Befund hängt am Werkzeugergebnis", "Befund:" in _erg, _erg[-120:])
+check("Befund nennt Datei und Zeile", "main.py:3" in _erg, _erg[-120:])
+check("Befund steht im Protokoll",
+      any(e["befunde"] for e in _tb.protokoll), _tb.protokoll)
+check("roter Lauf bleibt trotz Befund ungeprüft",
+      _tb.unverified == {"main.py"}, _tb.unverified)
+
+_erg = asyncio.run(_tb.call("search", {}))
+check("bei reinem Werkzeugfehler kein Befund-Anhang",
+      "Befund:" not in _erg, _erg)
+
+
+# Dieselbe Verdrahtung fuer TypeScript. Ein Parser, der die Ausgabe versteht,
+# nuetzt nichts, solange der Befund nicht am Ergebnis haengt - und tsc laeuft
+# ueber run_command, nicht ueber run_python.
+async def _rot_tsc(_dateien, _entry=None, command=None):
+    return 2, ("src/summe.ts(12,5): error TS2322: Type 'string' is not "
+               "assignable to type 'number'.")
+
+_w2 = ws_mod.Workspace(tempfile.mkdtemp())
+_tb2 = tools.Toolbox(_w2, run_sandbox=_rot_tsc)
+asyncio.run(_tb2.call("write_file", {"path": "src/summe.ts",
+                                     "content": "export const x = 1;\n"}))
+_erg2 = asyncio.run(_tb2.call("run_command", {"command": "npx tsc --noEmit"}))
+check("auch ein tsc-Fehler hängt als Befund am Ergebnis",
+      "Befund:" in _erg2, _erg2[-160:])
+check("und nennt Datei und Zeile", "src/summe.ts:12" in _erg2, _erg2[-160:])
+check("ein roter tsc-Lauf belegt die Datei nicht",
+      _tb2.unverified == {"src/summe.ts"}, _tb2.unverified)
+
+
+# ------------------------------------------------------------- Testauswahl
+print("\n[35] Testauswahl über den Importgraphen")
+
+import testimpact  # noqa: E402
+
+_projekt = {
+    "pkg/__init__.py":   "",
+    "pkg/kern.py":       "def rechne(x):\n    return x * 2\n",
+    "pkg/mittel.py":     "from .kern import rechne\ndef doppelt(x):\n    return rechne(x)\n",
+    "app.py":            "import pkg.mittel\n",
+    "einsam.py":         "import json\n",
+    "test_kern.py":      "from pkg.kern import rechne\n",
+    "test_mittel.py":    "from pkg.mittel import doppelt\n",
+    "tests/test_app.py": "import app\n",
+    "test_einsam.py":    "import einsam\n",
+}
+
+check("Modulname aus Pfad", testimpact.modulname("pkg/mod.py") == "pkg.mod")
+check("__init__ wird zum Paket", testimpact.modulname("pkg/__init__.py") == "pkg")
+check("Testdatei an Präfix erkannt", testimpact.ist_test("test_x.py"))
+check("Testdatei an Suffix erkannt", testimpact.ist_test("x_test.py"))
+check("Testdatei am Ordner erkannt", testimpact.ist_test("tests/irgendwas.py"))
+check("normale Datei ist kein Test", not testimpact.ist_test("pkg/kern.py"))
+
+_g = testimpact.graph(_projekt)
+check("relativer Import wird aufgelöst",
+      "pkg/kern.py" in _g["pkg/mittel.py"], _g["pkg/mittel.py"])
+check("punktierter Import wird aufgelöst",
+      "pkg/mittel.py" in _g["app.py"], _g["app.py"])
+check("Fremdimport erzeugt keine Kante", _g["einsam.py"] == set(), _g["einsam.py"])
+
+_t = testimpact.betroffene_tests(_projekt, ["pkg/kern.py"])
+check("Auswahl reicht über zwei Stufen",
+      _t == ["test_kern.py", "test_mittel.py", "tests/test_app.py"], _t)
+_t = testimpact.betroffene_tests(_projekt, ["einsam.py"])
+check("unabhängige Datei zieht nur ihren Test",
+      _t == ["test_einsam.py"], _t)
+check("das ist echte Einsparung, nicht die ganze Suite",
+      len(_t) < len([r for r in _projekt if testimpact.ist_test(r)]), _t)
+
+# Ein Importzyklus darf die Rueckwaertssuche nicht endlos drehen lassen.
+_zyklus = {"a.py": "import b\n", "b.py": "import a\n", "test_a.py": "import a\n"}
+check("Importzyklus hängt nicht",
+      testimpact.betroffene_tests(_zyklus, ["a.py"]) == ["test_a.py"])
+
+# Eine kaputte Datei verliert ihre Kanten - die Auswahl wird dadurch ZU KURZ.
+# Genau das muss dastehen, sonst wirkt eine unvollstaendige Liste wie ein
+# Ergebnis.
+_kaputt = dict(_projekt, **{"pkg/mittel.py": "from .kern import (\n"})
+_bericht = testimpact.bericht(_kaputt, ["pkg/kern.py"])
+check("unlesbare Datei wird beim Namen genannt",
+      "pkg/mittel.py" in _bericht and "ACHTUNG" in _bericht, _bericht)
+check("und die Auswahl wird als unvollständig bezeichnet",
+      "unvollständig" in _bericht, _bericht)
+check("der Graph bricht dabei nicht ab",
+      "test_kern.py" in _bericht, _bericht)
+
+check("Bericht nennt die Grenze der Methode",
+      "importlib" in testimpact.bericht(_projekt, ["pkg/kern.py"]))
+
+_ohne = {"a.py": "x = 1\n"}
+check("Projekt ohne Tests wird als solches gemeldet",
+      "keine erkennbaren Testdateien" in testimpact.bericht(_ohne, ["a.py"]),
+      testimpact.bericht(_ohne, ["a.py"]))
+
+_waise = {"a.py": "x = 1\n", "test_b.py": "import json\n"}
+check("Code ohne erreichenden Test wird benannt",
+      "Kein Test erreicht" in testimpact.bericht(_waise, ["a.py"]),
+      testimpact.bericht(_waise, ["a.py"]))
+
+# Verdrahtung als Werkzeug
+_w = ws_mod.Workspace(tempfile.mkdtemp())
+for _rel, _inhalt in _projekt.items():
+    _w.write(_rel, _inhalt)
+_tb = tools.Toolbox(_w)
+check("ohne Änderung sagt das Werkzeug das",
+      "Noch nichts geändert" in asyncio.run(_tb.call("affected_tests", {})))
+asyncio.run(_tb.call("edit_file", {"path": "pkg/kern.py",
+                                   "old_text": "x * 2", "new_text": "x * 3"}))
+_erg = asyncio.run(_tb.call("affected_tests", {}))
+check("Werkzeug nimmt von selbst die geänderten Dateien",
+      "pkg/kern.py" in _erg and "test_mittel.py" in _erg, _erg)
+_erg = asyncio.run(_tb.call("affected_tests", {"paths": "einsam.py"}))
+check("gezielte Abfrage grenzt richtig ein",
+      "test_einsam.py" in _erg and "test_kern.py" not in _erg, _erg)
+check("affected_tests belegt nichts",
+      _tb.unverified == {"pkg/kern.py"}, _tb.unverified)
+
+
+# ------------------------------------------------- Skills gegen neue Werkzeuge
+print("\n[36] Ausgelieferte Skills kennen die Werkzeuge")
+
+# Zweimal ist in diesem Projekt schon ein neues Werkzeug hinzugekommen, ohne in
+# die Allowlists der Skills einzuziehen - und war damit ueberall still
+# gesperrt, wo ein Skill griff. Kein Fehler, keine Meldung, nur ein Agent, der
+# das Werkzeug nie benutzt. Diese Zusicherung faengt den dritten Fall.
+_skills = skills_mod.load(os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills"))
+check("Skills werden geladen", len(_skills) >= 5, len(_skills))
+
+for _s in _skills:
+    _erlaubt = set(_s.werkzeuge)
+    check(f"{_s.name}: nur existierende Werkzeuge",
+          _erlaubt <= tools.NAMES, sorted(_erlaubt - tools.NAMES))
+    check(f"{_s.name}: finish ist drin", "finish" in _erlaubt, sorted(_erlaubt))
+    if _erlaubt & tools.MODIFYING:
+        # Wer Code aendern darf, muss auch pruefen duerfen - sonst laeuft er
+        # in die Abschluss-Sperre und kommt nicht wieder heraus.
+        check(f"{_s.name}: ändert Code, also auch check_syntax",
+              "check_syntax" in _erlaubt, sorted(_erlaubt))
+    # Frueher stand hier "aendert UND fuehrt aus". Das war zu grob: es traf
+    # auch den Web-Skill, und affected_tests laeuft ueber den PYTHON-
+    # Importgraphen - fuer ein TypeScript-Projekt hat es nichts zu sagen.
+    # Massgeblich ist deshalb run_python: wer Python ausfuehren darf, arbeitet
+    # an Python und soll wissen, welche Tests seine Aenderung erreicht.
+    if _erlaubt & tools.MODIFYING and "run_python" in _erlaubt:
+        # Nur wer auch ausfuehren darf. 'doku' aendert Docstrings, kann aber
+        # bewusst nichts starten - eine Testliste waere dort Information, mit
+        # der es nichts anfangen kann. Die erste Fassung dieser Zusicherung war
+        # zu grob und hat genau das angemahnt.
+        check(f"{_s.name}: ändert und führt aus, also auch affected_tests",
+              "affected_tests" in _erlaubt, sorted(_erlaubt))
+
+
+# ------------------------------------------------------ Bereitschaftspruefung
+print("\n[37] Bereitschaft: nicht raten, welche Datei gemeint war")
+
+import readiness  # noqa: E402
+
+_d = ["app/main.py", "app/tools.py", "app/workspace.py", "test_smoke.py"]
+_sym = ["berechne_summen", "berechne_saldo", "Workspace", "Toolbox"]
+
+def _stand(text):
+    return readiness.pruefen(text, _d, _sym).stand
+
+check("bekannte Datei ist bereit",
+      _stand("Behebe den Fehler in app/tools.py") == readiness.BEREIT)
+check("Tippfehler wird zur benannten Annahme",
+      _stand("Behebe den Fehler in app/tool.py") == readiness.BEREIT_MIT_ANNAHME)
+check("unbekannte Datei löst Rückfrage aus",
+      _stand("Behebe den Fehler in app/kern.py") == readiness.RUECKFRAGE)
+check("Symbol-Tippfehler wird zur Annahme",
+      _stand("Benenne berechne_summe in summiere um") == readiness.BEREIT_MIT_ANNAHME)
+
+# Die Rueckfrage muss konkret sein, nicht "bitte praezisieren".
+_u = readiness.pruefen("Behebe den Fehler in app/tool.py", _d, _sym)
+check("die Annahme nennt beide Namen",
+      "app/tool.py" in _u.text() and "app/tools.py" in _u.text(), _u.text())
+
+# Keine Rueckfrage aus Prinzip: vage Auftraege sind kein Mangel, sie nennen
+# eben nichts Konkretes. Wer hier fragt, macht den Agenten unbrauchbar.
+for _vage in ("Mach die Anwendung schneller",
+              "Die Datenbank ist zu langsam, optimiere die Abfragen",
+              "Räum den Code auf"):
+    check(f"vage bleibt bereit: {_vage[:28]}", _stand(_vage) == readiness.BEREIT)
+
+# Anlege-Absicht: dass die Datei fehlt, IST der Auftrag.
+for _neu in ("Schreibe eine neue Datei helfer.py",
+             "Erstelle die Datei berichte.py",
+             "Lege ein neues Modul cache.py an",
+             "Create a new file cache.py"):
+    check(f"Neuanlage fragt nicht: {_neu[:30]}", _stand(_neu) == readiness.BEREIT)
+
+# ... aber "neu" auf einer Datei, die es schon gibt, ist ein Widerspruch.
+check("Neuanlage einer vorhandenen Datei wird hinterfragt",
+      _stand("Lege eine neue Datei tools.py an") == readiness.RUECKFRAGE)
+# ... und "neue Funktion IN einer Datei" ist keine Dateianlage.
+check("'neue Funktion in X' ist keine Neuanlage",
+      _stand("Füge eine neue Funktion in app/kern.py hinzu") == readiness.RUECKFRAGE)
+
+check("leeres Projekt fragt nie",
+      readiness.pruefen("Baue etwas in main.py", [], []).stand == readiness.BEREIT)
+
+# Verdrahtung: die Sperre muss VOR der ersten Änderung greifen.
+_w = ws_mod.Workspace(tempfile.mkdtemp())
+_w.write("app/tools.py", "x = 1\n")
+_ereignisse = []
+async def _send(typ, text="", **rest):
+    _ereignisse.append({"type": typ, "text": text, **rest})
+async def _chat(_messages, _schema):
+    raise AssertionError("Das Modell darf bei einer Rückfrage gar nicht laufen")
+
+_tb = tools.Toolbox(_w)
+_ausgang = asyncio.run(agentloop.run_tool_agent(
+    _send, "Behebe den Fehler in app/kern.py",
+    chat_fn=_chat, toolbox=_tb, symbole=[]))
+check("Lauf endet als clarify", _ausgang == "clarify", _ausgang)
+check("kein Modellaufruf bei Rückfrage", True)   # _chat haette sonst geworfen
+check("nichts wurde geschrieben", _tb.written == [], _tb.written)
+check("die Frage nennt die Datei",
+      any("app/kern.py" in e["text"] for e in _ereignisse if e["type"] == "error"),
+      _ereignisse)
+check("done meldet ehrlich ok=False",
+      any(e["type"] == "done" and e["ok"] is False for e in _ereignisse),
+      _ereignisse)
+
+# Annahme blockiert nicht, steht aber im Auftrag, den das Modell sieht.
+_gesehen = []
+async def _chat2(messages, _schema):
+    _gesehen.append(messages)
+    return reply(calls=[("finish", {"summary": "fertig"})])
+_tb2 = tools.Toolbox(ws_mod.Workspace(tempfile.mkdtemp()))
+_tb2.ws.write("app/tools.py", "x = 1\n")
+_ausgang = asyncio.run(agentloop.run_tool_agent(
+    _send, "Behebe den Fehler in app/tool.py",
+    chat_fn=_chat2, toolbox=_tb2, symbole=[]))
+check("Annahme blockiert den Lauf nicht", _ausgang == "ok", _ausgang)
+check("die Annahme steht im Auftrag des Modells",
+      any("app/tools.py" in m.get("content", "")
+          for m in _gesehen[0] if m.get("role") == "user"), _gesehen[0])
+
+
+# --------------------------------------------------------- Abtastverhalten
+print("\n[38] Abtastverhalten: deterministisch, wo es genau sein muss")
+
+# Bis hierher setzte KEIN Pfad eine Temperatur - der Lauf uebernahm die
+# Vorgabe des Anbieters, meist um 0.8. Ein Agent, der Werkzeuge mit exakten
+# Argumenten aufruft, bekam damit bei gleicher Aufgabe verschiedene Aufrufe
+# und ein nicht nachstellbares Fehlerbild.
+
+def _ollama_kwargs(policy=provider.DETERMINISTISCH):
+    """Faengt die Nutzlast ab, mit der Ollama tatsaechlich gerufen wird."""
+    orig = httpx.stream
+    httpx.stream = _strom_setzen([{"message": {"content": "ok"}, "done": True}])
+    try:
+        provider._chat_ollama([{"role": "user", "content": "x"}], None, policy)
+    finally:
+        httpx.stream = orig
+    return dict(_letzte_anfrage["body"])
+
+_kw = _ollama_kwargs()
+check("Ollama bekommt Optionen", "options" in _kw, _kw.keys())
+check("deterministisch heißt Temperatur 0",
+      _kw["options"]["temperature"] == 0.0, _kw.get("options"))
+check("ohne BRAUNY_SEED kein seed im Aufruf",
+      "seed" not in _kw["options"], _kw.get("options"))
+
+_kw = _ollama_kwargs(provider.VIELFALT)
+check("Vielfalt heißt Temperatur über 0",
+      _kw["options"]["temperature"] > 0, _kw.get("options"))
+
+def _openai_payload(policy=provider.DETERMINISTISCH):
+    """Faengt die Nutzlast ab, ohne eine Anfrage zu senden."""
+    import httpx
+    gesehen = {}
+
+    class _Antwort:
+        status_code = 200
+        @staticmethod
+        def json():
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+    class _Client:
+        def __init__(self, **_): pass
+        def __enter__(self): return self
+        def __exit__(self, *_): return False
+        def post(self, _url, json=None, headers=None):
+            gesehen.update(json or {})
+            return _Antwort()
+
+    orig_client, orig_base, orig_provider = (
+        httpx.Client, provider.API_BASE, provider.PROVIDER)
+    httpx.Client = _Client
+    provider.API_BASE, provider.PROVIDER = "https://example.invalid/v1", "openai"
+    try:
+        provider._chat_openai([{"role": "user", "content": "x"}], None, policy)
+    finally:
+        httpx.Client = orig_client
+        provider.API_BASE, provider.PROVIDER = orig_base, orig_provider
+    return gesehen
+
+_p = _openai_payload()
+check("API-Nutzlast trägt eine Temperatur", "temperature" in _p, sorted(_p))
+check("und sie ist 0", _p["temperature"] == 0.0, _p.get("temperature"))
+check("ohne BRAUNY_SEED kein seed in der Nutzlast", "seed" not in _p, sorted(_p))
+check("Vielfalt wirkt auch über die API",
+      _openai_payload(provider.VIELFALT)["temperature"] > 0)
+
+# Ein gesetzter Startwert muss ankommen ...
+_orig_seed = provider.SEED
+try:
+    provider.SEED = 4711
+    check("gesetzter Startwert erreicht Ollama",
+          _ollama_kwargs()["options"].get("seed") == 4711)
+    check("gesetzter Startwert erreicht die API",
+          _openai_payload().get("seed") == 4711)
+finally:
+    provider.SEED = _orig_seed
+
+# ... und ein Tippfehler darin darf NICHT jeden Modellaufruf sprengen.
+_alt = os.environ.get("BRAUNY_SEED")
+try:
+    os.environ["BRAUNY_SEED"] = "vier-sieben-eins-eins"
+    check("unbrauchbarer Startwert wird ignoriert statt zu werfen",
+          provider._seed_lesen() is None)
+    os.environ["BRAUNY_SEED"] = "  17 "
+    check("Leerzeichen um den Startwert stören nicht",
+          provider._seed_lesen() == 17)
+finally:
+    if _alt is None:
+        os.environ.pop("BRAUNY_SEED", None)
+    else:
+        os.environ["BRAUNY_SEED"] = _alt
+
+check("Standard ist deterministisch",
+      provider._temperatur("unbekannte-betriebsart") == 0.0)
+
+
+# ------------------------------------------------------------ Sandbox-Image
+print("\n[39] Sandbox-Image")
+
+_WURZEL = os.path.dirname(os.path.abspath(__file__))
+_DOCKERFILE = os.path.join(_WURZEL, "deploy", "sandbox.Dockerfile")
+check("Dockerfile liegt vor", os.path.exists(_DOCKERFILE), _DOCKERFILE)
+
+if os.path.exists(_DOCKERFILE):
+    with open(_DOCKERFILE, encoding="utf-8") as _fh:
+        _df = _fh.read()
+    check("baut auf dem bisherigen Basisimage auf",
+          "FROM python:3.11-slim" in _df)
+    check("bringt einen Testläufer mit", "pytest" in _df)
+    check("bringt Hypothesis mit", "hypothesis" in _df)
+    # Bewusste Entscheidung, kein Versehen: mutmut zieht einen Terminal-UI-
+    # Stapel mit, der in einem Container ohne Netz und ohne Terminal nichts
+    # verloren hat. Wer ihn spaeter doch will, soll diese Zusicherung sehen.
+    check("mutmut bleibt bewusst draußen", "mutmut" not in _df.split("RUN pip")[-1])
+    check("Versionen sind nach oben begrenzt",
+          "<10" in _df and "<7" in _df, _df)
+    # Die Haertung steht in app/sandbox.py. Ein USER hier wuerde dieselbe
+    # Entscheidung an einer zweiten Stelle treffen - genau so laufen zwei
+    # Wahrheiten auseinander.
+    check("kein zweiter Ort für die Benutzer-Entscheidung",
+          not any(z.strip().startswith("USER ") for z in _df.splitlines()))
+    check("prüft sich beim Bauen selbst",
+          "import pytest, hypothesis" in _df)
+
+with open(os.path.join(_WURZEL, "install.sh"), encoding="utf-8") as _fh:
+    _inst = _fh.read()
+check("install.sh baut das Image", "sandbox.Dockerfile" in _inst)
+check("und hat einen Rückfall", "fehlgeschlagen" in _inst and "docker pull" in _inst)
+
+# Den Zweig ausfuehren statt ihn zu lesen: docker und sudo werden ersetzt,
+# beide Ausgaenge einmal gefahren.
+_start = _inst.index("# Der Sandbox-Container laeuft ohne Netzwerk")
+_ende = _inst.index("# ------------------------------------------------"
+                    "---------------- 3. Ollama")
+_block = _inst[_start:_ende]
+
+_RAHMEN = ("set -euo pipefail\n"
+           "step() { :; }\n"
+           "warn() { echo \"WARN $*\"; }\n"
+           "SRC_DIR=\"@SRC@\"\n"
+           "SANDBOX_IMAGE=\"python:3.11-slim\"\n"
+           "sudo() { \"$@\"; }\n"
+           "docker() { case \"$1\" in build) return @CODE@ ;; "
+           "pull) return 0 ;; esac; }\n"
+           "@BLOCK@\n"
+           "echo \"ERGEBNIS: $SANDBOX_IMAGE\"\n")
+
+_src = tempfile.mkdtemp()
+os.makedirs(os.path.join(_src, "deploy"))
+with open(os.path.join(_src, "deploy", "sandbox.Dockerfile"), "w") as _fh:
+    _fh.write("FROM x\n")
+
+def _fahre_zweig(code):
+    _skript = (_RAHMEN.replace("@SRC@", _src).replace("@CODE@", str(code))
+                      .replace("@BLOCK@", _block))
+    return subprocess.run(["bash", "-c", _skript], capture_output=True, text=True)
+
+_r = _fahre_zweig(0)
+check("gelungener Bau setzt das eigene Image",
+      "ERGEBNIS: braunycode-sandbox:1" in _r.stdout, _r.stdout + _r.stderr)
+_r = _fahre_zweig(1)
+check("gescheiterter Bau fällt auf das Basisimage zurück",
+      "ERGEBNIS: python:3.11-slim" in _r.stdout, _r.stdout + _r.stderr)
+check("und der Verlust wird benannt, nicht verschwiegen",
+      "belegt Aenderungen nur" in _r.stdout, _r.stdout)
+check("ein gescheiterter Bau kippt die Einrichtung nicht",
+      _r.returncode == 0, _r.returncode)
+
+
+# --------------------------------------------- Gegenbeispiele aus Testlaeufen
+print("\n[40] Gegenbeispiele und pytest-Ausgabe")
+
+# Die folgenden Ausgaben stammen aus ECHTEN Laeufen (pytest 9.1.1,
+# hypothesis 6.165.2) und sind hier festgehalten, weil hypothesis in der
+# Testumgebung nicht installiert sein muss. Weiter unten wird zusaetzlich
+# frisch erzeugt, falls es doch verfügbar ist.
+
+_HYP_PYTEST = """guthaben = 0, betrag = 1
+
+    @given(st.integers(min_value=0, max_value=1000),
+           st.integers(min_value=0, max_value=1000))
+    def test_kontostand_nie_negativ(guthaben, betrag):
+>       assert abheben(guthaben, betrag) >= 0
+E       assert -1 >= 0
+E        +  where -1 = abheben(0, 1)
+E       Failing test case: test_kontostand_nie_negativ(
+E           guthaben=0,
+E           betrag=1,
+E       )
+
+test_konto.py:9: AssertionError
+=========================== short test summary info ============================
+FAILED test_konto.py::test_kontostand_nie_negativ - assert -1 >= 0
+1 failed in 0.89s"""
+
+_b = diagnostics.parse(_HYP_PYTEST, "run_command")
+check("pytest-Fehlschlag ergibt einen Befund", len(_b) == 1, _b)
+check("widerlegte Eigenschaft wird PROPERTY",
+      _b and _b[0].kategorie == diagnostics.PROPERTY, _b)
+check("Datei aus der pytest-Zusammenfassung",
+      _b and _b[0].datei == "test_konto.py", _b)
+check("Zeilennummer nachgereicht", _b and _b[0].zeile == 9, _b)
+check("Testname als Symbol",
+      _b and _b[0].symbol == "test_kontostand_nie_negativ", _b)
+check("Gegenbeispiel extrahiert",
+      _b and _b[0].gegenbeispiel == "guthaben=0, betrag=1", _b and _b[0].gegenbeispiel)
+check("Gegenbeispiel steht im Einzeiler",
+      _b and "guthaben=0" in _b[0].einzeiler(), _b and _b[0].einzeiler())
+# Der Fingerabdruck darf den konkreten Fall NICHT enthalten - sonst zeigt jede
+# neue Eingabe auf einen anderen Eintrag im Fehlergedaechtnis.
+check("Fingerabdruck ohne den konkreten Fall",
+      _b and "guthaben=0" not in _b[0].fingerprint(), _b and _b[0].fingerprint())
+
+_HYP_DIREKT = """Traceback (most recent call last):
+  File "/app/direkt.py", line 7, in <module>
+    test_nie_negativ()
+  File "/app/direkt.py", line 5, in test_nie_negativ
+    assert abheben(g, b) >= 0
+AssertionError
+Failing test case: test_nie_negativ(
+    g=0,
+    b=1,
+)"""
+_b = diagnostics.parse(_HYP_DIREKT, "run_python")
+check("auch ohne pytest erkannt", len(_b) == 1, _b)
+check("und ebenfalls PROPERTY",
+      _b and _b[0].kategorie == diagnostics.PROPERTY, _b)
+check("Gegenbeispiel ohne pytest",
+      _b and _b[0].gegenbeispiel == "g=0, b=1", _b and _b[0].gegenbeispiel)
+
+# Ältere Hypothesis-Fassungen schreiben 'Falsifying example'.
+check("die ältere Schreibweise wird auch verstanden",
+      diagnostics.parse(_HYP_DIREKT.replace("Failing test case",
+                                            "Falsifying example"))[0]
+      .gegenbeispiel == "g=0, b=1")
+
+_PYTEST_SCHLICHT = """=================================== FAILURES ===================================
+__________________________________ test_summe __________________________________
+
+    def test_summe():
+>       assert summe(2, 3) == 5
+E       assert -1 == 5
+
+test_schlicht.py:3: AssertionError
+=========================== short test summary info ============================
+FAILED test_schlicht.py::test_summe - assert -1 == 5
+1 failed in 0.17s"""
+_b = diagnostics.parse(_PYTEST_SCHLICHT, "run_command")
+check("gewöhnlicher pytest-Fehlschlag wird erkannt", len(_b) == 1, _b)
+# Ohne Gegenbeispiel bleibt es eine Zusicherung. Alles zu PROPERTY zu erklären
+# waere eine Behauptung ueber eine ganze Eingabeklasse, die hier niemand belegt.
+check("ohne Gegenbeispiel bleibt es ASSERTION",
+      _b and _b[0].kategorie == diagnostics.ASSERTION, _b)
+check("kein Gegenbeispiel erfunden", _b and _b[0].gegenbeispiel is None, _b)
+
+_MEHRERE = _PYTEST_SCHLICHT + "\nFAILED test_a.py::test_x - assert 1 == 2"
+check("mehrere FAILED-Zeilen ergeben mehrere Befunde",
+      len(diagnostics.parse(_MEHRERE)) == 2, diagnostics.parse(_MEHRERE))
+
+check("bestandener Lauf ergibt keinen Befund",
+      diagnostics.parse("2 passed in 0.10s") == [])
+
+# --- JavaScript und TypeScript ---------------------------------------------
+#
+# Bis hierher konnte der Agent nur Python-Fehler benennen. Vor jeder anderen
+# Ausgabe stand er wie vor einer Textwand: er sah, DASS etwas rot ist, aber
+# nicht was oder wo - und wich auf Python aus. Die Vorlagen unten sind echte
+# Ausgaben der Werkzeuge, nicht nachgebaute Wunschformate.
+
+_TSC_AUSGABE = """src/summe.ts(12,5): error TS2322: Type 'string' is not \
+assignable to type 'number'.
+src/summe.ts(3,10): error TS1005: ';' expected."""
+_b = diagnostics.parse(_TSC_AUSGABE, "run_command")
+check("tsc-Fehler werden erkannt", len(_b) == 2, _b)
+check("ein Typfehler heisst Typfehler",
+      _b and _b[0].kategorie == diagnostics.TYPE and _b[0].typ == "TS2322", _b)
+check("Datei und Zeile stehen daneben",
+      _b and _b[0].datei == "src/summe.ts" and _b[0].zeile == 12, _b)
+# TS1xxx sind Parse-Fehler. Sie als Typfehler zu melden hiesse, das Modell
+# suchte einen Typ, wo ein Semikolon fehlt.
+check("TS1005 ist ein Syntaxfehler, kein Typfehler",
+      len(_b) == 2 and _b[1].kategorie == diagnostics.SYNTAX, _b)
+check("die Meldung bleibt erhalten",
+      _b and "not assignable" in _b[0].nachricht, _b)
+
+check("eine saubere tsc-Ausgabe ergibt keinen Befund",
+      diagnostics.parse("") == [] and diagnostics.parse("Found 0 errors.") == [])
+
+# eslint, stylish - der Dateiname steht als eigene Zeile ueber den Befunden.
+_ESLINT_AUSGABE = """
+/opt/projekt/src/app.js
+  1:1   error    'React' is not defined                    no-undef
+  4:7   warning  'zaehler' is assigned a value but never used  no-unused-vars
+  9:1   error    Expected indentation of 2 spaces but found 4  indent
+
+✖ 3 problems (2 errors, 1 warning)"""
+_b = diagnostics.parse(_ESLINT_AUSGABE, "run_command")
+check("eslint-Befunde werden erkannt", len(_b) == 3, _b)
+check("der Dateiname aus der Kopfzeile landet an jedem Befund",
+      all(f.datei == "/opt/projekt/src/app.js" for f in _b), _b)
+check("ein undefinierter Name ist ein Namensfehler",
+      _b and _b[0].kategorie == diagnostics.NAME and _b[0].typ == "no-undef", _b)
+# Sonst repariert das Modell Einrueckungen, waehrend der echte Fehler steht.
+check("eine Einrueckungsregel bleibt Stil, auch als 'error'",
+      len(_b) == 3 and _b[2].kategorie == diagnostics.STIL
+      and _b[2].schwere == diagnostics.FEHLER, _b)
+check("eine ungenutzte Variable ist Stil und nur eine Warnung",
+      len(_b) == 3 and _b[1].kategorie == diagnostics.STIL
+      and _b[1].schwere == diagnostics.WARNUNG, _b)
+check("die Zusammenfassungszeile ist kein Befund",
+      all("problems" not in f.nachricht for f in _b), _b)
+
+check("eslint ohne Beanstandung ergibt keinen Befund",
+      diagnostics.parse("/opt/projekt/src/app.js\n") == [])
+
+# jest. Derselbe Fehlschlag steht dreimal drin: in der Liste, als Ueberschrift
+# des Details und in der Zusammenfassung.
+_JEST_AUSGABE = """ FAIL  src/summe.test.js
+  Summe
+    ✕ addiert 1 + 2 zu 3 (3 ms)
+
+  ● Summe › addiert 1 + 2 zu 3
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 3
+    Received: 4
+
+      3 | test('addiert 1 + 2 zu 3', () => {
+    > 4 |   expect(summe(1, 2)).toBe(3);
+        |                       ^
+      5 | });
+
+      at Object.<anonymous> (src/summe.test.js:4:23)
+
+Tests:       1 failed, 1 total"""
+_b = diagnostics.parse(_JEST_AUSGABE, "run_command")
+check("ein jest-Fehlschlag wird erkannt", len(_b) >= 1, _b)
+check("er ist eine Zusicherung",
+      _b and _b[0].kategorie == diagnostics.ASSERTION, _b)
+check("die Testdatei aus der FAIL-Zeile steht daran",
+      _b and _b[0].datei == "src/summe.test.js", _b)
+# Ohne Zeile muesste das Modell die Datei erneut durchlesen, um die Stelle
+# zu finden - sie steht im Stapelauszug direkt darunter.
+check("die Zeile wird aus dem Stapelauszug nachgetragen",
+      _b and _b[0].zeile == 4, _b)
+
+_JEST_EINER = """ FAIL  src/summe.test.js
+  ✕ addiert (3 ms)
+
+  ● addiert
+
+    at Object.<anonymous> (src/summe.test.js:4:23)"""
+# '✕ addiert (3 ms)' und '● addiert' sind derselbe Test. Zwei Befunde daraus
+# zu machen hiesse, das Modell repariert zweimal dieselbe Stelle.
+check("derselbe Test wird nicht doppelt gemeldet",
+      len(diagnostics.parse(_JEST_EINER)) == 1, diagnostics.parse(_JEST_EINER))
+
+# vitest haengt den Testnamen mit '>' an die Datei.
+_VITEST_AUSGABE = """ ✗ src/summe.test.ts > addiert zwei Zahlen
+ FAIL  src/summe.test.ts > addiert zwei Zahlen
+AssertionError: expected 4 to be 3
+
+ Test Files  1 failed (1)
+      Tests  1 failed (1)"""
+_b = diagnostics.parse(_VITEST_AUSGABE, "run_command")
+check("ein vitest-Fehlschlag wird erkannt", len(_b) == 1, _b)
+check("Datei und Testname stehen daran",
+      _b and _b[0].datei == "src/summe.test.ts"
+      and _b[0].symbol == "addiert zwei Zahlen", _b)
+
+check("ein gruener jest-Lauf ergibt keinen Befund",
+      diagnostics.parse(" PASS  src/summe.test.js\n  ✓ addiert (2 ms)\n"
+                        "\nTests:       1 passed, 1 total") == [])
+
+# Ein Python-Traceback darf nicht ploetzlich als JavaScript gelesen werden.
+_b = diagnostics.parse(_stderr_von("raise ValueError('kaputt')"))
+check("Python bleibt Python", _b and _b[0].typ == "ValueError", _b)
+
+# Wenn hypothesis zur Hand ist: frisch erzeugen statt nur die Aufzeichnung.
+try:
+    import hypothesis  # noqa: F401
+except ImportError:
+    print("  ÜBERSPRUNGEN  Livelauf gegen hypothesis (nicht installiert)")
+else:
+    _ordner = tempfile.mkdtemp()
+    with open(os.path.join(_ordner, "p.py"), "w", encoding="utf-8") as _fh:
+        _fh.write(textwrap.dedent("""
+            from hypothesis import given, strategies as st
+            def abheben(g, b): return g - b
+            @given(st.integers(min_value=0, max_value=100),
+                   st.integers(min_value=0, max_value=100))
+            def test_nie_negativ(g, b):
+                assert abheben(g, b) >= 0
+            test_nie_negativ()
+        """))
+    _roh = subprocess.run([sys.executable, os.path.join(_ordner, "p.py")],
+                          capture_output=True, text=True).stderr
+    _b = diagnostics.parse(_roh.replace(_ordner, "/app"))
+    check("Livelauf ergibt ein Gegenbeispiel",
+          _b and _b[0].gegenbeispiel is not None, _roh[-300:])
+    check("Livelauf wird als PROPERTY eingeordnet",
+          _b and _b[0].kategorie == diagnostics.PROPERTY, _b)
+
+
+# ---------------------------------------------------------- Fehlergedaechtnis
+print("\n[41] Fehlergedächtnis")
+
+import memory as memory_mod  # noqa: E402
+
+def _befund(datei="konto.py", symbol="abheben", typ="AssertionError", text="negativ"):
+    return diagnostics.Finding(
+        kategorie=diagnostics.kategorie_fuer(typ), schwere=diagnostics.FEHLER,
+        typ=typ, nachricht=text, datei=datei, symbol=symbol, schritt=1)
+
+_pfad = os.path.join(tempfile.mkdtemp(), "tiefer", "g.sqlite")
+_g = memory_mod.Gedaechtnis(_pfad)
+check("Datei wird samt Ordner angelegt", os.path.exists(_pfad), _pfad)
+check("frisches Gedächtnis ist leer", _g.anzahl() == 0)
+check("ohne Vorwissen kein Hinweis", _g.hinweis(_befund()) == "")
+
+check("leere Lösung wird abgewiesen", _g.merken(_befund(), "   ") is False)
+check("und landet nicht in der Ablage", _g.anzahl() == 0)
+
+check("echte Lösung wird gemerkt",
+      _g.merken(_befund(), "edit_file(konto.py)") is True)
+_h = _g.hinweis(_befund())
+check("Hinweis nennt die Lösung", "edit_file(konto.py)" in _h, _h)
+# Als Hinweis, nicht als Anweisung: was damals half, muss heute nicht stimmen.
+check("Hinweis ist als ungeprüft gekennzeichnet",
+      "nicht ungeprüft übernehmen" in _h, _h)
+
+# Ein anderer Fehler an derselben Stelle darf NICHT treffen - sonst bekommt
+# das Modell eine Lösung für ein anderes Problem vorgelegt.
+check("anderer Fehlertyp trifft nicht",
+      _g.hinweis(_befund(typ="NameError")) == "")
+check("anderes Symbol trifft nicht",
+      _g.hinweis(_befund(symbol="einzahlen")) == "")
+check("andere Datei trifft nicht",
+      _g.hinweis(_befund(datei="andere.py")) == "")
+
+# Wechselnder Text im selben Fehler muss weiterhin treffen - genau dafür ist
+# der Fingerabdruck ohne den freien Text gebaut.
+check("wechselnde Meldung trifft trotzdem",
+      _g.hinweis(_befund(text="ganz anderer Wortlaut")) != "")
+
+for _i in range(5):
+    _g.merken(_befund(), f"lösung-{_i}")
+check("Anzahl der gezeigten Treffer ist gedeckelt",
+      _g.hinweis(_befund()).count("  - ") <= memory_mod.MAX_TREFFER,
+      _g.hinweis(_befund()))
+
+# Alterung: ein Fix von vor einem Jahr kann sich auf Code beziehen, den es
+# nicht mehr gibt.
+import sqlite3 as _sq  # noqa: E402
+with _sq.connect(_pfad) as _c:
+    _c.execute("UPDATE fehler SET zeitpunkt = ?", (time.time() - 400 * 86400,))
+check("veraltete Einträge werden nicht mehr gezeigt", _g.hinweis(_befund()) == "")
+check("und lassen sich entfernen", _g.aufraeumen() > 0)
+check("danach ist die Ablage leer", _g.anzahl() == 0)
+
+# Kein Quelltext in der Ablage - ein Gedächtnis, das Dateiinhalte mitschreibt,
+# waere ein Datenleck mit Zusatznutzen.
+_g.merken(_befund(), "edit_file(konto.py)")
+with _sq.connect(_pfad) as _c:
+    _inhalt = " ".join(str(z) for z in _c.execute("SELECT * FROM fehler"))
+check("kein Quelltext in der Ablage",
+      "def " not in _inhalt and "return" not in _inhalt, _inhalt)
+
+# Lösung aus dem Protokoll ableiten
+_prot = [
+    {"nr": 1, "werkzeug": "read_file", "ok": True, "dateien": []},
+    {"nr": 2, "werkzeug": "run_python", "ok": True, "dateien": []},
+    {"nr": 3, "werkzeug": "edit_file", "ok": True, "dateien": [{"pfad": "konto.py"}]},
+    {"nr": 4, "werkzeug": "edit_file", "ok": True, "dateien": [{"pfad": "konto.py"}]},
+    {"nr": 5, "werkzeug": "write_file", "ok": False, "dateien": [{"pfad": "x.py"}]},
+]
+_l = memory_mod.loesung_beschreiben(_prot, ab_schritt=2)
+check("nur Schritte NACH dem Fehler", "read_file" not in _l, _l)
+check("Wiederholungen werden zusammengefasst",
+      _l.count("edit_file") == 1, _l)
+check("gescheiterte Schritte zählen nicht", "write_file" not in _l, _l)
+check("Werkzeug und Pfad, kein Inhalt", _l == "edit_file(konto.py)", _l)
+
+# Verdrahtung: Hinweis erscheint im Werkzeugergebnis
+async def _rot(_d, _e=None, command=None):
+    return 1, ('Traceback (most recent call last):\n'
+               '  File "/app/konto.py", line 2, in abheben\n    return g - b\n'
+               'AssertionError: negativ')
+
+_w = ws_mod.Workspace(tempfile.mkdtemp())
+_w.write("konto.py", "def abheben(g, b):\n    return g - b\n")
+_g2 = memory_mod.Gedaechtnis(os.path.join(tempfile.mkdtemp(), "g2.sqlite"))
+
+_tb = tools.Toolbox(_w, run_sandbox=_rot, gedaechtnis=_g2)
+_erg = asyncio.run(_tb.call("run_python", {"path": "konto.py"}))
+check("beim ersten Mal kein Vorwissen", "kam hier schon vor" not in _erg, _erg[-200:])
+check("der Befund trägt seinen Schritt",
+      _tb.befunde and _tb.befunde[0].schritt is not None, _tb.befunde)
+
+_g2.merken(_tb.befunde[0], "edit_file(konto.py)")
+_tb2 = tools.Toolbox(_w, run_sandbox=_rot, gedaechtnis=_g2)
+_erg = asyncio.run(_tb2.call("run_python", {"path": "konto.py"}))
+check("beim zweiten Mal steht das Vorwissen dabei",
+      "kam hier schon vor" in _erg and "edit_file(konto.py)" in _erg, _erg[-300:])
+
+# Ohne Gedächtnis muss alles unverändert funktionieren.
+_tb3 = tools.Toolbox(_w, run_sandbox=_rot)
+_erg = asyncio.run(_tb3.call("run_python", {"path": "konto.py"}))
+check("ohne Gedächtnis läuft es normal weiter",
+      "Befund:" in _erg and "kam hier schon vor" not in _erg, _erg[-200:])
+
+# Ein unbelegter Lauf darf NICHTS merken - sonst wird eine Vermutung als
+# Erfahrung weitergereicht.
+_g3 = memory_mod.Gedaechtnis(os.path.join(tempfile.mkdtemp(), "g3.sqlite"))
+class _Attrappe:
+    gedaechtnis = _g3
+    befunde = [_befund()]
+    protokoll = [{"nr": 2, "werkzeug": "edit_file", "ok": True,
+                  "dateien": [{"pfad": "konto.py"}]}]
+agentloop._merken(_Attrappe())
+check("belegter Lauf merkt sich etwas", _g3.anzahl() == 1, _g3.anzahl())
+
+
+# ------------------------------------------------- Reichweite eines Belegs
+print("\n[42] Ein grüner Lauf belegt nur, was er erreicht hat")
+
+# Der Fehler, den diese Zusicherungen verhindern: 'pytest test_a.py' laeuft
+# durch, und die Sperre erklaert damit AUCH eine gleichzeitig geaenderte b.py
+# fuer belegt, die kein Test anfasst. Der Beleg waere echt - er belegte nur
+# das Falsche. Genau dagegen ist die ganze Schicht gebaut.
+
+def _reichweite_projekt():
+    w = ws_mod.Workspace(tempfile.mkdtemp())
+    w.write("a.py", "def f(): return 1\n")
+    w.write("b.py", "def g(): return 2\n")
+    w.write("hilf.py", "X = 3\n")
+    w.write("test_a.py", "import a\nimport hilf\ndef test_f(): assert a.f() == 1\n")
+    return w
+
+async def _gruen(_d, _e=None, command=None):
+    return 0, "1 passed"
+
+def _nach(aenderungen, pruefung):
+    tb = tools.Toolbox(_reichweite_projekt(), run_sandbox=_gruen)
+    for pfad in aenderungen:
+        asyncio.run(tb.call("edit_file", {"path": pfad, "old_text": "3"
+                                          if pfad == "hilf.py" else "return",
+                                          "new_text": "4" if pfad == "hilf.py"
+                                          else "return "}))
+    asyncio.run(tb.call(*pruefung))
+    return tb
+
+_tb = _nach(["a.py", "b.py"], ("run_command", {"command": "python -m pytest test_a.py"}))
+check("gezielter Testlauf belegt nur seinen Ast",
+      _tb.unverified == {"b.py"}, sorted(_tb.unverified))
+check("und finish wird deshalb abgewiesen",
+      asyncio.run(_tb.call("finish", {"summary": "x"})).startswith("FEHLER"))
+
+_tb = _nach(["hilf.py"], ("run_command", {"command": "python -m pytest test_a.py"}))
+check("transitiv importierte Datei gilt als belegt",
+      _tb.unverified == set(), sorted(_tb.unverified))
+
+_tb = _nach(["a.py", "b.py"], ("run_command", {"command": "python -m pytest"}))
+check("ein Lauf ohne Dateiangabe belegt alles",
+      _tb.unverified == set(), sorted(_tb.unverified))
+
+_tb = _nach(["a.py", "b.py"], ("run_python", {"path": "a.py"}))
+check("run_python belegt nur seinen eigenen Ast",
+      _tb.unverified == {"b.py"}, sorted(_tb.unverified))
+
+_tb = _nach(["a.py", "b.py"], ("run_command", {"command": "python -m pytest test_a.py"}))
+asyncio.run(_tb.call("run_python", {"path": "b.py"}))
+# Beide Äste sind einzeln belegt — das reicht seit der Gate-Sperre NICHT mehr.
+# Ein gezielter Testlauf über a.py und ein run_python über b.py sagen nichts
+# darüber, ob die Suite des Projekts als Ganzes noch grün ist. Genau diese
+# Lücke war gemeint mit "keine Regressionen".
+check("einzeln belegte Äste reichen dem Abschluss nicht mehr",
+      asyncio.run(_tb.call("finish", {"summary": "x"})).startswith("FEHLER"),
+      _tb.bericht()["gates"])
+asyncio.run(_tb.call("run_gates", {}))
+check("erst die Prüfbefehle des Projekts lassen finish durch",
+      not asyncio.run(_tb.call("finish", {"summary": "x"})).startswith("FEHLER"))
+check("und der Lauf gilt als verifiziert", _tb.verified is True)
+
+for _befehl, _erwartet in (
+        ('python -m pytest test_a.py', ["test_a.py"]),
+        ('python -m pytest "test_a.py"', ["test_a.py"]),
+        ("python -m pytest 'test_a.py'::test_f", ["test_a.py"]),
+        ("python -m pytest test_a.py::test_f", ["test_a.py"]),
+        ("python -m pytest", [])):
+    check(f"Befehlszerlegung: {_befehl[17:] or '(ohne Datei)'}",
+          testimpact.dateien_aus_befehl(_befehl, {"test_a.py"}) == _erwartet,
+          testimpact.dateien_aus_befehl(_befehl, {"test_a.py"}))
+
+# Nicht-Python-Dateien: sie koennen von keinem Lauf belegt werden, duerfen den
+# Abschluss also nicht blockieren - aber verschwiegen werden sie auch nicht.
+_w = ws_mod.Workspace(tempfile.mkdtemp())
+_w.write("main.py", "print(1)\n")
+_tb = tools.Toolbox(_w, run_sandbox=_gruen)
+asyncio.run(_tb.call("write_file", {"path": "notiz.txt", "content": "x"}))
+check("Textdatei blockiert den Abschluss nicht", _tb.unverified == set(), _tb.unverified)
+check("sie wird aber getrennt vermerkt",
+      _tb.ungeprueft_sonstige == {"notiz.txt"}, _tb.ungeprueft_sonstige)
+check("und steht im Bericht",
+      _tb.bericht()["ohne_pruefmoeglichkeit"] == ["notiz.txt"], _tb.bericht())
+check("finish geht deshalb durch",
+      not asyncio.run(_tb.call("finish", {"summary": "x"})).startswith("FEHLER"))
+
+# Der Beleg-Zwang galt lange nur fuer '.py'. Eine geschriebene .ts-Datei fiel
+# damit in denselben Topf wie eine README: nie geprueft, nie blockierend - der
+# Agent durfte fuer die halbe Welt behaupten statt belegen. Genau das war die
+# Beschwerde 'er versteht nur Python'.
+if _syn.unterstuetzt("x.ts"):
+    _w = ws_mod.Workspace(tempfile.mkdtemp())
+    _tb = tools.Toolbox(_w, run_sandbox=_gruen)
+    asyncio.run(_tb.call("write_file", {"path": "seite.ts",
+                                        "content": "export const a = 1;\n"}))
+    check("eine geschriebene .ts-Datei ist ungeprüft",
+          _tb.unverified == {"seite.ts"}, _tb.unverified)
+    check("sie landet nicht im Topf der Unprüfbaren",
+          _tb.ungeprueft_sonstige == set(), _tb.ungeprueft_sonstige)
+    _erg = asyncio.run(_tb.call("finish", {"summary": "fertig"}))
+    check("und finish wird abgewiesen", _erg.startswith("FEHLER"), _erg[:90])
+    check("die Abweisung nennt die Datei", "seite.ts" in _erg, _erg[:200])
+
+    _erg = asyncio.run(_tb.call("check_syntax", {"path": "seite.ts"}))
+    check("check_syntax belegt sie", _tb.unverified == set(), (_erg, _tb.unverified))
+    check("danach geht finish durch",
+          not asyncio.run(_tb.call("finish", {"summary": "x"})).startswith("FEHLER"))
+
+    # Kaputtes TypeScript darf nicht als Beleg zaehlen.
+    _tb2 = tools.Toolbox(_w, run_sandbox=_gruen)
+    asyncio.run(_tb2.call("write_file", {"path": "kaputt.ts",
+                                         "content": "export const a = ;\n"}))
+    asyncio.run(_tb2.call("check_syntax", {"path": "kaputt.ts"}))
+    check("ein Syntaxfehler belegt nichts",
+          _tb2.unverified == {"kaputt.ts"}, _tb2.unverified)
+else:
+    check("ohne node bleibt .ts unprüfbar - und blockiert deshalb nicht",
+          not _syn.unterstuetzt("x.ts"))
+
+
+# --------------------------------------------------------- Linter-Ausgabe
+print("\n[43] ruff und mypy")
+
+# Aufzeichnungen aus echten Laeufen (ruff 0.16.2, mypy 2.3.0). ruff steckt im
+# Sandbox-Image, mypy nicht - dessen Parser ist trotzdem da, falls ein Projekt
+# sein eigenes mitbringt.
+
+_RUFF = """modul.py:1:1: I001 [*] Import block is un-sorted or un-formatted
+modul.py:1:8: F401 [*] `os` imported but unused
+modul.py:13:5: F841 Local variable `x` is assigned to but never used
+modul.py:13:9: F821 Undefined name `ergebnis`
+Found 4 errors."""
+
+_b = diagnostics.parse(_RUFF, "run_command")
+check("ruff: alle vier Zeilen erkannt", len(_b) == 4, _b)
+_nach_typ = {f.typ: f for f in _b}
+# Ein nicht aufgeloester Name ist ein Fehler, eine unsortierte Importliste
+# nicht. Beides gleich zu melden brächte das Modell dazu, Stil zu reparieren,
+# während der echte Fehler stehen bleibt.
+check("undefinierter Name ist ein Fehler",
+      _nach_typ["F821"].schwere == diagnostics.FEHLER
+      and _nach_typ["F821"].kategorie == diagnostics.NAME, _nach_typ["F821"])
+check("unsortierte Importe sind nur Stil",
+      _nach_typ["I001"].schwere == diagnostics.WARNUNG
+      and _nach_typ["I001"].kategorie == diagnostics.STIL, _nach_typ["I001"])
+check("ungenutzter Import ist nur Stil",
+      _nach_typ["F401"].schwere == diagnostics.WARNUNG, _nach_typ["F401"])
+check("ruff: Datei und Zeile stimmen",
+      _nach_typ["F821"].datei == "modul.py" and _nach_typ["F821"].zeile == 13,
+      _nach_typ["F821"])
+check("die Zusammenfassungszeile erzeugt keinen Befund",
+      all("Found 4 errors" not in f.nachricht for f in _b), _b)
+
+# Der Sonderfall, an dem die erste Fassung gescheitert ist: bei kaputter
+# Syntax schreibt ruff 'invalid-syntax:' MIT Doppelpunkt, bei Regelcodes steht
+# keiner. Ausgerechnet der wichtigste Befund fiel damit durch.
+_b = diagnostics.parse(
+    "kaputt.py:1:7: invalid-syntax: Expected a parameter or the end of the "
+    "parameter list\nFound 1 error.", "run_command")
+check("ruff: Syntaxfehler wird erkannt", len(_b) == 1, _b)
+check("und als SYNTAX/Fehler eingeordnet",
+      _b and _b[0].kategorie == diagnostics.SYNTAX
+      and _b[0].schwere == diagnostics.FEHLER, _b)
+
+_MYPY = ('modul.py:9: error: Incompatible return value type (got "int", '
+         'expected "str")  [return-value]\n'
+         "Found 1 error in 1 file (checked 1 source file)")
+_b = diagnostics.parse(_MYPY, "run_command")
+check("mypy: Befund erkannt", len(_b) == 1, _b)
+check("mypy: Kategorie ist TYPE",
+      _b and _b[0].kategorie == diagnostics.TYPE, _b)
+check("mypy: der Regelcode wird zum Typ",
+      _b and _b[0].typ == "return-value", _b)
+check("mypy: Zeile stimmt", _b and _b[0].zeile == 9, _b)
+
+# Mit --show-column-numbers steht eine Spalte dazwischen.
+_b = diagnostics.parse(_MYPY.replace("modul.py:9:", "modul.py:9:12:"), "run_command")
+check("mypy: Spaltenangabe stört nicht",
+      len(_b) == 1 and _b[0].zeile == 9, _b)
+
+# 'note:' sind Zusatzzeilen unter einem Fehler, keine eigenen Befunde.
+_b = diagnostics.parse(
+    'a.py:3: error: Argument 1 has incompatible type  [arg-type]\n'
+    'a.py:3: note: "f" defined here', "run_command")
+check("mypy: Notizzeilen zählen nicht als Befund", len(_b) == 1, _b)
+
+# Gegenprobe: Erfolgsmeldungen dürfen nichts erfinden.
+for _sauber in ("All checks passed!",
+                "Success: no issues found in 1 source file",
+                "Alles in Ordnung."):
+    check(f"sauberer Lauf ergibt nichts: {_sauber[:24]}",
+          diagnostics.parse(_sauber) == [])
+
+# Und ruff gehört ins Image, mypy bewusst nicht.
+if os.path.exists(_DOCKERFILE):
+    with open(_DOCKERFILE, encoding="utf-8") as _fh:
+        _df = _fh.read()
+    _rezept = _df.split("RUN pip install")[1].split("&&")[0]
+    check("ruff steckt im Sandbox-Image", "ruff" in _rezept, _rezept)
+    check("mypy bleibt bewusst draußen", "mypy" not in _rezept, _rezept)
+    check("das Image prüft ruff beim Bauen", "ruff --version" in _df)
+
+
+print("\n[45] Textstrom aus dem Arbeitsfaden in den Ereignisloop")
+
+# Der Modellaufruf laeuft in einem Arbeitsfaden, die Anzeige im Ereignisloop.
+# Der erste Entwurf plante je Stueck eine eigene Aufgabe ein - dabei kann das
+# zuletzt erzeugte Stueck ein frueheres ueberholen und der Text steht
+# durcheinander auf dem Bildschirm. Hier wird die Reihenfolge geprueft, nicht
+# nur die Vollstaendigkeit.
+
+def _strom_durchreichen(stuecke, verzoegerung=0.0):
+    gesehen = []
+
+    async def _on_text(s):
+        gesehen.append(s)
+
+    def _falscher_chat(messages, tools=None, policy=None, on_text=None):
+        for teil in stuecke:
+            if verzoegerung:
+                time.sleep(verzoegerung)
+            if on_text:
+                on_text(teil)
+        return provider.Reply(text="".join(stuecke))
+
+    async def _lauf():
+        orig = provider.chat
+        provider.chat = _falscher_chat
+        try:
+            return await main.model_chat([{"role": "user", "content": "x"}],
+                                         None, on_text=_on_text)
+        finally:
+            provider.chat = orig
+
+    antwort = asyncio.run(_lauf())
+    return antwort, gesehen
+
+_stuecke = [f"teil{n}-" for n in range(25)]
+_antwort, _gesehen = _strom_durchreichen(_stuecke)
+check("nichts geht auf dem Weg verloren",
+      "".join(_gesehen) == "".join(_stuecke), "".join(_gesehen)[:80])
+check("die Reihenfolge bleibt erhalten",
+      "".join(_gesehen) == "".join(_stuecke)
+      and _gesehen == sorted(_gesehen, key=lambda s: "".join(_stuecke).index(s)),
+      _gesehen[:4])
+check("die Antwort selbst kommt trotzdem zurück",
+      _antwort.text == "".join(_stuecke), _antwort.text[:40])
+
+# Mit Pausen dazwischen kommen die Stuecke einzeln statt als ein Klumpen -
+# genau dafuer ist der Strom da.
+_antwort, _gesehen = _strom_durchreichen(["eins ", "zwei ", "drei"], verzoegerung=0.03)
+check("mit Pausen kommen die Stücke auch einzeln an",
+      len(_gesehen) >= 2 and "".join(_gesehen) == "eins zwei drei", _gesehen)
+
+# Ohne Rueckruf muss der alte, einfache Weg unveraendert funktionieren.
+def _stiller_chat(messages, tools=None, policy=None, on_text=None):
+    assert on_text is None, "ohne Rueckruf darf keiner durchgereicht werden"
+    return provider.Reply(text="still")
+
+async def _ohne_strom():
+    orig = provider.chat
+    provider.chat = _stiller_chat
+    try:
+        return await main.model_chat([{"role": "user", "content": "x"}])
+    finally:
+        provider.chat = orig
+
+check("ohne Rückruf bleibt es beim einfachen Aufruf",
+      asyncio.run(_ohne_strom()).text == "still")
+
+
+print("\n[44] Laeufe leben auf dem Server, nicht in der Verbindung")
+
+# 'runs' waere hier gefaehrlich: weiter oben wird der Name als gewoehnliche
+# Variable wiederverwendet (events, runs = drive_agent(...)) und wuerde das
+# Modul ueberschreiben.
+import runs as runs_mod  # noqa: E402
+import threading  # noqa: E402
+
+async def _lauf_grundlagen():
+    lauf = runs_mod.Lauf(id="t1", prompt="x", gestartet=time.time())
+    lauf.anhaengen("status", "eins")
+    lauf.anhaengen("tool", "list_files()")
+    lauf.abschliessen(ok=True, text="Fertig.")
+
+    alle = [e async for _, e in lauf.folgen(0)]
+    ab_eins = [(i, e) async for i, e in lauf.folgen(1)]
+    return lauf, alle, ab_eins
+
+_lauf, _alle, _ab_eins = asyncio.run(_lauf_grundlagen())
+check("Ereignisse werden der Reihe nach aufbewahrt",
+      [e["type"] for e in _alle] == ["status", "tool", "done"], _alle)
+check("ein Abschluss markiert den Lauf als fertig", _lauf.fertig and _lauf.ok is True)
+check("folgen(1) fängt beim zweiten Ereignis an",
+      _ab_eins[0][0] == 1 and _ab_eins[0][1]["type"] == "tool", _ab_eins[0])
+check("folgen(1) wiederholt das erste Ereignis nicht",
+      all(e["text"] != "eins" for _, e in _ab_eins), _ab_eins)
+
+# Nach dem Abschluss darf nichts mehr dazukommen - sonst haengt ein
+# Zuschauer, der schon 'done' gesehen hat, an einem Lauf ohne Ende.
+_lauf.anhaengen("status", "zu spät")
+check("nach dem Abschluss wird nichts mehr angenommen",
+      [e["type"] for e in _lauf.ereignisse] == ["status", "tool", "done"],
+      [e["type"] for e in _lauf.ereignisse])
+
+# Speichergrenze: nicht still abschneiden, sondern sagen, dass gekuerzt wurde.
+_voll = runs_mod.Lauf(id="t2", prompt="x", gestartet=time.time())
+for _n in range(runs_mod.MAX_EREIGNISSE + 50):
+    _voll.anhaengen("sandbox", f"Zeile {_n}")
+check("die Ereignisgrenze greift", len(_voll.ereignisse) <= runs_mod.MAX_EREIGNISSE + 2,
+      len(_voll.ereignisse))
+check("und wird benannt statt verschwiegen",
+      any(e["type"] == "error" and "Zu viele" in e["text"] for e in _voll.ereignisse))
+check("der Lauf endet dann auch wirklich", _voll.fertig and _voll.ok is False)
+
+_lang = runs_mod.Lauf(id="t3", prompt="x", gestartet=time.time())
+_lang.anhaengen("sandbox", "y" * (runs_mod.MAX_TEXT + 500))
+check("überlange Texte werden gekappt",
+      len(_lang.ereignisse[0]["text"]) == runs_mod.MAX_TEXT,
+      len(_lang.ereignisse[0]["text"]))
+
+_reg = runs_mod.Register()
+_a = _reg.starten("erster")
+_b = _reg.starten("zweiter")
+check("Läufe bekommen verschiedene Kennungen", _a.id != _b.id)
+check("der offene Lauf ist der jüngste", _reg.offen().id == _b.id)
+_b.abschliessen(ok=True)
+check("ein fertiger Lauf gilt nicht mehr als offen", _reg.offen().id == _a.id)
+_a.abschliessen(ok=True)
+check("ohne laufenden Auftrag gibt es keinen offenen", _reg.offen() is None)
+check("aber abrufbar bleiben sie", _reg.holen(_a.id) is not None)
+
+# Ein langlaufender Auftrag darf niemals weggeraeumt werden - er ist genau
+# dann am wertvollsten, wenn er lange dauert.
+_reg2 = runs_mod.Register()
+_alt = _reg2.starten("laeuft seit Stunden")
+_alt.gestartet = time.time() - 10 * runs_mod.AUFBEWAHRUNG
+for _n in range(runs_mod.MAX_LAEUFE + 5):
+    _reg2.starten(f"fuellung {_n}").abschliessen(ok=True)
+_reg2.starten("neu")
+check("ein laufender Auftrag überlebt jedes Aufräumen",
+      _reg2.holen(_alt.id) is not None)
+
+# --- Der eigentliche Punkt: Verbindung weg, Lauf laeuft weiter ------------
+#
+# Genau hieran ist der erste echte Auftrag gescheitert. Der Server hatte
+# sauber gearbeitet - nur hatte niemand mehr zugehoert, und mit dem Zuhoerer
+# starb die Arbeit.
+
+# Ab hier ein ECHTER Server statt des Testclients.
+#
+# Der Testclient von Starlette gibt jeder WebSocket-Sitzung ihren eigenen
+# Ereignisloop und raeumt ihn beim Verlassen des Blocks ab - mitsamt allem,
+# was darin gestartet wurde. Genau die Faehigkeit, die hier geprueft werden
+# soll, kann er also gar nicht zeigen: jeder Lauf endete unter ihm als
+# "Abgebrochen.", obwohl der Code richtig war.
+#
+# Das ist der Unterschied zwischen "der Test ist rot" und "der Code ist
+# kaputt". Wer das verwechselt, baut die falsche Sache um.
+import socket  # noqa: E402
+import uvicorn  # noqa: E402
+import websockets  # noqa: E402
+
+_tor = threading.Event()
+
+async def _langsamer_lauf(send, prompt, **kw):
+    await send("status", "erster Schritt")
+    # threading.Event statt asyncio.Event: gesetzt wird es aus dem Testfaden,
+    # und asyncio.Event ist ueber Fadengrenzen hinweg nicht sicher.
+    while not _tor.is_set():
+        await asyncio.sleep(0.01)
+    await send("status", "zweiter Schritt")
+    await send("done", "Fertig.", ok=True, exit=0, attempts=1, seconds=0.2)
+
+_frei = socket.socket()
+_frei.bind(("127.0.0.1", 0))
+_PORT = _frei.getsockname()[1]
+_frei.close()
+
+_echtes_dispatch = main.dispatch
+main.dispatch = _langsamer_lauf
+_server = uvicorn.Server(uvicorn.Config(main.app, host="127.0.0.1", port=_PORT,
+                                        log_level="error"))
+threading.Thread(target=_server.run, daemon=True).start()
+for _ in range(200):
+    if getattr(_server, "started", False):
+        break
+    time.sleep(0.05)
+
+_URL = f"ws://127.0.0.1:{_PORT}/ws/agent"
+
+async def _reden(nutzlast, bis=2, timeout=10):
+    """Verbindet, schickt eine Nachricht, liest Ereignisse.
+
+    bis: Anzahl der Ereignisse, oder 'done' fuer 'bis zum Abschluss'.
+    """
+    gelesen = []
+    async with websockets.connect(_URL) as w:
+        await w.send(json.dumps(nutzlast))
+        while True:
+            try:
+                ev = json.loads(await asyncio.wait_for(w.recv(), timeout))
+            except Exception:
+                break
+            gelesen.append(ev)
+            if bis == "done" and ev["type"] == "done":
+                break
+            if isinstance(bis, int) and len(gelesen) >= bis:
+                break
+            if ev["type"] == "error" and ev.get("code"):
+                break
+    return gelesen
+
+try:
+    check("der Testserver ist oben", getattr(_server, "started", False))
+
+    # 1. Auftrag starten und mittendrin die Verbindung kappen.
+    _erste = asyncio.run(_reden({"token": "geheim-test-token", "prompt": "dauert"}, bis=2))
+    _lauf_id = _erste[0].get("lauf")
+    _weiter_ab = _erste[-1]["i"] + 1
+
+    check("jedes Ereignis trägt die Laufkennung",
+          all(e.get("lauf") for e in _erste), _erste)
+    check("jedes Ereignis trägt eine laufende Nummer",
+          [e["i"] for e in _erste] == [0, 1], [e.get("i") for e in _erste])
+
+    # 2. Der Server arbeitet weiter, obwohl niemand mehr zusieht.
+    time.sleep(0.3)
+    _l = main.runs.register.holen(_lauf_id)
+    check("der Lauf lebt nach dem Verbindungsabbruch weiter",
+          bool(_l) and not _l.fertig, _l and _l.ereignisse[-1:])
+
+    _tor.set()
+    for _ in range(300):
+        _l = main.runs.register.holen(_lauf_id)
+        if _l and _l.fertig:
+            break
+        time.sleep(0.01)
+    check("und läuft ohne Zuschauer zu Ende", bool(_l and _l.fertig), _l)
+
+    # 3. Wieder anhaengen - ab der Stelle, an der wir waren.
+    _rest = asyncio.run(_reden({"token": "geheim-test-token",
+                                "attach": _lauf_id, "from": _weiter_ab}, bis="done"))
+    check("beim erneuten Anhängen kommt der Rest",
+          [e["text"] for e in _rest][:1] == ["zweiter Schritt"], _rest)
+    check("und das Ergebnis kommt an",
+          _rest[-1]["type"] == "done" and _rest[-1]["ok"] is True, _rest[-1])
+    check("nichts wird doppelt geschickt",
+          all(e["i"] >= _weiter_ab for e in _rest), [e["i"] for e in _rest])
+
+    # 4. Ein Lauf, den es nicht gibt, wird benannt statt verschwiegen.
+    _ev = asyncio.run(_reden({"token": "geheim-test-token",
+                              "attach": "gibtsnicht", "from": 0}, bis=1))[0]
+    check("ein unbekannter Lauf wird als solcher gemeldet",
+          _ev["type"] == "error" and _ev.get("code") == "unbekannt", _ev)
+
+    # 5. Abbrechen muss wirklich abbrechen - der Lauf haengt ja nicht mehr an
+    #    der Verbindung, ein Wegsehen beendet ihn also nicht mehr.
+    _tor.clear()
+    _start = asyncio.run(_reden({"token": "geheim-test-token", "prompt": "dauert"}, bis=2))
+    _abbruch_id = _start[0]["lauf"]
+    _ende = asyncio.run(_reden({"token": "geheim-test-token",
+                                "cancel": _abbruch_id, "from": 0}, bis="done"))[-1]
+    check("Abbrechen beendet den Lauf wirklich",
+          _ende["type"] == "done" and _ende["ok"] is False, _ende)
+    check("und sagt, dass abgebrochen wurde", "bgebrochen" in _ende["text"], _ende)
+finally:
+    main.dispatch = _echtes_dispatch
+    _tor.set()
+    _server.should_exit = True
+    time.sleep(0.3)
+
+# Die Oberflaeche muss das auch benutzen - sonst ist die Faehigkeit da und
+# niemand ruft sie ab.
+# Der Aktualisierungsbefehl. Anlass war ein echter Fehlschlag: die Anleitung
+# begann mit 'cd' ins Quellverzeichnis, das ein frueherer Lauf geloescht
+# hatte. Die Zeile brach sofort ab, alles dahinter passierte nie - und weil
+# sofort wieder ein Prompt kam, sah es aus, als sei es gelaufen.
+_upd_pfad = main.BASE_DIR.parent / "deploy" / "update.sh"
+check("es gibt einen Aktualisierungsbefehl", _upd_pfad.exists(), str(_upd_pfad))
+if _upd_pfad.exists():
+    _upd = _upd_pfad.read_text()
+    check("er setzt kein vorhandenes Quellverzeichnis voraus",
+          'rm -rf "$SRC"' in _upd and "git clone" in _upd)
+    check("er faengt ein fehlendes git ab", "command -v git" in _upd)
+    check("er laeuft losgeloest vom Terminal weiter",
+          "setsid" in _upd and "nohup" in _upd)
+    check("er nennt den eingespielten Stand", "rev-parse --short HEAD" in _upd)
+    check("er sagt, wo man nachsieht", "tail -f" in _upd)
+    check("er besteht auf root statt halb zu laufen",
+          '"$(id -u)" -ne 0' in _upd)
+    _inst = (main.BASE_DIR.parent / "install.sh").read_text()
+    check("der Installer legt ihn als Befehl ab",
+          "/usr/local/bin/braunycode-update" in _inst)
+    # Im Betrieb passiert: zwei Aktualisierungen kurz nacheinander, beide
+    # liefen los. Zwei pip-Laeufe in dieselbe Umgebung koennen sie halb
+    # geschrieben hinterlassen - danach startet der Dienst nicht mehr.
+    check("zwei Installationen gleichzeitig sind ausgeschlossen",
+          "flock -n 9" in _inst and "flock 9" in _inst)
+    # Haette der root-Durchgang die Sperre, wartete sein eigener Kindprozess
+    # ewig auf sie.
+    check("die Sperre sitzt nach dem Neustart als unprivilegierter Benutzer",
+          _inst.index('exec sudo -u "$BRAUNY_USER"') < _inst.index('exec 9>"$LOCK"'))
+
+check("die Oberfläche merkt sich den laufenden Auftrag", "brauny.run" in js)
+check("sie hängt sich beim Zurückkommen wieder an",
+      "visibilitychange" in js and "wiederanhaengen" in js)
+check("sie zählt mit, wo sie war", "ev.i" in js and "attach" in js)
+check("der Abbruch geht an den Server, statt nur wegzusehen", "cancel:" in js)
+
+
+# ------------------------------------------- Prüfbefehle aus dem Projekt
+print("\n[46] Die Prüfbefehle des Projekts finden statt raten")
+
+import gates  # noqa: E402
+
+_NEXT = ('{"scripts":{"dev":"next dev","build":"next build",'
+         '"lint":"next lint","test":"jest","start":"next start"}}')
+
+_g = gates.ermitteln({"package.json": _NEXT, "package-lock.json": ""})
+check("package.json-Skripte werden gefunden", len(_g) == 3, [x.zeile() for x in _g])
+check("in der Reihenfolge lint, build, test",
+      [x.rolle for x in _g] == ["lint", "build", "test"], [x.rolle for x in _g])
+check("npm braucht 'run'", _g and _g[0].befehl == ["npm", "run", "lint"], _g[0].befehl)
+# Ein Dauerlaeufer als Pruefung wuerde die Sandbox bis zum Zeitlimit
+# blockieren - der Lauf saehe aus wie ein Absturz.
+check("'dev' und 'start' sind keine Prüfbefehle",
+      not any("dev" in x.befehl or "start" in x.befehl for x in _g), _g)
+
+check("yarn.lock ergibt yarn ohne 'run'",
+      gates.ermitteln({"package.json": _NEXT, "yarn.lock": ""})[0].befehl
+      == ["yarn", "lint"])
+check("pnpm-lock ergibt pnpm",
+      gates.ermitteln({"package.json": _NEXT, "pnpm-lock.yaml": ""})[0].befehl
+      == ["pnpm", "run", "lint"])
+
+# Genau der Fall aus der Anforderung: nur 'dev' vorhanden. Er darf daraus
+# NICHT 'alles grün' machen.
+check("nur ein dev-Skript ergibt keinen einzigen Prüfbefehl",
+      gates.ermitteln({"package.json": '{"scripts":{"dev":"next dev"}}'}) == [])
+check("kaputte package.json wirft nicht",
+      gates.ermitteln({"package.json": "{kaputt"}) == [])
+check("package.json ohne scripts wirft nicht",
+      gates.ermitteln({"package.json": '{"name":"x"}'}) == [])
+
+_g = gates.ermitteln({"Makefile": ".PHONY: all\nCC := gcc\n"
+                                  "lint:\n\truff check .\ntest:\n\tpytest\n"})
+check("Makefile-Ziele werden gefunden",
+      [x.rolle for x in _g] == ["lint", "test"], [x.zeile() for x in _g])
+check("eine Variablenzuweisung ist kein Ziel",
+      all("CC" not in x.befehl for x in _g), _g)
+
+_g = gates.ermitteln({"pyproject.toml": "[tool.ruff]\nline-length = 88\n",
+                      "test_a.py": "def test_x(): pass\n"})
+check("Python: ruff aus der Konfiguration",
+      _g and _g[0].befehl == ["ruff", "check", "."], _g)
+check("Python: pytest wegen echter Testdateien",
+      any(x.befehl == ["python", "-m", "pytest", "-q"] for x in _g), _g)
+# Ohne Testdateien wird kein pytest erfunden - ein Lauf ueber nichts ist
+# kein Beleg.
+check("ohne Testdateien kein erfundener pytest-Aufruf",
+      not any("pytest" in x.befehl for x in
+              gates.ermitteln({"pyproject.toml": "[tool.ruff]\n"})))
+
+check("ein Projekt ohne alles ergibt keine Prüfbefehle",
+      gates.ermitteln({"main.py": "print(1)\n"}) == [])
+
+# Die Sandbox mountet nur lesend, hat kein Netz, und node_modules wird
+# bewusst nie mitkopiert. 'npm run build' ist dort also grundsätzlich nicht
+# ausführbar. Das ehrlich zu melden ist der Punkt — ein an fehlenden Paketen
+# gescheiterter Build sieht sonst aus wie kaputter Code, und das Modell
+# "repariert" dann etwas, das nie kaputt war.
+check("node_modules steht auf der Ausschlussliste des Arbeitsverzeichnisses",
+      "node_modules" in ws_mod.SKIP_DIRS)
+check("JS-Prüfbefehle brauchen Fremdpakete",
+      gates.braucht_fremdpakete(gates.ermitteln({"package.json": _NEXT})))
+check("Python-Prüfbefehle nicht",
+      not gates.braucht_fremdpakete(
+          gates.ermitteln({"test_a.py": "def test_x(): pass\n"})))
+
+# --- Verdrahtung im Werkzeugkasten ---
+check("run_gates ist ein echtes Werkzeug", "run_gates" in tools.BASE_NAMES)
+check("und zählt als Prüfung", "run_gates" in tools.CHECKING)
+
+_laeufe = []
+
+async def _gates_sandbox(_d, _e=None, command=None):
+    _laeufe.append(command)
+    return 0, "ok"
+
+# Ein Python-Projekt: dessen Prüfbefehle laufen in dieser Sandbox wirklich.
+_w = ws_mod.Workspace(tempfile.mkdtemp())
+_w.write("pyproject.toml", "[tool.ruff]\nline-length = 88\n")
+_w.write("test_a.py", "def test_x():\n    assert True\n")
+_tb = tools.Toolbox(_w, run_sandbox=_gates_sandbox)
+_erg = asyncio.run(_tb.call("run_gates", {}))
+check("run_gates führt beide Befehle aus",
+      _laeufe == [["ruff", "check", "."], ["python", "-m", "pytest", "-q"]], _laeufe)
+check("und meldet grün", "Alle Prüfbefehle des Projekts bestanden." in _erg, _erg)
+check("grün wird auch gebucht", _tb.gates_gruen is True)
+
+# Halt beim ersten Fehlschlag: ein Testlauf hinter rotem Lint sagt nichts
+# Neues, kostet aber einen Containerstart.
+_laeufe.clear()
+
+async def _rotes_lint(_d, _e=None, command=None):
+    _laeufe.append(command)
+    return 1, "test_a.py:1:8: F821 Undefined name `foo`"
+
+_tb = tools.Toolbox(_w, run_sandbox=_rotes_lint)
+_erg = asyncio.run(_tb.call("run_gates", {}))
+check("nach rotem Lint wird nicht weitergeprüft", len(_laeufe) == 1, _laeufe)
+check("der Abbruch wird benannt", "nicht mehr ausgeführt" in _erg, _erg)
+check("rot wird nicht als grün gebucht", _tb.gates_gruen is False)
+# Der Befund aus dem Parser muss hier ankommen, nicht nur die Rohausgabe.
+check("der Lint-Befund hängt am Ergebnis", "Befund:" in _erg, _erg[-200:])
+
+# Kein Prüfbefehl auffindbar: ausdrücklich KEIN Erfolg.
+_w2 = ws_mod.Workspace(tempfile.mkdtemp())
+_w2.write("notiz.md", "# hallo\n")
+_tb2 = tools.Toolbox(_w2, run_sandbox=_gates_sandbox)
+_erg = asyncio.run(_tb2.call("run_gates", {}))
+check("ohne Prüfbefehle wird das gesagt", "Keine Prüfbefehle gefunden" in _erg, _erg)
+check("und ausdrücklich nicht als bestanden gewertet",
+      "KEIN bestandener Lauf" in _erg and _tb2.gates_gruen is False, _erg)
+
+# node_modules fehlt: ehrlich als ungeprüft melden, nicht als kaputt und
+# nicht als grün.
+_w3 = ws_mod.Workspace(tempfile.mkdtemp())
+_w3.write("package.json", _NEXT)
+_tb3 = tools.Toolbox(_w3, run_sandbox=_gates_sandbox)
+_erg = asyncio.run(_tb3.call("run_gates", {}))
+check("nicht ausführbare Prüfbefehle werden als solche gemeldet",
+      "node_modules" in _erg, _erg)
+check("mit dem Grund: kein Netz, nur lesend", "kein Netz" in _erg, _erg)
+check("und gelten ausdrücklich nicht als bestanden",
+      "NICHT bestanden" in _erg and _tb3.gates_gruen is False, _erg)
+check("der Bericht sagt, dass sie nicht liefen",
+      "nicht ausführbar" in _tb3.bericht()["gates"]["stand"], _tb3.bericht()["gates"])
+# Sie duerfen den Abschluss nicht blockieren - der Agent kann sie hier nicht
+# ausfuehren, zwei Ablehnungen aendern daran nichts.
+asyncio.run(_tb3.call("write_file", {"path": "app.js", "content": "const a = 1;\n"}))
+asyncio.run(_tb3.call("check_syntax", {"path": "app.js"}))
+check("unausführbare Gates blockieren finish nicht",
+      not asyncio.run(_tb3.call("finish", {"summary": "x"})).startswith("FEHLER"))
+
+# --- Die Sperre am Abschluss ---
+_w4 = ws_mod.Workspace(tempfile.mkdtemp())
+_w4.write("pyproject.toml", "[tool.ruff]\n")
+_w4.write("test_a.py", "def test_x():\n    assert True\n")
+_tb4 = tools.Toolbox(_w4, run_sandbox=_gates_sandbox)
+asyncio.run(_tb4.call("write_file", {"path": "app.py", "content": "a = 1\n"}))
+asyncio.run(_tb4.call("check_syntax", {"path": "app.py"}))
+check("check_syntax allein belegt die Datei", _tb4.unverified == set(), _tb4.unverified)
+_erg = asyncio.run(_tb4.call("finish", {"summary": "fertig"}))
+# Genau der Punkt aus der Anforderung: er darf nicht 'fertig' sagen, solange
+# Lint und Tests des Projekts nach seiner Aenderung nicht gelaufen sind.
+check("finish wird trotzdem abgewiesen — die Gates fehlen",
+      _erg.startswith("FEHLER") and "run_gates" in _erg, _erg[:160])
+_erg = asyncio.run(_tb4.call("run_gates", {}))
+check("nach grünen Gates geht finish durch",
+      not asyncio.run(_tb4.call("finish", {"summary": "x"})).startswith("FEHLER"))
+check("und der Lauf gilt als belegt", _tb4.verified is True)
+check("der Bericht sagt grün", _tb4.bericht()["gates"]["stand"] == "grün",
+      _tb4.bericht()["gates"])
+
+# Eine Aenderung NACH gruenen Gates entwertet sie wieder.
+asyncio.run(_tb4.call("write_file", {"path": "app.py", "content": "b = 2\n"}))
+check("eine neue Änderung entwertet den grünen Lauf",
+      _tb4.gates_gruen is False)
+
+# Ohne eigene Prüfbefehle darf die Sperre nicht greifen, sonst haengt jedes
+# einfache Projekt fest.
+_w5 = ws_mod.Workspace(tempfile.mkdtemp())
+_tb5 = tools.Toolbox(_w5, run_sandbox=_gates_sandbox)
+asyncio.run(_tb5.call("write_file", {"path": "a.py", "content": "x = 1\n"}))
+asyncio.run(_tb5.call("check_syntax", {"path": "a.py"}))
+check("ohne Prüfbefehle blockiert die Gate-Sperre nicht",
+      not asyncio.run(_tb5.call("finish", {"summary": "x"})).startswith("FEHLER"))
+
+# Die Skills müssen das Werkzeug auch kennen dürfen.
+for _name in ("neubau", "bugfix", "umbau", "tests", "web", "daten"):
+    _s = (main.BASE_DIR.parent / "skills" / f"{_name}.md").read_text()
+    check(f"Skill {_name} darf run_gates benutzen", "run_gates" in _s)
+
+check("der Systemtext nennt run_gates", "run_gates" in agentloop.SYSTEM_PROMPT)
+check("und verlangt, den Fehler zu beheben statt weiterzubauen",
+      "solange die vorige rot" in agentloop.SYSTEM_PROMPT)
+
+# Ohne Sandbox kann gar nichts ausgeführt werden. Dann darf die Sperre nicht
+# greifen — sie kostete nur zwei Runden und endete danach genauso.
+_w6 = ws_mod.Workspace(tempfile.mkdtemp())
+_w6.write("pyproject.toml", "[tool.ruff]\n")
+_w6.write("test_a.py", "def test_x(): pass\n")
+_tb6 = tools.Toolbox(_w6)          # bewusst ohne run_sandbox
+asyncio.run(_tb6.call("write_file", {"path": "a.py", "content": "x = 1\n"}))
+asyncio.run(_tb6.call("check_syntax", {"path": "a.py"}))
+check("ohne Sandbox blockiert die Gate-Sperre nicht",
+      not asyncio.run(_tb6.call("finish", {"summary": "x"})).startswith("FEHLER"))
+
+# Das Prüfskript selbst. Es hat einmal "Alles gruen" gemeldet, während
+# test_e2e.py rot war: '|| true' setzt PIPESTATUS zurück, die Abfrage danach
+# sah deshalb immer eine 0. Ein Prüfskript, das Rot verschluckt, ist
+# schlimmer als keines.
+_pruef = (main.BASE_DIR.parent / "pruefen.sh").read_text()
+check("das Prüfskript liest den Exit-Code nicht mehr über PIPESTATUS",
+      "${PIPESTATUS" not in _pruef, _pruef)
+check("es sammelt die Ausgabe erst ein und prüft dann den Status",
+      'ausgabe="$(python3 "$datei" 2>&1)"' in _pruef and "status=$?" in _pruef)
+check("und bricht bei einem Fehler wirklich ab",
+      'exit 1' in _pruef and '[ "$status" -eq 0 ] || fehler=1' in _pruef)
+
 
 print(f"\n=== {ok} bestanden, {fail} fehlgeschlagen ===")
 sys.exit(1 if fail else 0)

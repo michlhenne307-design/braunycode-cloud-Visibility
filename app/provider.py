@@ -12,6 +12,7 @@ umschaltbar ueber eine Zeile in der Konfiguration.
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 from dataclasses import dataclass, field
@@ -23,6 +24,52 @@ MODEL = os.environ.get("BRAUNY_MODEL", "qwen2.5-coder:7b")
 API_BASE = os.environ.get("BRAUNY_API_BASE", "").rstrip("/")
 API_KEY = os.environ.get("BRAUNY_API_KEY", "")
 TIMEOUT = int(os.environ.get("BRAUNY_ASK_TIMEOUT", "300"))
+
+# ---------------------------------------------------------- Abtastverhalten
+#
+# Bisher wurde gar keine Temperatur gesetzt - der Lauf uebernahm damit die
+# Vorgabe des Anbieters, bei den meisten Modellen um 0.8. Fuer einen Agenten,
+# der Werkzeuge mit exakten Argumenten aufrufen soll, ist das die falsche
+# Einstellung: dieselbe Aufgabe erzeugt zweimal verschiedene Aufrufe, und ein
+# Fehlschlag laesst sich nicht nachstellen.
+#
+# Eine pauschale Regel "immer 0" waere aber ebenso falsch. Wo mehrere
+# Loesungsvorschlaege verglichen werden sollen, ist Vielfalt genau der Zweck.
+# Deshalb zwei benannte Betriebsarten statt einer Zahl im Code.
+DETERMINISTISCH = "deterministisch"
+VIELFALT = "vielfalt"
+
+TEMPERATUREN = {DETERMINISTISCH: 0.0, VIELFALT: 0.8}
+
+# Ein fester Startwert macht auch die Reihenfolge gleicher
+# Wahrscheinlichkeiten reproduzierbar. Bei Ollama ist er unbedenklich, weil
+# lokal und bekannt. Fremde OpenAI-kompatible Endpunkte kennen 'seed' nicht
+# alle und weisen unbekannte Felder teils zurueck - dort nur auf ausdrueckliche
+# Ansage. Das ist der Unterschied zwischen "reproduzierbar" und "kaputt".
+def _seed_lesen():
+    """Einmal beim Laden auswerten, nicht bei jedem Aufruf.
+
+    Ein Tippfehler in BRAUNY_SEED wuerde sonst jeden einzelnen Modellaufruf
+    mit einem ValueError sprengen - und zwar mitten im Lauf, weit weg von der
+    Ursache. Hier faellt er sofort auf und wird ignoriert statt weitergereicht.
+    """
+    roh = os.environ.get("BRAUNY_SEED", "").strip()
+    if not roh:
+        return None
+    try:
+        return int(roh)
+    except ValueError:
+        import logging
+        logging.getLogger(__name__).warning(
+            "BRAUNY_SEED=%r ist keine ganze Zahl — wird ignoriert.", roh)
+        return None
+
+
+SEED = _seed_lesen()
+
+
+def _temperatur(policy: str) -> float:
+    return TEMPERATUREN.get(policy, TEMPERATUREN[DETERMINISTISCH])
 
 
 @dataclass
@@ -36,6 +83,11 @@ class ToolCall:
 class Reply:
     text: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
+    # Was der Aufruf gekostet hat. Ohne Zahlen bleibt "es ist langsam" eine
+    # Meinung; mit ihnen sieht man, ob die Zeit ins Einlesen des Prompts, ins
+    # Erzeugen oder ins Nachladen des Modells geht - drei ganz verschiedene
+    # Probleme mit drei ganz verschiedenen Loesungen.
+    messung: dict = field(default_factory=dict)
 
 
 class ProviderError(RuntimeError):
@@ -56,39 +108,273 @@ def _parse_arguments(raw) -> dict:
 
 
 # ------------------------------------------------------------------ Ollama
+#
+# Hier wird bewusst NICHT das Python-Paket 'ollama' benutzt, sondern direkt
+# dessen HTTP-Schnittstelle. Der Grund ist ein echter Abbruch aus dem Betrieb:
+#
+#   ValidationError: 1 validation error for Message
+#   tool_calls.0.function.arguments
+#     Input should be a valid dictionary
+#     [type=dict_type, input_value='{}', input_type=str]
+#
+# Das Paket legt die Antwort in ein pydantic-Modell, das fuer 'arguments' ein
+# dict verlangt. qwen3-coder liefert an dieser Stelle einen JSON-*Text*. Das
+# ist bei Werkzeugaufrufen verbreitet - die OpenAI-Schnittstelle gibt sie
+# sogar immer so zurueck, weshalb _parse_arguments beide Formen kennt.
+#
+# Nur kam _parse_arguments nie zum Zug: das Paket bricht schon beim Einlesen
+# ab. Die Absicherung sass hinter einer Mauer. Ueber HTTP kommt die Antwort
+# als gewoehnliches JSON an, und die Behandlung greift wieder.
+#
+# Der Preis dafuer ist gering: /api/chat ist ein einzelner POST, und wir
+# bleiben unabhaengig davon, wie streng ein Client-Paket kuenftige Antworten
+# typisiert.
 
-def _chat_ollama(messages, tools):
-    import ollama
+def _ollama_host() -> str:
+    """Adresse des Ollama-Dienstes, in der Schreibweise von ollama selbst.
 
-    kwargs = {"model": MODEL, "messages": messages}
+    OLLAMA_HOST wird dort auch ohne Schema angegeben ('127.0.0.1:11434').
+    """
+    roh = os.environ.get("OLLAMA_HOST", "").strip() or "127.0.0.1:11434"
+    if not roh.startswith(("http://", "https://")):
+        roh = "http://" + roh
+    return roh.rstrip("/")
+
+
+OLLAMA_HOST = _ollama_host()
+
+# Ein grosses Modell muss beim ersten Aufruf erst von der Platte in den
+# Speicher - bei 19 GB dauert das Minuten, und die Erzeugung auf CPU danach
+# ebenfalls. Ein knapper Zeitwert wuerde genau den ersten Lauf abwuergen, der
+# ohnehin der schwierigste ist.
+MODELL_TIMEOUT = float(os.environ.get("BRAUNY_MODEL_TIMEOUT", "900"))
+
+# Wie lange Ollama das Modell nach einem Aufruf im Speicher behaelt. Die
+# Vorgabe dort sind fuenf Minuten. In einer Werkzeugschleife vergeht zwischen
+# zwei Modellaufrufen aber leicht mehr - ein Test laeuft, ein Container
+# startet -, und dann werden 19 GB neu von der Platte geladen. Auf dieser
+# Maschine ist das der teuerste einzelne Posten ueberhaupt.
+KEEP_ALIVE = os.environ.get("BRAUNY_KEEP_ALIVE", "2h")
+
+def _ganzzahl(name: str, vorgabe: int) -> int:
+    """Wie _seed_lesen: einmal beim Laden pruefen statt bei jedem Aufruf
+    abzustuerzen."""
+    roh = os.environ.get(name, "").strip()
+    if not roh:
+        return vorgabe
+    try:
+        wert = int(roh)
+    except ValueError:
+        import logging
+        logging.getLogger(__name__).warning(
+            "%s=%r ist keine ganze Zahl - es gilt %d.", name, roh, vorgabe)
+        return vorgabe
+    return wert if wert > 0 else vorgabe
+
+NUM_CTX = _ganzzahl("BRAUNY_NUM_CTX", 8192)
+NUM_PREDICT = _ganzzahl("BRAUNY_NUM_PREDICT", 1024)
+
+
+def _ollama_messages(messages) -> list[dict]:
+    """Den Verlauf in die Form bringen, die Ollama erwartet.
+
+    Der Agent baut seinen Verlauf im OpenAI-Format - das ist richtig so, denn
+    dasselbe Gespraech soll auch an eine fremde API gehen koennen. Nur passt
+    dieses Format an zwei Stellen nicht auf /api/chat:
+
+      arguments   OpenAI verlangt einen JSON-TEXT, Ollama ein OBJEKT. Wird ein
+                  Text geschickt, antwortet Ollama mit 400.
+      Zusatzfelder id, type und tool_call_id kennt Ollama nicht; der Name
+                  eines Werkzeugergebnisses heisst dort tool_name.
+
+    Das ist genau die Gegenrichtung des Fehlers, den _parse_arguments
+    behandelt: dort kam ein Text, wo ein Objekt erwartet wurde. Beide Seiten
+    der Uebersetzung gehoeren an dieselbe Stelle - die Grenze zum Anbieter.
+    """
+    raus = []
+    for nachricht in messages:
+        rolle = nachricht.get("role", "user")
+        sauber: dict = {"role": rolle, "content": nachricht.get("content", "") or ""}
+
+        if rolle == "tool":
+            # Ollama fuehrt den Werkzeugnamen unter 'tool_name'.
+            name = nachricht.get("tool_name") or nachricht.get("name")
+            if name:
+                sauber["tool_name"] = name
+
+        aufrufe = nachricht.get("tool_calls")
+        if aufrufe:
+            sauber["tool_calls"] = [
+                {"function": {
+                    "name": (a.get("function") or {}).get("name", ""),
+                    "arguments": _parse_arguments((a.get("function") or {}).get("arguments")),
+                }}
+                for a in aufrufe
+            ]
+        raus.append(sauber)
+    return raus
+
+
+def _ollama_optionen(policy: str) -> dict:
+    """Die Stellschrauben, die auf einer CPU-Maschine ueber Minuten entscheiden.
+
+    num_ctx  Ollama nimmt ohne Angabe 4096 Token. Systemanweisung plus
+             Werkzeugbeschreibungen plus wachsender Verlauf sprengen das
+             schnell - dann wird der Anfang abgeschnitten, und mit ihm die
+             Anweisung, an die der Agent sich halten soll. Zu gross ist
+             allerdings auch schaedlich: der Zwischenspeicher waechst
+             linear mit und frisst genau den Speicher, den das Modell
+             braucht.
+    num_predict  Deckel gegen Ausreisser. Ein Werkzeugaufruf ist kurz; wer
+             hier zweitausend Token schreibt, hat die Aufgabe ohnehin
+             missverstanden, und auf CPU kostet jedes davon Sekunden.
+    """
+    optionen = {
+        "temperature": _temperatur(policy),
+        "num_ctx": NUM_CTX,
+        "num_predict": NUM_PREDICT,
+    }
+    if SEED is not None:
+        # Lokal und bekannt - hier ist ein fester Startwert unbedenklich.
+        optionen["seed"] = SEED
+    return optionen
+
+
+def _fehler_aus_antwort(status: int, roh) -> ProviderError:
+    """Ollama schreibt den Grund einer Ablehnung in den Rumpf.
+
+    Ohne ihn steht in der Oberflaeche nur "400 Bad Request" - wahr, aber
+    unbrauchbar. Genau daran ist hier schon einmal eine Stunde verlorengegangen.
+    """
+    grund = ""
+    try:
+        grund = str(json.loads(roh).get("error", "")).strip()
+    except Exception:
+        grund = str(roh)[:400].strip()
+    return ProviderError(f"Ollama lehnt die Anfrage ab (HTTP {status})"
+                         + (f": {grund}" if grund else "."))
+
+
+def _chat_ollama(messages, tools, policy=DETERMINISTISCH, on_text=None):
+    """on_text muss GEWOEHNLICH sein, nicht asynchron.
+
+    Dieser Aufruf laeuft in einem Arbeitsfaden ohne Ereignisloop - eine
+    Koroutine liesse sich hier gar nicht abwarten. Uebergibt jemand trotzdem
+    eine, entstuende bei jedem Textstueck ein Objekt, das niemand ausfuehrt:
+    kein Fehler, keine Ausgabe, nur eine RuntimeWarning irgendwo im Log. Genau
+    das ist beim Bauen des Ende-zu-Ende-Tests passiert.
+
+    Deshalb lieber sofort und laut.
+    """
+    import httpx
+
+    if on_text is not None and inspect.iscoroutinefunction(on_text):
+        raise ProviderError(
+            "on_text muss eine gewoehnliche Funktion sein, keine Koroutine - "
+            "der Modellaufruf laeuft in einem Arbeitsfaden ohne Ereignisloop. "
+            "Die Bruecke dorthin baut main.model_chat.")
+
+    nutzlast = {
+        "model": MODEL,
+        "messages": _ollama_messages(messages),
+        "options": _ollama_optionen(policy),
+        # Immer stroemen. Nicht wegen der Geschwindigkeit - die aendert sich
+        # dadurch nicht -, sondern weil sonst minutenlang nichts zu sehen ist
+        # und niemand unterscheiden kann, ob gerechnet wird oder etwas haengt.
+        "stream": True,
+        # Der wichtigste Wert auf dieser Maschine. Ohne ihn wirft Ollama das
+        # Modell nach fuenf Minuten Ruhe aus dem Speicher - und laedt beim
+        # naechsten Schritt 19 GB von der Platte nach. Genau das passiert in
+        # einer Werkzeugschleife staendig, weil zwischen zwei Modellaufrufen
+        # ein Test laufen kann.
+        "keep_alive": KEEP_ALIVE,
+    }
     if tools:
-        kwargs["tools"] = tools
-    response = ollama.chat(**kwargs)
+        nutzlast["tools"] = tools
 
-    message = response["message"] if isinstance(response, dict) else response.message
-    text = (message.get("content") if isinstance(message, dict)
-            else getattr(message, "content", "")) or ""
-    raw_calls = (message.get("tool_calls") if isinstance(message, dict)
-                 else getattr(message, "tool_calls", None)) or []
+    text_teile: list[str] = []
+    roh_calls: list[dict] = []
+    messung: dict = {}
+
+    try:
+        with httpx.stream("POST", f"{OLLAMA_HOST}/api/chat", json=nutzlast,
+                          timeout=httpx.Timeout(MODELL_TIMEOUT, connect=10.0)) as antwort:
+            if antwort.status_code >= 400:
+                antwort.read()
+                raise _fehler_aus_antwort(antwort.status_code, antwort.text)
+
+            for zeile in antwort.iter_lines():
+                zeile = zeile.strip()
+                if not zeile:
+                    continue
+                try:
+                    stueck = json.loads(zeile)
+                except json.JSONDecodeError:
+                    # Eine kaputte Zeile mitten im Strom ist kein Grund, den
+                    # ganzen bereits erzeugten Text wegzuwerfen.
+                    continue
+
+                if stueck.get("error"):
+                    raise ProviderError(f"Ollama meldet: {stueck['error']}")
+
+                nachricht = stueck.get("message") or {}
+                neu = nachricht.get("content") or ""
+                if neu:
+                    text_teile.append(neu)
+                    if on_text is not None:
+                        try:
+                            on_text(neu)
+                        except Exception:
+                            # Ein Fehler beim Anzeigen darf den Modellaufruf
+                            # nicht mitreissen.
+                            pass
+                roh_calls.extend(nachricht.get("tool_calls") or [])
+
+                if stueck.get("done"):
+                    messung = {
+                        "prompt_token": stueck.get("prompt_eval_count", 0),
+                        "prompt_s": round(stueck.get("prompt_eval_duration", 0) / 1e9, 2),
+                        "antwort_token": stueck.get("eval_count", 0),
+                        "antwort_s": round(stueck.get("eval_duration", 0) / 1e9, 2),
+                        "gesamt_s": round(stueck.get("total_duration", 0) / 1e9, 2),
+                        "geladen_s": round(stueck.get("load_duration", 0) / 1e9, 2),
+                    }
+    except ProviderError:
+        raise
+    except httpx.HTTPError as exc:
+        raise ProviderError(f"Ollama nicht erreichbar: {exc}") from exc
+
+    text = "".join(text_teile)
 
     calls = []
-    for item in raw_calls:
-        function = item["function"] if isinstance(item, dict) else item.function
-        name = function["name"] if isinstance(function, dict) else function.name
-        args = (function.get("arguments") if isinstance(function, dict)
-                else getattr(function, "arguments", {}))
-        calls.append(ToolCall(name=name, arguments=_parse_arguments(args)))
-    return Reply(text=text, tool_calls=calls)
+    for item in roh_calls:
+        function = (item or {}).get("function") or {}
+        name = function.get("name") or ""
+        # Ein Aufruf ohne Namen ist nicht ausfuehrbar. Ihn stillschweigend
+        # zu uebergehen ist richtiger, als spaeter ueber einen leeren
+        # Werkzeugnamen zu stolpern.
+        if not name:
+            continue
+        calls.append(ToolCall(
+            name=name,
+            arguments=_parse_arguments(function.get("arguments")),
+        ))
+    return Reply(text=text, tool_calls=calls, messung=messung)
 
 
 # ------------------------------------------------------------------ OpenAI-kompatibel
 
-def _chat_openai(messages, tools):
+def _chat_openai(messages, tools, policy=DETERMINISTISCH):
     import httpx
 
     if not API_BASE:
         raise ProviderError("BRAUNY_API_BASE ist nicht gesetzt.")
-    payload = {"model": MODEL, "messages": messages}
+    payload = {"model": MODEL, "messages": messages,
+               "temperature": _temperatur(policy)}
+    if SEED is not None:
+        # Nur auf Ansage: nicht jeder Endpunkt kennt 'seed', und manche
+        # weisen unbekannte Felder mit 400 zurueck.
+        payload["seed"] = SEED
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
@@ -122,12 +408,17 @@ def _chat_openai(messages, tools):
 
 # ------------------------------------------------------------------ Fassade
 
-def chat(messages, tools=None) -> Reply:
-    """Blockierender Modellaufruf. Aufrufer legen ihn in einen Thread."""
+def chat(messages, tools=None, policy=DETERMINISTISCH, on_text=None) -> Reply:
+    """Blockierender Modellaufruf. Aufrufer legen ihn in einen Thread.
+
+    policy waehlt das Abtastverhalten: DETERMINISTISCH fuer alles, was genau
+    einmal richtig sein muss - Werkzeugaufrufe, Plaene, Extraktion. VIELFALT
+    nur dort, wo mehrere Vorschlaege verglichen werden sollen.
+    """
     if PROVIDER == "ollama":
-        return _chat_ollama(messages, tools)
+        return _chat_ollama(messages, tools, policy, on_text=on_text)
     if PROVIDER in OPENAI_ALIASES:
-        return _chat_openai(messages, tools)
+        return _chat_openai(messages, tools, policy)
     raise ProviderError(f"Unbekannter Anbieter: {PROVIDER!r}")
 
 
@@ -140,9 +431,12 @@ def health() -> tuple[bool, str]:
     genau so wird es auch gemeldet.
     """
     if PROVIDER == "ollama":
+        # Auch hier ueber HTTP, aus demselben Grund wie bei _chat_ollama und
+        # damit /healthz und der Modellaufruf dieselbe Verbindung pruefen.
         try:
-            import ollama
-            ollama.list()
+            import httpx
+            antwort = httpx.get(f"{OLLAMA_HOST}/api/tags", timeout=5.0)
+            antwort.raise_for_status()
             return True, "ok"
         except Exception as exc:
             return False, f"fehler: {exc}"

@@ -1,9 +1,13 @@
 ---
 name: umbau
 beschreibung: Bestehenden Code umbauen, ohne Verhalten zu ändern
-ausloeser: umbau, umbauen, refactor, refactoring, aufräumen, vereinfachen, umstrukturieren, zerlegen, extrahiere
-werkzeuge: list_files, glob, read_file, search, outline, symbol_info, edit_file, write_file, move_file, rename_symbol, check_syntax, run_python, run_command, undo, finish
+ausloeser: umbau, umbauen, refactor, refactoring, aufräumen, vereinfachen, umstrukturieren, zerlegen, extrahiere, umbenennen, benenne, umbenennung, verschiebe, verschieben, auslagern, zusammenfassen, entrümpeln, lesbarer
+werkzeuge: list_files, glob, read_file, search, outline, symbol_info, edit_file, write_file, move_file, rename_symbol, check_syntax, affected_tests, run_python, run_command, run_gates, undo, finish, git_push
 ---
+0. **Lies höchstens drei, vier Dateien, dann fang an.** Ein fremdes
+   Projekt versteht man beim Ändern, nicht beim Suchen. Wer nach zehn
+   Suchläufen noch keine Zeile angefasst hat, sucht nicht mehr — er
+   weicht aus.
 Ein Umbau ändert die Form, nicht das Verhalten. Wenn sich das Verhalten ändert,
 ist es kein Umbau — dann sag das.
 

@@ -14,11 +14,15 @@ Alle drei Faelle werden erkannt und benannt statt beschoenigt.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
+import logging
 import os
 import time
 
+import memory
 import provider
+import readiness
 import tools
 
 # Wie viele Werkzeugrunden ein Auftrag hoechstens bekommt. Jede Runde ist ein
@@ -38,9 +42,23 @@ SYSTEM_PROMPT = (
     "read_file), bevor du etwas aenderst.\n"
     "2. Aendere mit edit_file: nur den Ausschnitt angeben, der sich aendert. "
     "write_file ist NUR fuer neue Dateien oder vollstaendigen Ersatz.\n"
-    "3. Pruefe mit check_syntax, dann mit run_python oder run_command.\n"
-    "4. Erst wenn die Aufgabe erledigt ist, rufe finish mit einer kurzen "
-    "Zusammenfassung auf.\n\n"
+    "3. Pruefe in dieser Reihenfolge, vom Billigen zum Teuren:\n"
+    "   a) check_syntax auf jeder geaenderten Datei. Das kostet Millisekunden "
+    "und faengt den haeufigsten Fehler ab. Es gilt fuer Python UND fuer "
+    "JavaScript/TypeScript.\n"
+    "   b) run_gates - das fuehrt die Pruefbefehle aus, die das Projekt "
+    "SELBST mitbringt: Lint, Typcheck, Build, Tests aus package.json, "
+    "Makefile oder pyproject.toml. Rate nicht, ob 'npm test' oder 'pytest' "
+    "richtig ist; run_gates sieht nach, was es wirklich gibt.\n"
+    "   c) Bei Python zusaetzlich affected_tests - das nennt die Tests, die "
+    "deine Aenderung ueber Importe erreichen. Genau die laesst du mit "
+    "run_command laufen, statt die ganze Suite zu fahren. Gibt es keine "
+    "Tests, nimm run_python.\n"
+    "4. Schlaegt eine Pruefung fehl: behebe GENAU diesen Fehler und pruefe "
+    "erneut. Nicht die naechste Teilaufgabe anfangen, solange die vorige rot "
+    "ist. Nicht drumherum bauen, nicht die Pruefung umgehen.\n"
+    "5. Erst wenn die Aufgabe erledigt und die Pruefung gruen ist, rufe "
+    "finish mit einer kurzen Zusammenfassung auf.\n\n"
     "Regeln:\n"
     "- Pro Antwort genau ein Werkzeugaufruf, kein Fliesstext daneben.\n"
     "- Rate nie den Inhalt einer Datei, lies sie.\n"
@@ -53,7 +71,19 @@ SYSTEM_PROMPT = (
     "- Wiederhole keinen Aufruf, der schon dasselbe Ergebnis geliefert hat.\n"
     "- Der Code laeuft ohne Netzwerk, ohne Eingabe (kein input()) und nur mit "
     "der Standardbibliothek. Er muss von selbst terminieren.\n"
-    "- Behaupte in finish nichts, was du nicht ausgefuehrt hast."
+    "- Behaupte in finish nichts, was du nicht ausgefuehrt hast.\n\n"
+    "- Arbeite in kleinen Schritten, die je fuer sich laufen. Eine Aenderung "
+    "ueber zehn Dateien, die zusammen nie geprueft wurde, ist kein Fortschritt "
+    "- sie ist ein Haufen, den niemand mehr auseinanderbekommt.\n"
+    "- Kannst du etwas nicht pruefen, sag das im Abschluss ausdruecklich. "
+    "'Nicht geprueft' ist eine brauchbare Antwort, 'fertig' ohne Beleg nicht.\n\n"
+    "Abschluss:\n"
+    "finish wird abgewiesen, solange du nach deiner letzten Aenderung keine "
+    "Pruefung bestanden hast. Das ist keine Ermahnung, sondern eine Sperre im "
+    "Werkzeug - Zureden hilft nicht, nur check_syntax und ein erfolgreicher "
+    "Lauf mit run_gates, run_python oder run_command. Bringt das Projekt "
+    "eigene Pruefbefehle mit, wird finish ausserdem abgewiesen, solange "
+    "run_gates nach deiner letzten Aenderung nicht gruen war."
 )
 
 NUDGE = (
@@ -71,6 +101,48 @@ def _summarize(name: str, arguments: dict) -> str:
             text = text[:60] + "…"
         parts.append(f"{key}={text}")
     return f"{name}({', '.join(parts)})"
+
+
+# Wie oft ein Lebenszeichen kommt, waehrend das Modell rechnet.
+PULS_S = float(os.environ.get("BRAUNY_PULS", "3"))
+
+# Wie viele Ausgabezeilen eines einzelnen Laufs in die Oberflaeche gehen.
+# Mehr sieht sich ohnehin niemand an, und ein durchgehendes Programm darf
+# nicht das Ereignisbudget des ganzen Auftrags verbrauchen.
+MAX_AUSGABE_ZEILEN = int(os.environ.get("BRAUNY_MAX_AUSGABE", "200"))
+
+# Nach so vielen Runden ohne eine einzige Aenderung wird deutlich nachgefasst,
+# nach doppelt so vielen abgebrochen.
+#
+# Anlass ist ein echter Lauf: dreissig Runden, ausschliesslich 'grep', keine
+# geschriebene Zeile. Das Modell hat sich im Lesen verlaufen - jede einzelne
+# Suche war fuer sich plausibel, zusammen waren es dreissig Minuten fuer
+# nichts. Ein Agent, der nur liest, ist kein Agent.
+#
+# Die Grenze ist mit Absicht nicht klein: ein fremdes Projekt zu verstehen
+# braucht ein paar Blicke. Sie greift erst, wenn aus Schauen Suchen ohne Ende
+# geworden ist.
+LESE_GRENZE = int(os.environ.get("BRAUNY_LESE_GRENZE", "8"))
+
+
+async def _mit_puls(send, aufgabe, schritt):
+    """Auf das Modell warten und dabei regelmaessig zeigen, dass es laeuft.
+
+    Auf einer CPU-Maschine vergehen zwischen Auftrag und erstem Zeichen leicht
+    Minuten. Ohne Lebenszeichen ist das von einem Absturz nicht zu
+    unterscheiden - und wer nicht unterscheiden kann, drueckt irgendwann auf
+    Abbrechen.
+
+    shield ist noetig, damit die Zeitueberschreitung des Wartens nicht den
+    Modellaufruf selbst abbricht: hier laeuft nur die Uhr ab, nicht die Arbeit.
+    """
+    begonnen = time.monotonic()
+    while True:
+        try:
+            return await asyncio.wait_for(asyncio.shield(aufgabe), timeout=PULS_S)
+        except asyncio.TimeoutError:
+            await send("puls", "", schritt=schritt,
+                       sekunden=round(time.monotonic() - begonnen, 1))
 
 
 def _assistant_message(reply, calls) -> dict:
@@ -114,7 +186,7 @@ def trim(messages: list[dict], limit: int = MAX_HISTORY) -> list[dict]:
 
 
 async def run_tool_agent(send, task, *, chat_fn, toolbox, max_steps=MAX_STEPS,
-                         context="", skill=None):
+                         context="", skill=None, symbole=()):
     """Laesst das Modell mit Werkzeugen am Projekt arbeiten.
 
     chat_fn(messages, schema) -> provider.Reply ist hineingereicht, damit die
@@ -126,11 +198,30 @@ async def run_tool_agent(send, task, *, chat_fn, toolbox, max_steps=MAX_STEPS,
       "failed"   - Schrittgrenze oder Modellfehler, 'done' wurde gesendet
       "no-tools" - das Modell kann keine Werkzeuge; KEIN 'done' gesendet,
                    der Aufrufer soll auf den einfachen Weg wechseln
+      "clarify"  - der Auftrag nennt etwas, das es nicht gibt; nichts wurde
+                   angefasst, die Rueckfragen sind gesendet
     """
     start = time.monotonic()
 
     def elapsed():
         return round(time.monotonic() - start, 1)
+
+    # Bereitschaft VOR der ersten Aenderung. Der teuerste Fehler ist nicht der
+    # Absturz, sondern die saubere Arbeit am falschen Ziel: nennt der Auftrag
+    # eine Datei, die es nicht gibt, waehlt das Modell sonst eine aehnliche und
+    # aendert ueberzeugend die falsche. Hinterher stimmt jede Pruefung.
+    urteil = readiness.pruefen(task, toolbox.ws.list_files(), symbole)
+    if not urteil.darf_starten:
+        await send("error", urteil.text())
+        await send("done", "Rückfrage nötig — es wurde nichts geändert.",
+                   ok=False, exit=-1, attempts=0, seconds=elapsed(),
+                   verified=False)
+        return "clarify"
+    if urteil.annahmen:
+        # Nicht blockieren, aber auch nicht verschweigen: die Annahme steht
+        # sichtbar da UND im Auftrag, damit das Modell dieselbe trifft.
+        await send("status", urteil.text())
+        task = f"{task}\n\n{urteil.text()}"
 
     system = SYSTEM_PROMPT
     if skill is not None:
@@ -151,17 +242,34 @@ async def run_tool_agent(send, task, *, chat_fn, toolbox, max_steps=MAX_STEPS,
     schema = toolbox.schema()
     repeats: dict[str, int] = {}
     idle_rounds = 0
+    nur_gelesen = 0    # Runden hintereinander ohne jede Aenderung
     executed = False   # wurde run_python jemals erfolgreich ausgefuehrt
 
+    # Nimmt dieser Aufrufer Textstuecke entgegen, waehrend sie entstehen?
+    # Tests reichen eigene, einfachere chat_fn herein - die duerfen davon
+    # nichts wissen muessen.
+    nimmt_strom = "on_text" in inspect.signature(chat_fn).parameters
+
     for step in range(1, max_steps + 1):
+        async def _strom(stueck: str, _s=step):
+            await send("delta", stueck, step=_s)
+
         try:
-            reply = await chat_fn(messages, schema)
+            if nimmt_strom:
+                aufgabe = asyncio.ensure_future(
+                    chat_fn(messages, schema, on_text=_strom))
+            else:
+                aufgabe = asyncio.ensure_future(chat_fn(messages, schema))
+            reply = await _mit_puls(send, aufgabe, step)
         except Exception as exc:
             await send("error", f"Modellaufruf fehlgeschlagen: "
                                 f"{type(exc).__name__}: {exc}")
             await send("done", "Abgebrochen.", ok=False, exit=-1,
                        attempts=step, seconds=elapsed())
             return "failed"
+
+        if getattr(reply, "messung", None):
+            await send("messung", "", step=step, **reply.messung)
 
         calls = list(reply.tool_calls)
         if not calls:
@@ -216,8 +324,23 @@ async def run_tool_agent(send, task, *, chat_fn, toolbox, max_steps=MAX_STEPS,
                 except Exception:
                     pass
             elif call.name in ("run_python", "run_command"):
-                for line in result.splitlines():
+                # Deckel je Aufruf. Im Betrieb passiert: das Modell baut ein
+                # Menue mit input(), in der Sandbox kommt keine Eingabe, die
+                # Schleife dreht endlos und schreibt tausende Zeilen. Damit war
+                # das Ereignisbudget des ganzen Laufs aufgebraucht und der Lauf
+                # brach ab - wegen der AUSGABE, nicht wegen des Fehlers.
+                #
+                # Gekuerzt wird mit Ansage. Eine still abgeschnittene Ausgabe
+                # ist schlimmer als eine lange: dann sucht man den Fehler in
+                # einem Protokoll, das gar nicht vollstaendig ist.
+                zeilen = result.splitlines()
+                for line in zeilen[:MAX_AUSGABE_ZEILEN]:
                     await send("sandbox", line)
+                if len(zeilen) > MAX_AUSGABE_ZEILEN:
+                    await send("sandbox",
+                               f"… {len(zeilen) - MAX_AUSGABE_ZEILEN} weitere Zeilen "
+                               "abgeschnitten. Laeuft das Programm in einer "
+                               "Endlosschleife oder wartet es auf eine Eingabe?")
                 executed = executed or result.startswith(
                     ("Lauf erfolgreich", "Befehl erfolgreich"))
             elif call.name in ("fetch_url", "git_push") and not failed:
@@ -237,6 +360,36 @@ async def run_tool_agent(send, task, *, chat_fn, toolbox, max_steps=MAX_STEPS,
                     f"{repeats[fingerprint]}-mal aufgerufen. Das Ergebnis "
                     "aendert sich nicht. Mach etwas anderes oder rufe finish auf."})
                 repeats[fingerprint] = 0
+
+        # Nur gelesen und nichts getan? Einmal deutlich nachfassen, dann
+        # abbrechen. Sonst laeuft die Schrittgrenze ab, ohne dass jemand
+        # erfaehrt, WARUM nichts entstanden ist.
+        namen = {c.name for c in calls}
+        if namen & (tools.MODIFYING | {"finish"}):
+            nur_gelesen = 0
+        else:
+            nur_gelesen += 1
+            if nur_gelesen == LESE_GRENZE:
+                await send("status",
+                           f"{nur_gelesen} Runden ohne eine Änderung — "
+                           "ich fasse nach.")
+                messages.append({"role": "user", "content":
+                    f"Du hast jetzt {nur_gelesen} Runden lang nur gelesen und "
+                    "gesucht, ohne eine einzige Datei zu ändern. Das reicht. "
+                    "Entscheide dich jetzt: schreibe die erste Datei oder "
+                    "ändere die erste Stelle — auch wenn du noch nicht alles "
+                    "weißt. Ein erster Schritt, der sich korrigieren lässt, "
+                    "ist mehr wert als weitere Suche. Kommst du wirklich nicht "
+                    "weiter, rufe finish auf und schreibe hinein, was dir "
+                    "fehlt."})
+            elif nur_gelesen >= LESE_GRENZE * 2:
+                await send("done",
+                           f"Nach {nur_gelesen} Runden ohne eine einzige "
+                           "Änderung abgebrochen. Der Auftrag war "
+                           "wahrscheinlich zu unbestimmt — sag genauer, welche "
+                           "Datei oder welcher Bereich geändert werden soll.",
+                           ok=False, exit=-1, attempts=step, seconds=elapsed())
+                return "failed"
 
         messages = trim(messages)
 
@@ -263,13 +416,76 @@ async def _finish(send, task, toolbox, step, seconds, executed) -> str:
     if getattr(toolbox, "pushed", None):
         await send("status", "Nach außen übertragen: " +
                    "; ".join(toolbox.pushed))
-    if not executed:
-        # Das Modell behauptet Erfolg, ohne den Code laufen gelassen zu haben.
-        # Das gehoert dazugesagt, statt es als geprueft zu verkaufen.
+
+    # Der Beleg stammt aus der Buchfuehrung der Toolbox, nicht aus dem Text
+    # des Modells. Faellt sie aus (aeltere Toolbox im Test), wird auf das
+    # gröbere 'executed' zurueckgefallen, statt nichts zu melden.
+    bericht = toolbox.bericht() if hasattr(toolbox, "bericht") else None
+    verified = bericht["verifiziert"] if bericht else executed
+
+    if bericht and bericht["belege"]:
+        await send("status", "Belegt durch: " + "; ".join(
+            f"Schritt {b['nr']} ({b['werkzeug']}) → {', '.join(b['abgedeckt'])}"
+            for b in bericht["belege"]))
+    if bericht and bericht.get("ohne_pruefmoeglichkeit"):
+        # Kein Fehler, aber eine Luecke, die niemand stillschweigend
+        # hinnehmen soll: eine Textdatei laesst sich nicht ausfuehren.
+        await send("status", "Nicht durch Ausführung belegbar: " +
+                   ", ".join(bericht["ohne_pruefmoeglichkeit"]) +
+                   " — dafür gibt es keine Prüfung, nur das Diff.")
+    if bericht and bericht["ungeprueft"]:
+        # Der Lauf ist durch die Ablehnungsgrenze gerutscht. Das ist der eine
+        # Fall, in dem 'fertig' und 'ungeprueft' zusammen auftreten - und
+        # genau dann muss es dastehen.
+        await send("error", "Ungeprüft geblieben: " +
+                   ", ".join(bericht["ungeprueft"]) +
+                   ". Die Zusammenfassung ist die Einschätzung des Agenten, "
+                   "kein Prüfergebnis.")
+    elif bericht and changed and not any(
+            b["werkzeug"] in ("run_python", "run_command")
+            for b in bericht["belege"]):
+        # Sperre bestanden, aber nur mit check_syntax. Dass eine Datei parst,
+        # heisst nicht, dass sie tut was sie soll - dieser Unterschied darf
+        # nicht in einem einzigen Haken verschwinden.
+        await send("status", "Belegt ist nur die Syntax — der Code wurde nicht "
+                             "ausgeführt.")
+    elif not verified:
         await send("error", "Hinweis: Der Agent hat den Code nicht ausgeführt. "
                             "Die Zusammenfassung ist seine eigene Einschätzung, "
                             "kein Testergebnis.")
 
+    # Nur ein BELEGTER Lauf darf ins Gedaechtnis. Was am Ende ungeprueft
+    # blieb, hat nichts bewiesen - es zu merken hiesse, kuenftigen Laeufen
+    # eine Vermutung als Erfahrung zu verkaufen.
+    if verified:
+        _merken(toolbox)
+
     await send("done", f"{summary}{commit}", ok=True, exit=0,
-               attempts=step, seconds=seconds, verified=executed)
+               attempts=step, seconds=seconds, verified=verified)
     return "ok"
+
+
+def _merken(toolbox) -> None:
+    """Zu jedem behobenen Befund festhalten, was danach passiert ist.
+
+    Je Fingerabdruck nur der ERSTE Befund: taucht derselbe Fehler dreimal auf,
+    ist das ein Fehler mit einer Loesung, nicht drei. Fehlt das Gedaechtnis
+    oder scheitert das Schreiben, laeuft der Lauf normal zu Ende - ein
+    Gedaechtnis ist eine Hilfe, kein Bestandteil des Ergebnisses.
+    """
+    gedaechtnis = getattr(toolbox, "gedaechtnis", None)
+    if gedaechtnis is None:
+        return
+    gesehen = set()
+    for befund in getattr(toolbox, "befunde", []):
+        schluessel = befund.fingerprint()
+        if schluessel in gesehen or befund.schritt is None:
+            continue
+        gesehen.add(schluessel)
+        loesung = memory.loesung_beschreiben(toolbox.protokoll, befund.schritt)
+        try:
+            gedaechtnis.merken(befund, loesung)
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "Fehlergedächtnis nicht beschreibbar: %s", exc)
+            return

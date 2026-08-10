@@ -1,84 +1,77 @@
 <!DOCTYPE html>
 <html lang="de">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1c1f24">
+<meta name="color-scheme" content="dark">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="BraunyCode">
-<meta name="theme-color" content="#1c1f24">
-<meta name="description" content="KI-Coding-Agent mit Sandbox-Ausführung, bedienbar vom iPhone.">
-<title>BraunyCode Control</title>
-<link rel="manifest" href="/manifest.json">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
-<link rel="icon" href="/icons/icon-192.png" sizes="192x192">
+<link rel="manifest" href="/manifest.json">
+<title>BraunyCode</title>
 <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
 
-<header>
+<header class="top">
+  <button class="icon-btn" id="btn-history" type="button" aria-label="Verlauf">
+    <span aria-hidden="true">☰</span>
+  </button>
   <div class="brand">
-    <h1>BraunyCode Control</h1>
-    <p class="meta"><span id="health" class="dot"></span><span id="health-text">verbinde …</span></p>
+    <strong>BraunyCode</strong>
+    <span class="meta"><span id="health" class="dot"></span><span id="health-text">verbinde …</span></span>
   </div>
-  <button class="icon-btn" id="btn-history" type="button" aria-label="Verlauf">☰</button>
+  <button class="icon-btn" id="btn-new" type="button" aria-label="Neuer Auftrag">
+    <span aria-hidden="true">＋</span>
+  </button>
 </header>
 
-<main>
-  <textarea id="prompt" placeholder="Was soll gebaut werden?&#10;z. B. Berechne die ersten 50 Primzahlen"
-            enterkeyhint="done" autocapitalize="sentences"></textarea>
-
-  <div class="tabs" role="tablist">
-    <button role="tab" data-panel="log" aria-selected="true">Protokoll</button>
-    <button role="tab" data-panel="code">Code<span class="badge" id="badge-code"></span></button>
-    <button role="tab" data-panel="out">Ausgabe<span class="badge" id="badge-out"></span></button>
-  </div>
-
-  <div class="panel" id="panel-log" role="tabpanel">
-    <div class="empty">Noch kein Lauf gestartet.</div>
-  </div>
-
-  <div class="panel" id="panel-code" role="tabpanel" hidden>
-    <div class="panel-head"><span>main.py</span><button type="button" id="btn-copy">Kopieren</button></div>
-    <div id="code-body"><div class="empty">Der generierte Code erscheint hier.</div></div>
-  </div>
-
-  <div class="panel" id="panel-out" role="tabpanel" hidden>
-    <div class="panel-head"><span>Sandbox-Ausgabe</span></div>
-    <div id="out-body"><div class="empty">Die Ausgabe des Programms erscheint hier.</div></div>
+<main class="stream" id="stream" aria-live="polite">
+  <div class="welcome" id="empty">
+    <div class="mark" aria-hidden="true">B</div>
+    <h1>Was soll ich bauen?</h1>
+    <p>Ich lese, schreibe und führe Code aus — und belege jede Änderung mit einem Lauf.</p>
+    <div class="chips" id="chips"></div>
   </div>
 </main>
 
-<footer>
-  <button class="btn" id="btn-run" type="button">Agent starten</button>
-  <button class="btn ghost" id="btn-clear" type="button" aria-label="Leeren">Leeren</button>
-</footer>
+<form class="composer" id="composer" autocomplete="off">
+  <div class="field">
+    <textarea id="prompt" rows="1" enterkeyhint="send"
+              placeholder="Auftrag eingeben …"></textarea>
+    <button class="send" id="btn-run" type="submit" aria-label="Auftrag starten">
+      <span class="arrow" aria-hidden="true">↑</span>
+      <span class="square" aria-hidden="true"></span>
+    </button>
+  </div>
+  <p class="hint" id="hint">Läuft auf deinem Server · <span id="hint-model">—</span></p>
+</form>
 
-<!-- Token-Abfrage -->
 <div class="sheet" id="gate" hidden>
   <div class="box">
-    <h2>Anmeldung</h2>
-    <p>Das Zugangs-Token steht in der Ausgabe von <code>install.sh</code>
-       und in <code>~/braunycode/brauny.env</code>.</p>
+    <h2>Anmelden</h2>
+    <p>Dein Zugangs-Token steht in <code>brauny.env</code> auf dem Server.</p>
     <input id="token" type="password" placeholder="Zugangs-Token"
            autocomplete="current-password" enterkeyhint="go">
     <button class="btn" id="btn-login" type="button">Speichern</button>
   </div>
 </div>
 
-<!-- Verlauf -->
 <div class="sheet" id="history" hidden>
   <div class="box">
     <h2>Verlauf</h2>
-    <p>Die letzten Läufe, lokal auf diesem Gerät gespeichert.</p>
     <ul class="hist" id="hist-list"></ul>
-    <button class="btn ghost" id="btn-hist-clear" type="button">Verlauf löschen</button>
-    <button class="btn" id="btn-hist-close" type="button">Schließen</button>
+    <div class="row">
+      <button class="btn ghost" id="btn-hist-clear" type="button">Löschen</button>
+      <button class="btn" id="btn-hist-close" type="button">Schließen</button>
+    </div>
   </div>
 </div>
 
-<div id="toast"></div>
+<div id="toast" role="status"></div>
 
 <script src="/static/app.js"></script>
 </body>

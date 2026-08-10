@@ -19,6 +19,9 @@ eine Typanalyse ist es nicht.
 from __future__ import annotations
 
 import ast
+import os
+
+import syntax
 import re
 from dataclasses import dataclass, field
 
@@ -41,8 +44,22 @@ class Symbol:
     calls: set[str] = field(default_factory=set)
 
     def header(self) -> str:
-        prefix = "class" if self.kind == "class" else "def"
-        text = f"{prefix} {self.signature}"
+        """Eine Zeile fuer die Uebersicht.
+
+        Die Schreibweise richtet sich nach der Sprache der Datei, nicht nach
+        der des Werkzeugs: 'def Page()' fuer eine .tsx-Komponente war schlicht
+        falsch und legt dem Modell nahe, hier waere Python im Spiel - genau
+        die Verwechslung, die einen ganzen Lauf gekostet hat.
+
+        Bei class, interface, type und enum steht die Art schon in der
+        Signatur; ein zweites Wort davor waere Doppelung.
+        """
+        if self.signature.startswith(("class ", "interface ", "type ", "enum ")):
+            text = self.signature
+        elif self.path.endswith((".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")):
+            text = f"function {self.signature}"
+        else:
+            text = f"def {self.signature}"
         return f"{text}  — {self.doc}" if self.doc else text
 
 
@@ -154,7 +171,17 @@ class CodeIndex:
     @classmethod
     def build(cls, ws) -> "CodeIndex":
         index = cls()
+        # TypeScript und JavaScript werden gesammelt und in EINEM Node-Lauf
+        # ausgewertet. Ein Prozess je Datei waere bei zweihundert Dateien
+        # zehn Sekunden reine Startzeit.
+        web: list[tuple[str, str]] = []
         for rel in ws.list_files():
+            if os.path.splitext(rel)[1].lower() in syntax.TYPESCRIPT:
+                try:
+                    web.append((rel, str(ws.resolve(rel))))
+                except Exception as exc:
+                    index.skipped.append((rel, str(exc)))
+                continue
             if not rel.endswith(".py"):
                 continue
             try:
@@ -173,6 +200,27 @@ class CodeIndex:
             index.symbols.extend(collector.symbols)
             index.files.append(rel)
             index._sources[rel] = source
+
+        # Ohne node oder typescript bleibt es beim Python-Teil. Der Index ist
+        # dann unvollstaendig - aber er behauptet nichts, was er nicht weiss.
+        gefunden = syntax.symbole(web) if web else None
+        if gefunden is None:
+            for rel, _ in web:
+                index.skipped.append((rel, "kein TypeScript-Parser verfügbar"))
+        else:
+            for eintrag in gefunden:
+                index.symbols.append(Symbol(
+                    kind=eintrag.get("kind", "function"),
+                    name=eintrag.get("name", ""),
+                    qualname=eintrag.get("qualname", ""),
+                    path=eintrag.get("path", ""),
+                    line=int(eintrag.get("line", 1)),
+                    end_line=int(eintrag.get("end_line", 1)),
+                    signature=eintrag.get("signature", ""),
+                    doc=eintrag.get("doc", ""),
+                ))
+            for rel, _ in web:
+                index.files.append(rel)
         return index
 
     # ------------------------------------------------------------ Abfragen

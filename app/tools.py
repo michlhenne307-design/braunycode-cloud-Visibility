@@ -12,12 +12,20 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import dataclasses
 import fnmatch
+import hashlib
 import json
 import re
 import shlex
+import time
 
 import connectors
+import diagnostics
+import gates
+import memory as memory_mod
+import syntax
+import testimpact
 
 MAX_OUTPUT = 4000        # Zeichen, die ein Werkzeugergebnis zurueckgeben darf
 MAX_SEARCH_HITS = 25
@@ -29,6 +37,28 @@ MAX_SANDBOX_BYTES = 400_000
 # Ohne dieses Werkzeug kann die Schleife nicht sauber enden - es bleibt
 # deshalb auch dann erlaubt, wenn ein Skill die Werkzeuge einschraenkt.
 ALWAYS = "finish"
+
+# Werkzeuge, die den Projektstand veraendern, und solche, die ihn pruefen.
+# Aus dem Zusammenspiel der beiden Mengen ergibt sich, ob der aktuelle Stand
+# belegt ist oder nur behauptet.
+MODIFYING = {"write_file", "edit_file", "rename_symbol", "delete_file",
+             "move_file"}
+CHECKING = {"check_syntax", "run_python", "run_command", "run_gates"}
+
+# Anfaenge, an denen eine Pruefung als bestanden gilt. Bewusst an den
+# Rueckgabetexten der Werkzeuge festgemacht und nicht am Exit-Code: was das
+# Modell zu sehen bekommt, ist genau das, was hier gewertet wird.
+GREEN_PREFIXES = ("Lauf erfolgreich", "Befehl erfolgreich")
+GREEN_SUFFIX_SYNTAX = ": Syntax in Ordnung."
+# run_gates schreibt seinen Befund ans ENDE, weil davor die einzelnen
+# Pruefbefehle stehen. 'Keine Pruefbefehle gefunden' zaehlt ausdruecklich
+# nicht dazu - siehe _run_gates.
+GREEN_GATES = "Alle Prüfbefehle des Projekts bestanden."
+
+# So oft darf 'finish' abgewiesen werden, bevor der Lauf trotzdem enden darf -
+# dann aber ausdruecklich als unbelegt. Ohne diesen Deckel koennte ein Modell,
+# das die Pruefung nicht hinbekommt, die Schleife bis zum Schrittlimit drehen.
+FINISH_BLOCK_LIMIT = 2
 
 
 def _tool(name, description, properties, required):
@@ -117,6 +147,15 @@ def base_schema() -> list[dict]:
               ["path", "old_name", "new_name"]),
 
         # ---------------------------------------------------------- Prüfen
+        _tool("affected_tests",
+              "Nennt die Testdateien, die den geänderten Code über Importe "
+              "erreichen. Ohne Angabe werden die in diesem Lauf geänderten "
+              "Dateien genommen. Damit läuft die kurze Prüfung statt der "
+              "ganzen Suite.",
+              {"paths": {"type": "string",
+                         "description": "Optional, kommagetrennt. Leer lassen "
+                                        "für die selbst geänderten Dateien."}},
+              []),
         _tool("check_syntax",
               "Prüft eine Python-Datei auf Syntaxfehler, ohne sie auszuführen. "
               "Kostet nichts — vor jedem Lauf sinnvoll.",
@@ -132,6 +171,13 @@ def base_schema() -> list[dict]:
               "Änderungen wirken nicht auf das echte Projekt.",
               {"command": {"type": "string", "description": "Befehl mit Argumenten"}},
               ["command"]),
+        _tool("run_gates",
+              "Führt die Prüfbefehle aus, die das Projekt SELBST mitbringt "
+              "(package.json, Makefile, pyproject.toml): Lint, Typcheck, Build, "
+              "Tests — in dieser Reihenfolge, Halt beim ersten Fehlschlag. "
+              "Das ist der Nachweis, dass eine Änderung trägt. Rate nicht, "
+              "welcher Befehl passt — dieses Werkzeug sieht nach.",
+              {}, []),
 
         # ---------------------------------------------------------- Zurück
         _tool("undo",
@@ -159,7 +205,11 @@ def connector_schema() -> dict[str, dict]:
             "Committet den Projektstand und schiebt ihn auf den eingerichteten "
             "Git-Remote.",
             {"branch": {"type": "string", "description": "Gewünschter Branch-Name"},
-             "message": {"type": "string", "description": "Commit-Nachricht"}},
+             "message": {"type": "string", "description": "Commit-Nachricht"},
+             "projekt": {"type": "string",
+                         "description": "Unterordner eines geklonten Projekts. "
+                                        "Dann geht der Push auf dessen eigenen "
+                                        "Remote statt auf den allgemeinen."}},
             ["message"]),
     }
 
@@ -205,6 +255,13 @@ def _clip(text: str) -> str:
     return text[:MAX_OUTPUT] + f"\n… gekürzt ({len(text)} Zeichen insgesamt)"
 
 
+def _kurz(value, limit: int = 120) -> str:
+    """Argumentwert fuers Protokoll. Ein ganzer Dateiinhalt gehoert da nicht
+    hinein - der steht ohnehin als Fingerabdruck daneben."""
+    text = str(value).replace("\n", "⏎")
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
 class Toolbox:
     """Fuehrt Werkzeugaufrufe gegen ein Projektverzeichnis aus.
 
@@ -212,7 +269,8 @@ class Toolbox:
     testbar bleibt.
     """
 
-    def __init__(self, ws, run_sandbox=None, index_builder=None, enabled=None):
+    def __init__(self, ws, run_sandbox=None, index_builder=None, enabled=None,
+                 gedaechtnis=None):
         self.ws = ws
         self.run_sandbox = run_sandbox
         self.index_builder = index_builder
@@ -223,6 +281,38 @@ class Toolbox:
         self.pushed: list[str] = []
         self.fetched: list[str] = []
         self.finished: str | None = None
+
+        # --- Belegfuehrung -------------------------------------------------
+        # Dateien, die seit der letzten bestandenen Pruefung veraendert wurden.
+        # Solange hier etwas drinsteht, ist der Stand unbelegt.
+        self.unverified: set[str] = set()
+        # Geaenderte Dateien, ueber die keine Ausfuehrung etwas aussagen kann
+        # (Text, Markdown, Konfiguration). Sie blockieren den Abschluss nicht,
+        # werden aber am Ende genannt.
+        self.ungeprueft_sonstige: set[str] = set()
+        # Sind die Pruefbefehle des Projekts (Lint, Typcheck, Build, Tests)
+        # nach der letzten Aenderung einmal vollstaendig grün gelaufen?
+        # Getrennt von 'unverified': ein bestandener Einzeltest belegt die
+        # geaenderte Datei, aber nicht, dass der Build des Projekts noch haelt.
+        self.gates_gruen = False
+        self.geaendert_seit_gates = False
+        # Lueckenloses Protokoll aller Aufrufe. Das ist die Nachvollziehbarkeit:
+        # was wurde aufgerufen, mit welchen Argumenten, was kam heraus, und wie
+        # sah die Datei vorher und nachher aus.
+        self.protokoll: list[dict] = []
+        # Bestandene Pruefungen mit dem, was sie abgedeckt haben.
+        self.belege: list[dict] = []
+        # Alle erkannten Befunde des Laufs, in Reihenfolge. Grundlage fuer
+        # das Fehlergedaechtnis und fuer die gezielte Reparatur.
+        self.befunde: list = []
+        # Optional: was frueher schon einmal kaputt war. Fehlt es,
+        # arbeitet alles genauso weiter - nur ohne Vorwissen.
+        self.gedaechtnis = gedaechtnis
+        # Letzter bekannter Inhalts-Fingerabdruck je Datei.
+        self._hashes: dict[str, str | None] = {}
+        self.finish_blocked = 0
+        # Wird beim Abschluss gesetzt: war der gemeldete Stand geprueft?
+        self.verified = False
 
     def restrict(self, names) -> list[str]:
         """Schraenkt die Werkzeuge ein, etwa weil ein Skill es so vorgibt.
@@ -273,19 +363,207 @@ class Toolbox:
         return [item for item in schema(self.enabled)
                 if item["function"]["name"] in self.allowed]
 
+    def _hash(self, path: str) -> str | None:
+        """Fingerabdruck des Dateiinhalts, oder None wenn es sie nicht gibt.
+
+        Zwoelf Hex-Stellen reichen: das ist kein Schutz gegen Manipulation,
+        sondern ein Beleg dafuer, DASS sich etwas geaendert hat und was.
+        """
+        try:
+            roh = self.ws.read(path).encode("utf-8", "replace")
+        except Exception:
+            return None
+        return hashlib.sha256(roh).hexdigest()[:12]
+
+    def _abdeckung(self, name: str, arguments: dict) -> set[str]:
+        """Welche offenen Dateien ein gruener Lauf wirklich belegt hat.
+
+        Ueber den Importgraphen vorwaerts, ausgehend von dem, was gestartet
+        wurde. Nennt ein Befehl keine einzige Projektdatei ('python -m pytest'
+        ueber alles), gilt der Lauf als vollstaendig - dann IST alles gelaufen.
+        """
+        try:
+            dateien = self._alle_python()
+        except Exception:
+            # Ohne Graph lieber vollstaendig belegen als gar nicht: sonst
+            # blockierte ein Lesefehler den Abschluss dauerhaft.
+            return set(self.unverified)
+
+        if name == "run_gates":
+            # Lint, Typcheck, Build und Tests des Projekts laufen ueber ALLES,
+            # was das Projekt kennt - nicht nur ueber einen Ast des
+            # Importgraphen. Ein gruener Durchlauf belegt deshalb alles Offene.
+            return set(self.unverified)
+
+        if name == "run_python":
+            start = [str(arguments.get("path", "")).strip()]
+        else:
+            start = testimpact.dateien_aus_befehl(
+                str(arguments.get("command", "")), dateien)
+            if not start:
+                return set(self.unverified)   # Lauf ueber alles
+
+        erreicht = testimpact.abgedeckt(dateien, start)
+        # Nicht-Python-Dateien kann der Graph nicht einordnen. Sie bleiben
+        # offen, statt stillschweigend als belegt zu gelten.
+        return self.unverified & erreicht
+
+    def _ist_gruen(self, name: str, result: str) -> bool:
+        if name == "check_syntax":
+            return result.rstrip().endswith(GREEN_SUFFIX_SYNTAX)
+        if name == "run_gates":
+            return result.rstrip().endswith(GREEN_GATES)
+        return result.startswith(GREEN_PREFIXES)
+
     async def call(self, name: str, arguments: dict) -> str:
-        """Fuehrt ein Werkzeug aus. Fehler werden als Text zurueckgegeben,
-        damit das Modell darauf reagieren kann statt abzubrechen."""
+        """Fuehrt ein Werkzeug aus und schreibt den Vorgang ins Protokoll.
+
+        Fehler werden als Text zurueckgegeben, damit das Modell darauf
+        reagieren kann statt abzubrechen.
+
+        Nebenher wird mitgefuehrt, welche Dateien seit der letzten bestandenen
+        Pruefung veraendert wurden. Genau daran haengt spaeter, ob 'finish'
+        durchgeht - das Modell kann diese Buchhaltung nicht beeinflussen, weil
+        sie hier passiert und nicht in seinem Text.
+        """
         if name not in self.allowed:
             grund = ("ist für diese Aufgabe nicht freigegeben"
                      if name in NAMES else "gibt es nicht")
             return (f"FEHLER: Unbekanntes Werkzeug '{name}' — {grund}. "
                     f"Erlaubt: {sorted(self.allowed)}")
+
+        vorher_written = len(self.written)
+        begonnen = time.monotonic()
         try:
             handler = getattr(self, f"_{name}")
-            return _clip(await handler(arguments))
+            result = _clip(await handler(arguments))
         except Exception as exc:
-            return f"FEHLER: {type(exc).__name__}: {exc}"
+            result = f"FEHLER: {type(exc).__name__}: {exc}"
+
+        ok = not result.startswith("FEHLER")
+        # Welche Dateien angefasst wurden, wird nicht aus den Argumenten
+        # geraten, sondern von den Werkzeugen selbst gemeldet.
+        beruehrt = list(dict.fromkeys(self.written[vorher_written:]))
+
+        aenderungen = []
+        for pfad in beruehrt:
+            alt = self._hashes.get(pfad)
+            neu = self._hash(pfad)
+            self._hashes[pfad] = neu
+            aenderungen.append({"pfad": pfad, "vorher": alt, "nachher": neu})
+
+        if ok and name in MODIFYING:
+            # Was geprueft werden KANN, muss auch geprueft werden. Hier stand
+            # frueher '.py': eine geschriebene .ts-Datei kam damit ungeprueft
+            # durch 'finish', obwohl check_syntax sie laengst lesen kann - der
+            # Agent durfte also fuer die halbe Welt behaupten statt belegen.
+            # Eine .md hat dagegen kein Verhalten, das eine Pruefung belegen
+            # koennte; sie zu sperren hiesse, ihn bei jeder README festzuhalten.
+            # Fehlt der TypeScript-Parser auf der Maschine, sagt 'unterstuetzt'
+            # das von selbst - dann sperrt hier nichts, was niemand pruefen kann.
+            pruefbar = {p for p in beruehrt if syntax.unterstuetzt(p)}
+            self.unverified.update(pruefbar)
+            if beruehrt:
+                # Jede Aenderung entwertet einen frueheren gruenen Gate-Lauf.
+                # Sonst wuerde ein Lauf von vor zehn Schritten den Abschluss
+                # von Code belegen, den es damals noch nicht gab.
+                self.gates_gruen = False
+                self.geaendert_seit_gates = True
+            # Verschwiegen wird der Rest deshalb nicht: am Ende steht, was
+            # ausserhalb der Reichweite jeder Pruefung geaendert wurde.
+            self.ungeprueft_sonstige.update(set(beruehrt) - pruefbar)
+        elif ok and name in CHECKING and self._ist_gruen(name, result):
+            if name == "check_syntax":
+                # Belegt genau die eine Datei - und nur ihre Syntax.
+                geprueft = {str(arguments.get("path", "")).strip()}
+                self.unverified -= geprueft
+            else:
+                # Ein gruener Lauf belegt NICHT alles, was gerade offen ist -
+                # nur das, was er tatsaechlich erreicht hat. 'pytest test_a.py'
+                # sagt nichts ueber eine gleichzeitig geaenderte b.py, die kein
+                # Test anfasst. Diese Unterscheidung ist der Unterschied
+                # zwischen einem Beleg und einer Behauptung mit Testausgabe
+                # daneben.
+                geprueft = self._abdeckung(name, arguments)
+                self.unverified -= geprueft
+            if geprueft:
+                self.belege.append({"nr": len(self.protokoll) + 1,
+                                    "werkzeug": name,
+                                    "abgedeckt": sorted(geprueft)})
+
+        # Rohausgabe zu Befunden verdichten. Ein Traceback zwingt das Modell
+        # sonst, sich Datei und Zeile selbst herauszusuchen - und dabei raet
+        # es gern den ersten Rahmen statt den letzten.
+        gescheitert = not ok or (name in CHECKING
+                                 and not self._ist_gruen(name, result))
+        befunde = diagnostics.parse(result, quelle=name) if gescheitert else []
+        # Den Schritt festhalten: erst damit laesst sich spaeter sagen, was
+        # NACH dem Fehler passiert ist und ihn behoben hat.
+        nr = len(self.protokoll) + 1
+        befunde = [dataclasses.replace(f, schritt=nr) for f in befunde]
+
+        self.protokoll.append({
+            "nr": len(self.protokoll) + 1,
+            "werkzeug": name,
+            "argumente": {k: _kurz(v) for k, v in (arguments or {}).items()},
+            "ok": ok,
+            "ms": int((time.monotonic() - begonnen) * 1000),
+            "dateien": aenderungen,
+            "befunde": [f.to_dict() for f in befunde],
+        })
+        self.befunde.extend(befunde)
+
+        # Nur anhaengen, wenn der Befund mehr weiss als die Meldung selbst.
+        # Bei "FEHLER: 'pattern' fehlt." waere die Wiederholung nur Laerm.
+        ergiebig = [f for f in befunde if f.datei or f.typ]
+        if ergiebig:
+            result = f"{result}\n\nBefund:\n{diagnostics.zusammenfassen(ergiebig)}"
+            # Vorwissen dazustellen, falls dieser Fehler hier schon einmal
+            # auftrat. Als Hinweis, nicht als Anweisung - was damals half,
+            # muss heute nicht richtig sein.
+            if self.gedaechtnis is not None:
+                hinweise = [h for h in
+                            (self.gedaechtnis.hinweis(f) for f in ergiebig) if h]
+                if hinweise:
+                    result = f"{result}\n\n" + "\n".join(hinweise)
+        return result
+
+    def bericht(self) -> dict:
+        """Der maschinell erzeugte Beleg zum Lauf.
+
+        Bewusst nicht vom Modell formuliert: was hier steht, stammt aus der
+        Buchfuehrung von call() und laesst sich gegen das Protokoll pruefen.
+        """
+        return {
+            "schritte": len(self.protokoll),
+            "fehlgeschlagen": sum(1 for e in self.protokoll if not e["ok"]),
+            "geaendert": sorted({a["pfad"] for e in self.protokoll
+                                 for a in e["dateien"]}),
+            "belege": list(self.belege),
+            "ungeprueft": sorted(self.unverified),
+            "ohne_pruefmoeglichkeit": sorted(self.ungeprueft_sonstige),
+            # Damit im Nachhinein nicht offenbleibt, WAS eigentlich geprueft
+            # wurde: liefen die Pruefbefehle des Projekts oder nicht.
+            "gates": self._gates_bericht(),
+            "verifiziert": self.verified,
+        }
+
+    def _gates_bericht(self) -> dict:
+        """Stand der projekteigenen Pruefbefehle - fuer den Abschlussbericht."""
+        try:
+            gefunden = gates.ermitteln(self._project_files())
+        except Exception:
+            return {"stand": "unbekannt", "befehle": []}
+        befehle = [g.zeile() for g in gefunden]
+        if not gefunden:
+            stand = "keine gefunden"
+        elif gates.braucht_fremdpakete(gefunden):
+            stand = "nicht ausführbar (braucht node_modules, Sandbox ohne Netz)"
+        elif self.gates_gruen:
+            stand = "grün"
+        else:
+            stand = "nicht grün gelaufen"
+        return {"stand": stand, "befehle": befehle}
 
     # -------------------------------------------------------------- Werkzeuge
 
@@ -445,17 +723,66 @@ class Toolbox:
             return ("FEHLER: Kein Rückwärtsgang möglich — das Projekt hat noch "
                     "keine Historie.")
         self.written.clear()
+        # Der Stand ist wieder der zuletzt eingecheckte. Was vorher als
+        # ungeprueft offen stand, gibt es nicht mehr - es waere falsch, den
+        # Abschluss weiterhin daran zu hindern.
+        self.unverified.clear()
+        self.ungeprueft_sonstige.clear()
+        self._hashes.clear()
         return (f"Projekt auf Commit {sha} zurückgesetzt. "
                 "Alle Änderungen seitdem sind verworfen.")
 
+    async def _affected_tests(self, args) -> str:
+        roh = str(args.get("paths", "")).strip()
+        if roh:
+            geaendert = [p.strip() for p in roh.split(",") if p.strip()]
+        else:
+            # Der uebliche Fall: was dieser Lauf angefasst hat. Das Modell muss
+            # sich nicht merken, welche Dateien das waren.
+            geaendert = sorted(set(self.written))
+        if not geaendert:
+            return ("Noch nichts geändert — es gibt nichts einzugrenzen. "
+                    "Gib 'paths' an, wenn du trotzdem wissen willst, welche "
+                    "Tests eine bestimmte Datei erreichen.")
+
+        dateien = await asyncio.to_thread(self._alle_python)
+        return await asyncio.to_thread(testimpact.bericht, dateien, geaendert)
+
+    def _alle_python(self) -> dict[str, str]:
+        """Alle lesbaren Python-Dateien des Projekts, fuer den Importgraphen."""
+        dateien: dict[str, str] = {}
+        for rel in self.ws.list_files():
+            if not rel.endswith(".py"):
+                continue
+            try:
+                dateien[rel] = self.ws.read(rel)
+            except Exception:
+                continue          # unlesbar oder binaer - fuer den Graph egal
+        return dateien
+
     async def _check_syntax(self, args) -> str:
+        """Prueft die Syntax - fuer Python, JSON und die TypeScript-Familie.
+
+        Frueher konnte hier nur Python geprueft werden. An einem
+        TypeScript-Projekt hiess das: keine Pruefung, also kein Beleg, also
+        wich das Modell auf Python aus, weil das das Einzige war, womit es
+        etwas zeigen konnte. Wer nur einen Hammer hat, sucht Naegel.
+
+        'Weiss nicht' bleibt ausdruecklich ein eigenes Ergebnis und wird NICHT
+        als bestanden gemeldet - sonst waere die Ausweitung ein Rueckschritt.
+        """
         path = str(args.get("path", "")).strip()
         code = self.ws.read(path)
         try:
-            ast.parse(code)
-        except SyntaxError as exc:
-            return f"SyntaxError in {path}, Zeile {exc.lineno}: {exc.msg}"
-        return f"{path}: Syntax in Ordnung."
+            auf_platte = str(self.ws.resolve(path))
+        except Exception:
+            auf_platte = ""
+        bestanden, meldung = syntax.pruefen(path, code, auf_platte)
+        if bestanden is None:
+            # Kein "in Ordnung" - der Aufrufer erkennt am fehlenden Schluss,
+            # dass hier nichts belegt wurde.
+            return f"HINWEIS: {meldung}"
+        return meldung
 
     async def _search(self, args) -> str:
         query = str(args.get("query", "")).strip()
@@ -596,9 +923,140 @@ class Toolbox:
         status = "erfolgreich" if exit_code == 0 else f"Exit-Code {exit_code}"
         return f"Befehl {status}.\nAusgabe:\n{output or '(keine)'}"
 
+    async def _run_gates(self, _args) -> str:
+        """Die Pruefbefehle des Projekts der Reihe nach, Halt beim ersten Fehler.
+
+        Halt beim ersten Fehlschlag ist Absicht: laeuft der Lint nicht durch,
+        sagt ein anschliessender Testlauf nichts Neues, kostet aber einen
+        Containerstart. Und das Modell soll einen Fehler nach dem anderen
+        beheben statt fuenf gleichzeitig.
+        """
+        if self.run_sandbox is None:
+            return "FEHLER: Keine Sandbox verfügbar."
+
+        dateien = self._project_files()
+        gefunden = gates.ermitteln(dateien)
+        if not gefunden:
+            # Ausdruecklich KEIN Erfolg. Ein Projekt, das nicht sagt, wie man
+            # es prueft, ist nicht geprueft - es ist ungeprueft.
+            return ("Keine Prüfbefehle gefunden. Das Projekt bringt weder "
+                    "package.json-Skripte noch Makefile-Ziele noch eine "
+                    "Test-/Lint-Konfiguration mit.\n"
+                    "Das ist KEIN bestandener Lauf. Prüfe die Änderung selbst "
+                    "— mit run_python, run_command oder einem neuen Test — "
+                    "und sag im Abschluss dazu, womit belegt wurde.")
+
+        if gates.braucht_fremdpakete(gefunden):
+            liste = "\n".join(f"  {g.zeile()}" for g in gefunden)
+            return ("Die Prüfbefehle dieses Projekts brauchen installierte "
+                    "Pakete (node_modules) und sind in dieser Sandbox nicht "
+                    "ausführbar: kein Netz für 'npm install', /app nur "
+                    "lesend, node_modules wird nicht mitkopiert.\n"
+                    f"Gefunden wären:\n{liste}\n\n"
+                    "Das ist NICHT bestanden, sondern ungeprüft. Belege deine "
+                    "Änderung mit dem, was hier geht — check_syntax auf jeder "
+                    "geänderten Datei, und für eigene Logik ein Test ohne "
+                    "Fremdpakete. Schreibe in den Abschluss ausdrücklich, "
+                    "dass Lint, Build und Tests des Projekts nicht laufen "
+                    "konnten und deshalb nicht belegt sind.")
+
+        zeilen = [f"{len(gefunden)} Prüfbefehl(e) aus dem Projekt:"]
+        for gate in gefunden:
+            zeilen.append(f"  {gate.zeile()}")
+        zeilen.append("")
+
+        alle_gruen = True
+        for gate in gefunden:
+            exit_code, output = await self.run_sandbox(
+                dateien, None, command=list(gate.befehl))
+            kurz = _clip(output or "(keine Ausgabe)")
+            if exit_code == 0:
+                zeilen.append(f"✓ {gate.rolle} bestanden ({' '.join(gate.befehl)})")
+                continue
+            alle_gruen = False
+            zeilen.append(f"✗ {gate.rolle} FEHLGESCHLAGEN, Exit-Code {exit_code} "
+                          f"({' '.join(gate.befehl)})")
+            zeilen.append(kurz)
+            offen = [g.rolle for g in gefunden[gefunden.index(gate) + 1:]]
+            if offen:
+                zeilen.append(f"Abgebrochen — {', '.join(offen)} wurde deshalb "
+                              f"nicht mehr ausgeführt.")
+            break
+
+        if alle_gruen:
+            self.gates_gruen = True
+            zeilen.append("")
+            zeilen.append("Alle Prüfbefehle des Projekts bestanden.")
+        return "\n".join(zeilen)
+
     async def _finish(self, args) -> str:
-        self.finished = str(args.get("summary", "")).strip() or "Fertig."
-        return self.finished
+        """Abschluss - aber nur gegen Beleg.
+
+        Der haeufigste stille Fehlschlag eines Agenten ist nicht der Absturz,
+        sondern die Erfolgsmeldung ueber ungepruefte Arbeit. Deshalb wird hier
+        abgewiesen, solange seit der letzten Aenderung keine Pruefung
+        bestanden wurde. Die Ablehnung geht als gewoehnliches Werkzeugergebnis
+        zurueck; die Schleife laeuft weiter und das Modell kann nachliefern.
+
+        Nach FINISH_BLOCK_LIMIT Ablehnungen darf der Lauf trotzdem enden -
+        dann aber mit verified=False, und die Oberflaeche sagt das dazu. Ein
+        Agent, der die Pruefung nicht hinbekommt, soll das melden duerfen; er
+        soll es nur nicht als geprueft ausgeben.
+        """
+        summary = str(args.get("summary", "")).strip() or "Fertig."
+        if self.unverified and self.finish_blocked < FINISH_BLOCK_LIMIT:
+            self.finish_blocked += 1
+            offen = ", ".join(sorted(self.unverified))
+            rest = FINISH_BLOCK_LIMIT - self.finish_blocked
+            return ("FEHLER: Abschluss abgelehnt — seit der letzten Änderung "
+                    f"ist keine Prüfung bestanden worden. Ungeprüft: {offen}. "
+                    "Rufe check_syntax auf diesen Dateien auf und lass den "
+                    "Code mit run_python laufen, dann finish erneut. "
+                    f"(Noch {rest} Ablehnung(en), danach wird der Lauf als "
+                    "unbelegt beendet.)")
+        # Hat das Projekt eigene Pruefbefehle und wurden sie nie grün gesehen,
+        # ist der Abschluss eine Behauptung. Ein bestandener Einzeltest belegt
+        # nicht, dass Lint, Typcheck und Build des Projekts noch tragen.
+        if (self.geaendert_seit_gates and not self.gates_gruen
+                and self.finish_blocked < FINISH_BLOCK_LIMIT
+                and self._gates_vorhanden()):
+            self.finish_blocked += 1
+            rest = FINISH_BLOCK_LIMIT - self.finish_blocked
+            return ("FEHLER: Abschluss abgelehnt — die Prüfbefehle des "
+                    "Projekts (Lint, Typcheck, Build, Tests) sind seit deiner "
+                    "Änderung nicht grün gelaufen. Rufe run_gates auf. "
+                    "Schlägt etwas fehl, behebe es und rufe run_gates erneut. "
+                    f"(Noch {rest} Ablehnung(en), danach wird der Lauf als "
+                    "unbelegt beendet.)")
+        self.finished = summary
+        self.verified = not self.unverified and not (
+            self.geaendert_seit_gates and self._gates_vorhanden()
+            and not self.gates_gruen)
+        return summary
+
+    def _gates_vorhanden(self) -> bool:
+        """Bringt das Projekt Pruefbefehle mit, die HIER auch laufen koennen?
+
+        Die zweite Haelfte der Frage ist die wichtige. Ein Next.js-Projekt hat
+        Pruefbefehle, aber sie brauchen node_modules und sind in dieser
+        Sandbox nicht ausfuehrbar. Den Abschluss daran zu haengen hiesse, den
+        Agenten fuer etwas zu bestrafen, das er nicht tun kann - er wuerde
+        zwei Runden verbrennen und danach genauso enden. Dass sie nicht
+        liefen, steht stattdessen im Bericht.
+
+        Fehler beim Nachsehen duerfen den Abschluss nicht blockieren - sonst
+        haengt ein Lauf an einem unlesbaren Verzeichnis statt an der Arbeit.
+        """
+        if self.run_sandbox is None:
+            # Ohne Sandbox laesst sich ueberhaupt nichts ausfuehren. Dann ist
+            # die Sperre reine Schikane: sie kostet zwei Runden und endet
+            # danach genauso.
+            return False
+        try:
+            gefunden = gates.ermitteln(self._project_files())
+        except Exception:
+            return False
+        return bool(gefunden) and not gates.braucht_fremdpakete(gefunden)
 
     # ------------------------------------------------------------ Konnektoren
 
@@ -614,7 +1072,8 @@ class Toolbox:
         ergebnis = await asyncio.to_thread(
             connectors.git_push, self.ws,
             str(args.get("branch", "")).strip(),
-            str(args.get("message", "")).strip())
+            str(args.get("message", "")).strip(),
+            str(args.get("projekt", "")).strip())
         self.pushed.append(ergebnis.splitlines()[0] if ergebnis else "gepusht")
         return ergebnis
 

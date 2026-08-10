@@ -1,28 +1,39 @@
-/* BraunyCode Control - Frontend ohne Build-Schritt.
-   Modell-Ausgaben werden ausschliesslich per textContent gesetzt,
-   niemals per innerHTML - sonst waere jeder generierte String ein XSS-Vektor. */
+/* BraunyCode - Frontend ohne Build-Schritt.
+
+   Aufbau: ein fortlaufender Gespraechsverlauf. Der Auftrag steht als eigener
+   Beitrag darin, darunter waechst die Arbeit des Agenten mit.
+
+   Werkzeugaufrufe werden ZUGEKLAPPT gezeigt, ihre Ausgabe steckt darin. Im
+   Normalfall interessiert nur das Ergebnis; geht etwas schief, ist der Weg
+   einen Fingertipp entfernt. Die Belegzeilen am Ende eines Laufs
+   ("Geaendert:", "Belegt durch:") bleiben dagegen IMMER sichtbar - sie sind
+   der Grund, warum es dieses Programm gibt, und gehoeren nicht in eine
+   Klappe.
+
+   Modell-Ausgaben werden ausschliesslich per textContent gesetzt, niemals
+   per innerHTML - sonst waere jeder erzeugte String ein XSS-Vektor. */
 'use strict';
 
 const $ = id => document.getElementById(id);
 const TOKEN_KEY = 'brauny.token';
 const HIST_KEY = 'brauny.history';
+const RUN_KEY = 'brauny.run';
 const HIST_MAX = 20;
+const WIEDERHOLUNG = 3000;
 
-const TAGS = {
-  status:  'System',
-  plan:    'Plan',
-  tool:    'Werkzeug',
-  code:    'Code',
-  sandbox: 'Sandbox',
-  error:   'Fehler',
-  done:    'Fertig',
-};
+const VORSCHLAEGE = [
+  'Schreibe rechner.py mit addiere(a, b) und einem Test dazu. Führe den Test aus.',
+  'Lies das Projekt und sag mir in fünf Sätzen, was es tut.',
+  'Finde die Stelle, an der Eingaben geprüft werden, und melde Lücken.',
+];
 
 let ws = null;
 let running = false;
-let codeText = '';
-let outLines = 0;
 let startedAt = 0;
+let turn = null;        // aktueller Agenten-Beitrag
+let schritt = null;     // offener Werkzeugaufruf (details-Element)
+let ausgabe = null;     // laufender Ausgabeblock
+let strom = null;       // Textblock, in den das Modell gerade schreibt
 
 /* ----------------------------------------------------------- Hilfsmittel */
 
@@ -34,61 +45,213 @@ function toast(text) {
   toast._t = setTimeout(() => el.classList.remove('show'), 1900);
 }
 
-function clearPanel(el, placeholder) {
-  el.textContent = '';
-  if (placeholder) {
-    const div = document.createElement('div');
-    div.className = 'empty';
-    div.textContent = placeholder;
-    el.appendChild(div);
+function amEnde() {
+  const s = $('stream');
+  return s.scrollHeight - s.scrollTop - s.clientHeight < 90;
+}
+
+function nachUnten(erzwingen) {
+  const s = $('stream');
+  if (erzwingen || amEnde()) s.scrollTop = s.scrollHeight;
+}
+
+function el(tag, klasse, text) {
+  const node = document.createElement(tag);
+  if (klasse) node.className = klasse;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+/* Haengt einen Knoten in den laufenden Beitrag - vor die Tippanzeige, damit
+   die immer unten bleibt. */
+function anhaengen(node) {
+  if (!turn) return;
+  const unten = amEnde();
+  const punkte = turn.querySelector('.thinking');
+  if (punkte) turn.insertBefore(node, punkte);
+  else turn.appendChild(node);
+  nachUnten(unten);
+}
+
+/* -------------------------------------------------------------- Beitraege */
+
+function leerenAusblenden() {
+  const leer = $('empty');
+  if (leer) leer.remove();
+}
+
+function beitragNutzer(text) {
+  leerenAusblenden();
+  const t = el('div', 'turn user');
+  t.appendChild(el('div', 'bubble', text));
+  $('stream').appendChild(t);
+  nachUnten(true);
+}
+
+function beitragAgentBeginnen() {
+  turn = el('div', 'turn agent');
+  const punkte = el('div', 'thinking');
+  punkte.appendChild(el('i'));
+  punkte.appendChild(el('i'));
+  punkte.appendChild(el('i'));
+  turn.appendChild(punkte);
+  $('stream').appendChild(turn);
+  schritt = null;
+  ausgabe = null;
+  strom = null;
+  nachUnten(true);
+}
+
+function beitragAgentBeenden() {
+  if (!turn) return;
+  const punkte = turn.querySelector('.thinking');
+  if (punkte) punkte.remove();
+  turn = null;
+  schritt = null;
+  ausgabe = null;
+  strom = null;
+}
+
+/* Solange das Modell rechnet, laeuft eine Uhr statt drei stummer Punkte.
+   Auf CPU vergehen Minuten bis zum ersten Zeichen; ohne Anzeige ist das von
+   einem Absturz nicht zu unterscheiden - und wer nicht unterscheiden kann,
+   drueckt irgendwann auf Abbrechen. */
+function puls(sekunden) {
+  if (!turn) return;
+  const punkte = turn.querySelector('.thinking');
+  if (!punkte) return;
+  let uhr = punkte.querySelector('.uhr');
+  if (!uhr) {
+    uhr = el('span', 'uhr');
+    punkte.appendChild(uhr);
   }
+  uhr.textContent = 'denkt … ' + Math.round(sekunden) + ' s';
 }
 
-function dropPlaceholder(el) {
-  const ph = el.querySelector('.empty');
-  if (ph) ph.remove();
-  // Auch die Whitespace-Textknoten aus der HTML-Einrueckung entfernen -
-  // sie wuerden sonst als Leerraum am Panelanfang stehen bleiben.
-  [...el.childNodes].forEach(node => {
-    if (node.nodeType === Node.TEXT_NODE && !node.textContent.trim()) node.remove();
+/* Text, waehrend er entsteht. Ein eigener Block, damit ein Werkzeugaufruf
+   oder Code danach wieder sauber daneben steht. */
+function stromZeile(stueck) {
+  if (!strom) {
+    strom = el('div', 'say strom', '');
+    anhaengen(strom);
+  }
+  const unten = amEnde();
+  strom.textContent += stueck;
+  nachUnten(unten);
+}
+
+/* Was der Schritt gekostet hat. Ohne Zahlen bleibt "es ist langsam" eine
+   Meinung; mit ihnen sieht man, wohin die Zeit geht. */
+function messwerte(ev) {
+  const teile = [];
+  if (ev.prompt_token) {
+    teile.push(ev.prompt_token + ' Token gelesen (' + ev.prompt_s + ' s)');
+  }
+  if (ev.antwort_token) {
+    const rate = ev.antwort_s > 0 ? (ev.antwort_token / ev.antwort_s).toFixed(1) : '?';
+    teile.push(ev.antwort_token + ' erzeugt (' + ev.antwort_s + ' s, ' + rate + '/s)');
+  }
+  if (ev.geladen_s > 1) teile.push('Modell geladen: ' + ev.geladen_s + ' s');
+  if (!teile.length) return;
+  anhaengen(el('div', 'mess', teile.join(' · ')));
+}
+
+function sagen(text, art) {
+  if (!text) return;
+  anhaengen(el('div', 'say' + (art ? ' ' + art : ''), text));
+}
+
+function werkzeug(text) {
+  // Ein neuer Aufruf beendet den vorigen, den Ausgabeblock und den Textstrom.
+  schritt = null;
+  ausgabe = null;
+  strom = null;
+
+  const d = document.createElement('details');
+  d.className = 'step';
+  const s = document.createElement('summary');
+  s.appendChild(el('span', 'glyph', '⚙'));
+  s.appendChild(el('span', 'what', text));
+  d.appendChild(s);
+  d.appendChild(el('div', 'body', ''));
+  anhaengen(d);
+  schritt = d;
+}
+
+function ausgabezeile(text) {
+  // Laeuft gerade ein Werkzeug, gehoert seine Ausgabe hinein.
+  if (schritt) {
+    const body = schritt.querySelector('.body');
+    body.textContent += (body.textContent ? '\n' : '') + text;
+    if (/fehler|error|traceback|failed/i.test(text)) schritt.classList.add('fail');
+    nachUnten();
+    return;
+  }
+  if (!ausgabe) {
+    ausgabe = el('div', 'block out');
+    const kopf = el('div', 'head');
+    kopf.appendChild(el('span', null, 'Ausgabe'));
+    ausgabe.appendChild(kopf);
+    ausgabe.appendChild(el('pre', null, ''));
+    anhaengen(ausgabe);
+  }
+  const pre = ausgabe.querySelector('pre');
+  pre.textContent += (pre.textContent ? '\n' : '') + text;
+  nachUnten();
+}
+
+function codeblock(text, pfad, versuch) {
+  schritt = null;
+  ausgabe = null;
+  strom = null;
+
+  const b = el('div', 'block');
+  const kopf = el('div', 'head');
+  let titel = pfad || 'main.py';
+  if (versuch && versuch > 1) titel += ' · Versuch ' + versuch;
+  kopf.appendChild(el('span', null, titel));
+
+  const knopf = el('button', null, 'Kopieren');
+  knopf.type = 'button';
+  knopf.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      toast('Code kopiert');
+    } catch {
+      toast('Kopieren nicht erlaubt — braucht HTTPS');
+    }
   });
+  kopf.appendChild(knopf);
+
+  b.appendChild(kopf);
+  b.appendChild(el('pre', null, text));
+  anhaengen(b);
 }
 
-function logLine(kind, text) {
-  const panel = $('panel-log');
-  dropPlaceholder(panel);
-  const atBottom = panel.scrollHeight - panel.scrollTop - panel.clientHeight < 60;
+function ergebnis(ev) {
+  schritt = null;
+  ausgabe = null;
+  strom = null;
 
-  const line = document.createElement('span');
-  line.className = 'line ' + kind;
-  const tag = document.createElement('span');
-  tag.className = 'tag';
-  tag.textContent = TAGS[kind] || kind;
-  line.appendChild(tag);
-  line.appendChild(document.createTextNode(text));
-  panel.appendChild(line);
+  const gut = !!ev.ok;
+  const v = el('div', 'verdict ' + (gut ? 'ok' : 'fail'));
+  v.appendChild(el('span', 'glyph', gut ? '✓' : '✗'));
+  v.appendChild(el('span', null, ev.text || (gut ? 'Fertig.' : 'Fehlgeschlagen.')));
 
-  if (atBottom) panel.scrollTop = panel.scrollHeight;
+  const sek = typeof ev.seconds === 'number'
+    ? ev.seconds.toFixed(1)
+    : (startedAt ? ((Date.now() - startedAt) / 1000).toFixed(1) : null);
+  if (sek !== null) v.appendChild(el('span', 'when', sek + ' s'));
+  anhaengen(v);
+  return sek;
 }
 
-/* ----------------------------------------------------------- Ansichten */
-
-function selectTab(name) {
-  document.querySelectorAll('.tabs button').forEach(b => {
-    b.setAttribute('aria-selected', String(b.dataset.panel === name));
-  });
-  ['log', 'code', 'out'].forEach(p => { $('panel-' + p).hidden = p !== name; });
-  if (name === 'code') $('badge-code').textContent = '';
-  if (name === 'out') $('badge-out').textContent = '';
-}
+/* ----------------------------------------------------------- Zustand */
 
 function setRunning(on) {
   running = on;
-  const btn = $('btn-run');
-  btn.textContent = on ? 'Stoppen' : 'Agent starten';
-  btn.classList.toggle('stop', on);
-  $('prompt').disabled = on;
-  $('btn-clear').disabled = on;
+  document.body.classList.toggle('running', on);
+  $('btn-run').setAttribute('aria-label', on ? 'Abbrechen' : 'Auftrag starten');
   if (on) setHealth('busy', 'Agent arbeitet …');
   else checkHealth();
 }
@@ -104,15 +267,16 @@ async function checkHealth() {
     const res = await fetch('/healthz', { cache: 'no-store' });
     const data = await res.json();
     if (res.ok) {
-      setHealth('ok', 'Bereit · ' + data.model);
+      setHealth('ok', 'Bereit');
+      $('hint-model').textContent = data.model || '—';
     } else {
-      // Auf "fehler:" prüfen statt auf "ok": eine konfigurierte API meldet
+      // Auf "fehler:" pruefen statt auf "ok": eine konfigurierte API meldet
       // "konfiguriert (nicht angefragt)" und ist damit nicht kaputt.
       const labels = { modell_backend: 'Modell', docker: 'Docker' };
-      const broken = Object.keys(labels)
+      const kaputt = Object.keys(labels)
         .filter(k => String(data[k] || '').startsWith('fehler'))
         .map(k => labels[k]);
-      setHealth('bad', 'Problem: ' + (broken.join(', ') || 'unbekannt'));
+      setHealth('bad', 'Problem: ' + (kaputt.join(', ') || 'unbekannt'));
     }
   } catch {
     setHealth('bad', 'Server nicht erreichbar');
@@ -137,27 +301,22 @@ function renderHistory() {
   ul.textContent = '';
   const list = loadHistory();
   if (!list.length) {
-    const li = document.createElement('li');
-    li.textContent = 'Noch keine Läufe.';
-    ul.appendChild(li);
+    ul.appendChild(el('li', null, 'Noch keine Läufe.'));
     return;
   }
   list.forEach(item => {
-    const li = document.createElement('li');
-    li.textContent = item.prompt;
-    const when = document.createElement('div');
-    when.className = 'when';
-    const mark = document.createElement('span');
-    mark.className = item.ok ? 'ok' : 'fail';
-    mark.textContent = item.ok ? '✓ erfolgreich' : '✗ fehlgeschlagen';
-    when.appendChild(mark);
+    const li = el('li', null, item.prompt);
+    const when = el('div', 'when');
+    when.appendChild(el('span', item.ok ? 'ok' : 'fail',
+                        item.ok ? '✓ erfolgreich' : '✗ fehlgeschlagen'));
     when.appendChild(document.createTextNode(
       ' · ' + new Date(item.at).toLocaleString('de-DE') + ' · ' + item.seconds + ' s'));
     li.appendChild(when);
     li.addEventListener('click', () => {
       $('prompt').value = item.prompt;
+      hoeheAnpassen();
       $('history').hidden = true;
-      toast('Auftrag übernommen');
+      $('prompt').focus();
     });
     ul.appendChild(li);
   });
@@ -165,105 +324,154 @@ function renderHistory() {
 
 /* ----------------------------------------------------------- Lauf */
 
+/* Der Lauf gehoert dem Server, nicht dieser Verbindung. Hier steht nur, an
+   welchen wir haengen und wie weit wir gekommen sind - damit wir nach einem
+   Verbindungsabriss genau dort weitermachen und nichts doppelt anzeigen. */
+
+function laufLesen() {
+  try { return JSON.parse(localStorage.getItem(RUN_KEY)) || null; }
+  catch { return null; }
+}
+
+function laufMerken(daten) {
+  localStorage.setItem(RUN_KEY, JSON.stringify(daten));
+}
+
+function laufVergessen() {
+  localStorage.removeItem(RUN_KEY);
+}
+
+function verbinden(nutzlast, prompt) {
+  const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${scheme}://${location.host}/ws/agent`);
+  ws.onopen = () => ws.send(JSON.stringify(nutzlast));
+  ws.onmessage = e => handleEvent(e.data, prompt);
+  ws.onclose = () => {
+    ws = null;
+    // Nur wenn kein Lauf mehr offen ist, ist wirklich Schluss. Sonst haben
+    // wir bloss den Zuschauerplatz verloren und holen ihn uns gleich zurueck.
+    if (!laufLesen()) { beitragAgentBeenden(); setRunning(false); }
+  };
+}
+
 function start() {
   const prompt = $('prompt').value.trim();
   if (!prompt) { toast('Bitte einen Auftrag eingeben'); return; }
+  if (!localStorage.getItem(TOKEN_KEY)) { openGate(); return; }
 
   const token = localStorage.getItem(TOKEN_KEY) || '';
+  $('prompt').value = '';
+  hoeheAnpassen();
 
-  clearPanel($('panel-log'), null);
-  clearPanel($('code-body'), 'Der generierte Code erscheint hier.');
-  clearPanel($('out-body'), 'Die Ausgabe des Programms erscheint hier.');
-  $('badge-code').textContent = '';
-  $('badge-out').textContent = '';
-  codeText = '';
-  outLines = 0;
+  beitragNutzer(prompt);
+  beitragAgentBeginnen();
   startedAt = Date.now();
-  selectTab('log');
   setRunning(true);
-
-  const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${scheme}://${location.host}/ws/agent`);
-
-  ws.onopen = () => ws.send(JSON.stringify({ token, prompt }));
-  ws.onmessage = e => handleEvent(e.data, prompt);
-  ws.onerror = () => logLine('error', 'Verbindung fehlgeschlagen. Läuft der Dienst? Ist Port 8000 offen?');
-  ws.onclose = () => { ws = null; setRunning(false); };
+  // Vorlaeufig ohne Kennung - die kommt mit dem ersten Ereignis zurueck.
+  laufMerken({ id: '', i: 0, prompt });
+  verbinden({ token, prompt }, prompt);
 }
 
 function stop() {
+  const l = laufLesen();
+  const token = localStorage.getItem(TOKEN_KEY) || '';
+  if (l && l.id) {
+    // Der Lauf laeuft auf dem Server weiter, auch wenn wir die Verbindung
+    // kappen. Also muss der Abbruch dorthin, statt nur wegzusehen.
+    if (ws) { ws.onclose = null; ws.close(); ws = null; }
+    verbinden({ token, cancel: l.id, from: l.i || 0 }, l.prompt || '');
+    sagen('Abbruch angefordert …', 'status');
+    return;
+  }
   if (ws) { ws.close(); ws = null; }
-  logLine('error', 'Vom Benutzer abgebrochen.');
+  laufVergessen();
+  sagen('Vom Benutzer abgebrochen.', 'error');
+  beitragAgentBeenden();
   setRunning(false);
+}
+
+/* Nach dem Aufwachen wieder anhaengen. Auf einem Telefon ist genau das der
+   Normalfall: Bildschirm aus, App gewechselt, Netz gewechselt. */
+function wiederanhaengen() {
+  if (ws) return;
+  const l = laufLesen();
+  if (!l || !l.id) return;
+  const token = localStorage.getItem(TOKEN_KEY) || '';
+  if (!token) return;
+
+  if (!turn) {
+    // Nach einem Neuladen ist der Verlauf leer - den Auftrag wieder hinstellen,
+    // damit die Antwort nicht ohne Frage dasteht.
+    beitragNutzer(l.prompt || '(Auftrag)');
+    beitragAgentBeginnen();
+  }
+  setRunning(true);
+  verbinden({ token, attach: l.id, from: l.i || 0 }, l.prompt || '');
 }
 
 function handleEvent(raw, prompt) {
   let ev;
   try { ev = JSON.parse(raw); }
-  catch { logLine('status', String(raw)); return; }
+  catch { sagen(String(raw), 'status'); return; }
+
+  // Jedes Ereignis traegt Laufkennung und laufende Nummer. Damit wissen wir
+  // nach einem Abriss, wo wir waren - und der Server schickt beim erneuten
+  // Anhaengen genau ab dort, nicht von vorn.
+  if (ev.lauf) {
+    const alt = laufLesen() || {};
+    laufMerken({ id: ev.lauf, i: (typeof ev.i === 'number' ? ev.i + 1 : (alt.i || 0)),
+                 prompt: alt.prompt || prompt || '' });
+  }
 
   switch (ev.type) {
-    case 'code': {
-      codeText = ev.text || '';
-      const attempt = ev.attempt || 1;
-      const body = $('code-body');
-      clearPanel(body, null);
-      const pre = document.createElement('div');
-      pre.textContent = codeText;
-      body.appendChild(pre);
-
-      // Kopfzeile des Code-Reiters mit der Versuchsnummer beschriften
-      const head = document.querySelector('#panel-code .panel-head span');
-      if (head) head.textContent = attempt > 1 ? `main.py · Versuch ${attempt}` : 'main.py';
-
-      // Bei einer korrigierten Fassung startet ein frischer Lauf:
-      // alte Ausgabe wegräumen, damit sie sich nicht stapelt.
-      if (attempt > 1) {
-        clearPanel($('out-body'), 'Die Ausgabe des Programms erscheint hier.');
-        outLines = 0;
-        $('badge-out').textContent = '';
-      }
-
-      const lines = codeText.split('\n').length;
-      logLine('code', attempt > 1
-        ? `Korrigierte Fassung (Versuch ${attempt}), ${lines} Zeilen — im Reiter „Code“`
-        : `${lines} Zeilen erzeugt — im Reiter „Code“`);
-      if ($('panel-code').hidden) $('badge-code').textContent = '•';
+    case 'tool':
+      werkzeug(ev.text || '');
       break;
-    }
-    case 'sandbox': {
-      const body = $('out-body');
-      dropPlaceholder(body);
-      const line = document.createElement('div');
-      line.textContent = ev.text;
-      body.appendChild(line);
-      body.scrollTop = body.scrollHeight;
-      outLines += 1;
-      if ($('panel-out').hidden) $('badge-out').textContent = String(outLines);
-      logLine('sandbox', ev.text);
+    case 'code':
+      codeblock(ev.text || '', ev.path, ev.attempt);
       break;
-    }
-    case 'done': {
-      // Serverseitige Messung bevorzugen. Ohne vorheriges start() ist
-      // startedAt 0 - dann waere die lokale Differenz die Epoch-Zeit.
-      const seconds = typeof ev.seconds === 'number'
-        ? ev.seconds.toFixed(1)
-        : (startedAt ? ((Date.now() - startedAt) / 1000).toFixed(1) : '?');
-      logLine('done', ev.text || (ev.ok ? 'Fertig.' : 'Fehlgeschlagen.'));
-      addHistory({ prompt, ok: !!ev.ok, at: Date.now(), seconds });
-      if (ev.ok && outLines && $('panel-out').hidden) selectTab('out');
+    case 'sandbox':
+      (ev.text || '').split('\n').forEach(ausgabezeile);
       break;
-    }
-    case 'error': {
-      logLine('error', ev.text);
+    case 'plan':
+      sagen(ev.text || '');
+      break;
+    case 'delta':
+      stromZeile(ev.text || '');
+      break;
+    case 'puls':
+      puls(ev.sekunden || 0);
+      break;
+    case 'messung':
+      messwerte(ev);
+      break;
+    case 'error':
+      schritt = null;
+      sagen(ev.text || '', 'error');
       if (ev.code === 'auth') {
+        laufVergessen();
         localStorage.removeItem(TOKEN_KEY);
         openGate('Token abgelehnt. Bitte erneut eingeben.');
       }
+      // Der Lauf, an den wir uns haengen wollten, gibt es nicht mehr - dann
+      // hilft auch kein weiterer Versuch.
+      if (ev.code === 'unbekannt') { laufVergessen(); setRunning(false); }
+      break;
+    case 'done': {
+      const sek = ergebnis(ev);
+      const l = laufLesen();
+      addHistory({ prompt: (l && l.prompt) || prompt,
+                   ok: !!ev.ok, at: Date.now(), seconds: sek || '?' });
+      laufVergessen();
+      beitragAgentBeenden();
+      setRunning(false);
       break;
     }
     default:
-      logLine(ev.type in TAGS ? ev.type : 'status', ev.text || '');
+      // status und alles Unbekannte: als schlichte Zeile, niemals versteckt.
+      schritt = null;
+      strom = null;
+      sagen(ev.text || '', 'status');
   }
 }
 
@@ -281,33 +489,67 @@ function saveToken() {
   localStorage.setItem(TOKEN_KEY, value);
   $('token').value = '';
   $('gate').hidden = true;
-  toast('Token gespeichert');
+  toast('Angemeldet');
   checkHealth();
+}
+
+/* ----------------------------------------------------------- Eingabefeld */
+
+function hoeheAnpassen() {
+  const t = $('prompt');
+  t.style.height = 'auto';
+  t.style.height = Math.min(t.scrollHeight, window.innerHeight * 0.38) + 'px';
+}
+
+function vorschlaegeBauen() {
+  const box = $('chips');
+  if (!box) return;
+  VORSCHLAEGE.forEach(text => {
+    const b = el('button', 'chip', text);
+    b.type = 'button';
+    b.addEventListener('click', () => {
+      $('prompt').value = text;
+      hoeheAnpassen();
+      $('prompt').focus();
+    });
+    box.appendChild(b);
+  });
 }
 
 /* ----------------------------------------------------------- Verdrahtung */
 
-$('btn-run').addEventListener('click', () => (running ? stop() : start()));
-$('btn-clear').addEventListener('click', () => {
-  clearPanel($('panel-log'), 'Noch kein Lauf gestartet.');
-  clearPanel($('code-body'), 'Der generierte Code erscheint hier.');
-  clearPanel($('out-body'), 'Die Ausgabe des Programms erscheint hier.');
-  $('badge-code').textContent = '';
-  $('badge-out').textContent = '';
+$('composer').addEventListener('submit', e => {
+  e.preventDefault();
+  if (running) stop(); else start();
 });
 
-document.querySelectorAll('.tabs button').forEach(b => {
-  b.addEventListener('click', () => selectTab(b.dataset.panel));
-});
-
-$('btn-copy').addEventListener('click', async () => {
-  if (!codeText) { toast('Noch kein Code da'); return; }
-  try {
-    await navigator.clipboard.writeText(codeText);
-    toast('Code kopiert');
-  } catch {
-    toast('Kopieren nicht erlaubt — braucht HTTPS');
+$('prompt').addEventListener('input', hoeheAnpassen);
+$('prompt').addEventListener('keydown', e => {
+  // Zeilenumbruch mit Umschalt, Absenden mit Eingabe - aber nur dort, wo es
+  // eine echte Tastatur gibt. Auf Beruehrungsgeraeten ist die Eingabetaste
+  // der einzige Weg zu einem Absatz.
+  if (e.key !== 'Enter' || e.shiftKey) return;
+  if (e.metaKey || e.ctrlKey || !matchMedia('(pointer: coarse)').matches) {
+    e.preventDefault();
+    if (!running) start();
   }
+});
+
+$('btn-new').addEventListener('click', () => {
+  if (running) { toast('Erst den laufenden Auftrag beenden'); return; }
+  const s = $('stream');
+  s.textContent = '';
+  const leer = el('div', 'welcome');
+  leer.id = 'empty';
+  leer.appendChild(el('div', 'mark', 'B'));
+  leer.appendChild(el('h1', null, 'Was soll ich bauen?'));
+  leer.appendChild(el('p', null,
+    'Ich lese, schreibe und führe Code aus — und belege jede Änderung mit einem Lauf.'));
+  const box = el('div', 'chips');
+  box.id = 'chips';
+  leer.appendChild(box);
+  s.appendChild(leer);
+  vorschlaegeBauen();
 });
 
 $('btn-history').addEventListener('click', () => { renderHistory(); $('history').hidden = false; });
@@ -321,10 +563,6 @@ $('btn-hist-clear').addEventListener('click', () => {
 $('btn-login').addEventListener('click', saveToken);
 $('token').addEventListener('keydown', e => { if (e.key === 'Enter') saveToken(); });
 
-$('prompt').addEventListener('keydown', e => {
-  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) start();
-});
-
 document.querySelectorAll('.sheet').forEach(sheet => {
   sheet.addEventListener('click', e => {
     if (e.target === sheet && sheet.id !== 'gate') sheet.hidden = true;
@@ -333,9 +571,21 @@ document.querySelectorAll('.sheet').forEach(sheet => {
 
 /* ----------------------------------------------------------- Start */
 
+vorschlaegeBauen();
+hoeheAnpassen();
 if (!localStorage.getItem(TOKEN_KEY)) openGate();
 checkHealth();
 setInterval(checkHealth, 20000);
+
+// Zurueck aus dem Hintergrund: sofort wieder anhaengen. Der regelmaessige
+// Versuch daneben faengt die Faelle ab, in denen das Ereignis ausbleibt -
+// etwa bei einem Netzwechsel, bei dem die Seite nie unsichtbar war.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) { wiederanhaengen(); checkHealth(); }
+});
+window.addEventListener('online', wiederanhaengen);
+setInterval(wiederanhaengen, WIEDERHOLUNG);
+wiederanhaengen();
 
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
