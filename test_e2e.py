@@ -408,6 +408,19 @@ if _ms.exists():
     check("er benennt, dass Code an den Anbieter geht",
           "an den Anbieter" in _mst)
 
+_mess = (HIER / "deploy" / "messen.sh")
+check("es gibt eine Geschwindigkeitsmessung", _mess.exists(), str(_mess))
+if _mess.exists():
+    _mt = _mess.read_text()
+    # Lesen und Antworten sind zwei verschiedene Kosten mit zwei
+    # verschiedenen Gegenmitteln. Eine Zahl allein fuehrt zur falschen
+    # Massnahme.
+    check("sie trennt Prompt-Lesen von Antworten",
+          "prompt_eval_count" in _mt and "eval_count" in _mt)
+    check("sie misst kalt und warm", "Kalt" in _mt and "Warm" in _mt or "warm" in _mt)
+    check("sie prüft, ob keep_alive greift", "keep_alive" in _mt and "laden" in _mt)
+    check("sie sagt, was die Zahlen bedeuten", "So liest du das" in _mt)
+
 
 print(f"\n=== {ok} bestanden, {fail} fehlgeschlagen ===")
 sys.exit(1 if fail else 0)

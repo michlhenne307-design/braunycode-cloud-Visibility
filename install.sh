@@ -343,6 +343,10 @@ if [ -f "$SRC_DIR/deploy/modell.sh" ]; then
   step "Modellumschalter einrichten (braunycode-modell)"
   sudo install -m 0755 "$SRC_DIR/deploy/modell.sh" /usr/local/bin/braunycode-modell
 fi
+if [ -f "$SRC_DIR/deploy/messen.sh" ]; then
+  step "Geschwindigkeitsmessung einrichten (braunycode-messen)"
+  sudo install -m 0755 "$SRC_DIR/deploy/messen.sh" /usr/local/bin/braunycode-messen
+fi
 
 # ---------------------------------------------------------------- 7. Firewall
 step "Lokale Firewall fuer Port $BRAUNY_PORT oeffnen"
@@ -385,6 +389,8 @@ cat <<EOF
     Startet dann im Vollbild ohne Browserleiste.
 
   Aktualisieren  sudo braunycode-update
+  Tempo messen   braunycode-messen
+  Modell wechseln sudo braunycode-modell
 
   Status    sudo systemctl status braunycode
   Logs      journalctl -u braunycode -f
