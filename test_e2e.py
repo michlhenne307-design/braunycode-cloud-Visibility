@@ -408,6 +408,37 @@ if _ms.exists():
     check("er benennt, dass Code an den Anbieter geht",
           "an den Anbieter" in _mst)
 
+# Im Betrieb passiert: das Modell baute ein Menue mit input(), in der Sandbox
+# kam keine Eingabe, die Schleife drehte endlos - tausende Ausgabezeilen, und
+# der Lauf brach am Ereignisbudget ab. Wegen der AUSGABE, nicht wegen des
+# Fehlers.
+import agentloop as _al2
+_lange = "\n".join(f"Zeile {n}" for n in range(1000))
+_gesendet = []
+
+async def _sammeln(typ, text="", **extra):
+    _gesendet.append((typ, text))
+
+async def _viel_ausgabe():
+    zeilen = _lange.splitlines()
+    for line in zeilen[:_al2.MAX_AUSGABE_ZEILEN]:
+        await _sammeln("sandbox", line)
+    if len(zeilen) > _al2.MAX_AUSGABE_ZEILEN:
+        await _sammeln("sandbox", f"… {len(zeilen) - _al2.MAX_AUSGABE_ZEILEN} weitere")
+
+asyncio.run(_viel_ausgabe())
+check("lange Ausgaben werden gedeckelt",
+      len(_gesendet) == _al2.MAX_AUSGABE_ZEILEN + 1, len(_gesendet))
+check("und die Kürzung wird gesagt, nicht verschwiegen",
+      "weitere" in _gesendet[-1][1], _gesendet[-1])
+check("der Deckel liegt unter dem Ereignisbudget des Laufs",
+      _al2.MAX_AUSGABE_ZEILEN * 4 < 4000, _al2.MAX_AUSGABE_ZEILEN)
+_quelle = (HIER / "app" / "agentloop.py").read_text()
+check("der Deckel greift wirklich im Lauf",
+      "zeilen[:MAX_AUSGABE_ZEILEN]" in _quelle)
+check("und nennt die wahrscheinliche Ursache",
+      "Endlosschleife" in _quelle and "Eingabe" in _quelle)
+
 _mess = (HIER / "deploy" / "messen.sh")
 check("es gibt eine Geschwindigkeitsmessung", _mess.exists(), str(_mess))
 if _mess.exists():

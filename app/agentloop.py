@@ -90,6 +90,11 @@ def _summarize(name: str, arguments: dict) -> str:
 # Wie oft ein Lebenszeichen kommt, waehrend das Modell rechnet.
 PULS_S = float(os.environ.get("BRAUNY_PULS", "3"))
 
+# Wie viele Ausgabezeilen eines einzelnen Laufs in die Oberflaeche gehen.
+# Mehr sieht sich ohnehin niemand an, und ein durchgehendes Programm darf
+# nicht das Ereignisbudget des ganzen Auftrags verbrauchen.
+MAX_AUSGABE_ZEILEN = int(os.environ.get("BRAUNY_MAX_AUSGABE", "200"))
+
 
 async def _mit_puls(send, aufgabe, schritt):
     """Auf das Modell warten und dabei regelmaessig zeigen, dass es laeuft.
@@ -289,8 +294,23 @@ async def run_tool_agent(send, task, *, chat_fn, toolbox, max_steps=MAX_STEPS,
                 except Exception:
                     pass
             elif call.name in ("run_python", "run_command"):
-                for line in result.splitlines():
+                # Deckel je Aufruf. Im Betrieb passiert: das Modell baut ein
+                # Menue mit input(), in der Sandbox kommt keine Eingabe, die
+                # Schleife dreht endlos und schreibt tausende Zeilen. Damit war
+                # das Ereignisbudget des ganzen Laufs aufgebraucht und der Lauf
+                # brach ab - wegen der AUSGABE, nicht wegen des Fehlers.
+                #
+                # Gekuerzt wird mit Ansage. Eine still abgeschnittene Ausgabe
+                # ist schlimmer als eine lange: dann sucht man den Fehler in
+                # einem Protokoll, das gar nicht vollstaendig ist.
+                zeilen = result.splitlines()
+                for line in zeilen[:MAX_AUSGABE_ZEILEN]:
                     await send("sandbox", line)
+                if len(zeilen) > MAX_AUSGABE_ZEILEN:
+                    await send("sandbox",
+                               f"… {len(zeilen) - MAX_AUSGABE_ZEILEN} weitere Zeilen "
+                               "abgeschnitten. Laeuft das Programm in einer "
+                               "Endlosschleife oder wartet es auf eine Eingabe?")
                 executed = executed or result.startswith(
                     ("Lauf erfolgreich", "Befehl erfolgreich"))
             elif call.name in ("fetch_url", "git_push") and not failed:

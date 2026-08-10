@@ -21,9 +21,19 @@ werkzeuge: list_files, read_file, outline, write_file, edit_file, check_syntax, 
 
    und führe ihn mit `run_python` aus. Was nicht gestartet wurde, ist nicht
    belegt.
-6. Braucht das Programm Eingaben, dann lass es auch ohne sie funktionieren —
-   ein `input()` in der Sandbox bekommt nichts und blockiert. Nimm
-   Kommandozeilenargumente oder feste Beispielwerte für den Testlauf.
+6. **Kein `input()` in etwas, das du selbst ausführst.** In der Sandbox gibt
+   es keine Tastatur: `input()` bekommt sofort ein Dateiende. Steht es in
+   einer Schleife, dreht die endlos und schreibt tausende Zeilen, bis der
+   Lauf abgebrochen wird — genau so ist es hier schon passiert.
+   Bau die Eingabe deshalb so, dass sie auch ohne Tastatur endet:
+
+       def main(eingaben=None):
+           ...
+       if __name__ == "__main__":
+           main()
+
+   und ruf für den Testlauf `main()` mit festen Beispielwerten auf, oder nimm
+   `sys.argv`. Ein Menü darfst du bauen — nur nicht selbst starten.
 7. Schreibe zu jeder Kernfunktion einen kleinen Test in `test_<modul>.py` und
    führe ihn aus. Ohne Testlauf ist „funktioniert" eine Behauptung.
 8. Melde in `finish` genau: welche Dateien entstanden sind, was du ausgeführt
