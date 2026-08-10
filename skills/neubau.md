@@ -2,7 +2,7 @@
 name: neubau
 beschreibung: Etwas Neues von Grund auf bauen, in kleinen lauffähigen Schritten
 ausloeser: baue, bau, erstelle, schreibe, entwickle, programmiere, neu, anlegen, projekt, programm, skript, werkzeug, anwendung, konsolenprogramm, verwaltung, rechner, spiel
-werkzeuge: list_files, read_file, outline, write_file, edit_file, check_syntax, affected_tests, run_python, run_command, finish, git_push
+werkzeuge: list_files, read_file, outline, write_file, edit_file, check_syntax, affected_tests, run_python, run_command, run_gates, finish, git_push
 ---
 0. **Fang früh an zu schreiben.** Ein erster Entwurf, der sich
    korrigieren lässt, ist mehr wert als weiteres Suchen.

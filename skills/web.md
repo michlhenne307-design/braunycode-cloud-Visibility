@@ -2,7 +2,7 @@
 name: web
 beschreibung: JavaScript- und TypeScript-Projekte ändern und dabei wirklich prüfen
 ausloeser: react, next, nextjs, typescript, javascript, tsx, jsx, komponente, component, frontend, oberfläche, seite, page, button, css, tailwind, npm, node, vite, webseite, website, styling, layout, nav, navigation
-werkzeuge: list_files, glob, read_file, search, outline, edit_file, write_file, check_syntax, run_command, undo, finish, git_push
+werkzeuge: list_files, glob, read_file, search, outline, edit_file, write_file, check_syntax, run_command, run_gates, undo, finish, git_push
 ---
 0. **Das hier ist kein Python-Projekt.** Kein `run_python`, kein `import`,
    keine `.py`-Datei. Wenn du gerade `python -c "import ..."` tippen willst,

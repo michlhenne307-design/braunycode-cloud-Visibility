@@ -2,7 +2,7 @@
 name: daten
 beschreibung: Dateien und Daten einlesen, umformen und auswerten
 ausloeser: csv, json, datei einlesen, daten, tabelle, auswerten, umwandeln, konvertieren, parsen, datenimport, datenexport, statistik, zählen, sortieren
-werkzeuge: list_files, glob, read_file, search, write_file, edit_file, check_syntax, affected_tests, run_python, run_command, finish, git_push
+werkzeuge: list_files, glob, read_file, search, write_file, edit_file, check_syntax, affected_tests, run_python, run_command, run_gates, finish, git_push
 ---
 1. Sieh dir die echten Daten an, bevor du Code schreibst: die ersten Zeilen
    mit `read_file`. Ein Trennzeichen, eine Kopfzeile oder ein Datumsformat zu

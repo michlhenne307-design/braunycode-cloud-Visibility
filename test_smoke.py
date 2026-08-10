@@ -3676,7 +3676,15 @@ check("run_python belegt nur seinen eigenen Ast",
 
 _tb = _nach(["a.py", "b.py"], ("run_command", {"command": "python -m pytest test_a.py"}))
 asyncio.run(_tb.call("run_python", {"path": "b.py"}))
-check("beide Äste belegt lässt finish durch",
+# Beide Äste sind einzeln belegt — das reicht seit der Gate-Sperre NICHT mehr.
+# Ein gezielter Testlauf über a.py und ein run_python über b.py sagen nichts
+# darüber, ob die Suite des Projekts als Ganzes noch grün ist. Genau diese
+# Lücke war gemeint mit "keine Regressionen".
+check("einzeln belegte Äste reichen dem Abschluss nicht mehr",
+      asyncio.run(_tb.call("finish", {"summary": "x"})).startswith("FEHLER"),
+      _tb.bericht()["gates"])
+asyncio.run(_tb.call("run_gates", {}))
+check("erst die Prüfbefehle des Projekts lassen finish durch",
       not asyncio.run(_tb.call("finish", {"summary": "x"})).startswith("FEHLER"))
 check("und der Lauf gilt als verifiziert", _tb.verified is True)
 
@@ -4127,6 +4135,208 @@ check("sie hängt sich beim Zurückkommen wieder an",
       "visibilitychange" in js and "wiederanhaengen" in js)
 check("sie zählt mit, wo sie war", "ev.i" in js and "attach" in js)
 check("der Abbruch geht an den Server, statt nur wegzusehen", "cancel:" in js)
+
+
+# ------------------------------------------- Prüfbefehle aus dem Projekt
+print("\n[46] Die Prüfbefehle des Projekts finden statt raten")
+
+import gates  # noqa: E402
+
+_NEXT = ('{"scripts":{"dev":"next dev","build":"next build",'
+         '"lint":"next lint","test":"jest","start":"next start"}}')
+
+_g = gates.ermitteln({"package.json": _NEXT, "package-lock.json": ""})
+check("package.json-Skripte werden gefunden", len(_g) == 3, [x.zeile() for x in _g])
+check("in der Reihenfolge lint, build, test",
+      [x.rolle for x in _g] == ["lint", "build", "test"], [x.rolle for x in _g])
+check("npm braucht 'run'", _g and _g[0].befehl == ["npm", "run", "lint"], _g[0].befehl)
+# Ein Dauerlaeufer als Pruefung wuerde die Sandbox bis zum Zeitlimit
+# blockieren - der Lauf saehe aus wie ein Absturz.
+check("'dev' und 'start' sind keine Prüfbefehle",
+      not any("dev" in x.befehl or "start" in x.befehl for x in _g), _g)
+
+check("yarn.lock ergibt yarn ohne 'run'",
+      gates.ermitteln({"package.json": _NEXT, "yarn.lock": ""})[0].befehl
+      == ["yarn", "lint"])
+check("pnpm-lock ergibt pnpm",
+      gates.ermitteln({"package.json": _NEXT, "pnpm-lock.yaml": ""})[0].befehl
+      == ["pnpm", "run", "lint"])
+
+# Genau der Fall aus der Anforderung: nur 'dev' vorhanden. Er darf daraus
+# NICHT 'alles grün' machen.
+check("nur ein dev-Skript ergibt keinen einzigen Prüfbefehl",
+      gates.ermitteln({"package.json": '{"scripts":{"dev":"next dev"}}'}) == [])
+check("kaputte package.json wirft nicht",
+      gates.ermitteln({"package.json": "{kaputt"}) == [])
+check("package.json ohne scripts wirft nicht",
+      gates.ermitteln({"package.json": '{"name":"x"}'}) == [])
+
+_g = gates.ermitteln({"Makefile": ".PHONY: all\nCC := gcc\n"
+                                  "lint:\n\truff check .\ntest:\n\tpytest\n"})
+check("Makefile-Ziele werden gefunden",
+      [x.rolle for x in _g] == ["lint", "test"], [x.zeile() for x in _g])
+check("eine Variablenzuweisung ist kein Ziel",
+      all("CC" not in x.befehl for x in _g), _g)
+
+_g = gates.ermitteln({"pyproject.toml": "[tool.ruff]\nline-length = 88\n",
+                      "test_a.py": "def test_x(): pass\n"})
+check("Python: ruff aus der Konfiguration",
+      _g and _g[0].befehl == ["ruff", "check", "."], _g)
+check("Python: pytest wegen echter Testdateien",
+      any(x.befehl == ["python", "-m", "pytest", "-q"] for x in _g), _g)
+# Ohne Testdateien wird kein pytest erfunden - ein Lauf ueber nichts ist
+# kein Beleg.
+check("ohne Testdateien kein erfundener pytest-Aufruf",
+      not any("pytest" in x.befehl for x in
+              gates.ermitteln({"pyproject.toml": "[tool.ruff]\n"})))
+
+check("ein Projekt ohne alles ergibt keine Prüfbefehle",
+      gates.ermitteln({"main.py": "print(1)\n"}) == [])
+
+# Die Sandbox mountet nur lesend, hat kein Netz, und node_modules wird
+# bewusst nie mitkopiert. 'npm run build' ist dort also grundsätzlich nicht
+# ausführbar. Das ehrlich zu melden ist der Punkt — ein an fehlenden Paketen
+# gescheiterter Build sieht sonst aus wie kaputter Code, und das Modell
+# "repariert" dann etwas, das nie kaputt war.
+check("node_modules steht auf der Ausschlussliste des Arbeitsverzeichnisses",
+      "node_modules" in ws_mod.SKIP_DIRS)
+check("JS-Prüfbefehle brauchen Fremdpakete",
+      gates.braucht_fremdpakete(gates.ermitteln({"package.json": _NEXT})))
+check("Python-Prüfbefehle nicht",
+      not gates.braucht_fremdpakete(
+          gates.ermitteln({"test_a.py": "def test_x(): pass\n"})))
+
+# --- Verdrahtung im Werkzeugkasten ---
+check("run_gates ist ein echtes Werkzeug", "run_gates" in tools.BASE_NAMES)
+check("und zählt als Prüfung", "run_gates" in tools.CHECKING)
+
+_laeufe = []
+
+async def _gates_sandbox(_d, _e=None, command=None):
+    _laeufe.append(command)
+    return 0, "ok"
+
+# Ein Python-Projekt: dessen Prüfbefehle laufen in dieser Sandbox wirklich.
+_w = ws_mod.Workspace(tempfile.mkdtemp())
+_w.write("pyproject.toml", "[tool.ruff]\nline-length = 88\n")
+_w.write("test_a.py", "def test_x():\n    assert True\n")
+_tb = tools.Toolbox(_w, run_sandbox=_gates_sandbox)
+_erg = asyncio.run(_tb.call("run_gates", {}))
+check("run_gates führt beide Befehle aus",
+      _laeufe == [["ruff", "check", "."], ["python", "-m", "pytest", "-q"]], _laeufe)
+check("und meldet grün", "Alle Prüfbefehle des Projekts bestanden." in _erg, _erg)
+check("grün wird auch gebucht", _tb.gates_gruen is True)
+
+# Halt beim ersten Fehlschlag: ein Testlauf hinter rotem Lint sagt nichts
+# Neues, kostet aber einen Containerstart.
+_laeufe.clear()
+
+async def _rotes_lint(_d, _e=None, command=None):
+    _laeufe.append(command)
+    return 1, "test_a.py:1:8: F821 Undefined name `foo`"
+
+_tb = tools.Toolbox(_w, run_sandbox=_rotes_lint)
+_erg = asyncio.run(_tb.call("run_gates", {}))
+check("nach rotem Lint wird nicht weitergeprüft", len(_laeufe) == 1, _laeufe)
+check("der Abbruch wird benannt", "nicht mehr ausgeführt" in _erg, _erg)
+check("rot wird nicht als grün gebucht", _tb.gates_gruen is False)
+# Der Befund aus dem Parser muss hier ankommen, nicht nur die Rohausgabe.
+check("der Lint-Befund hängt am Ergebnis", "Befund:" in _erg, _erg[-200:])
+
+# Kein Prüfbefehl auffindbar: ausdrücklich KEIN Erfolg.
+_w2 = ws_mod.Workspace(tempfile.mkdtemp())
+_w2.write("notiz.md", "# hallo\n")
+_tb2 = tools.Toolbox(_w2, run_sandbox=_gates_sandbox)
+_erg = asyncio.run(_tb2.call("run_gates", {}))
+check("ohne Prüfbefehle wird das gesagt", "Keine Prüfbefehle gefunden" in _erg, _erg)
+check("und ausdrücklich nicht als bestanden gewertet",
+      "KEIN bestandener Lauf" in _erg and _tb2.gates_gruen is False, _erg)
+
+# node_modules fehlt: ehrlich als ungeprüft melden, nicht als kaputt und
+# nicht als grün.
+_w3 = ws_mod.Workspace(tempfile.mkdtemp())
+_w3.write("package.json", _NEXT)
+_tb3 = tools.Toolbox(_w3, run_sandbox=_gates_sandbox)
+_erg = asyncio.run(_tb3.call("run_gates", {}))
+check("nicht ausführbare Prüfbefehle werden als solche gemeldet",
+      "node_modules" in _erg, _erg)
+check("mit dem Grund: kein Netz, nur lesend", "kein Netz" in _erg, _erg)
+check("und gelten ausdrücklich nicht als bestanden",
+      "NICHT bestanden" in _erg and _tb3.gates_gruen is False, _erg)
+check("der Bericht sagt, dass sie nicht liefen",
+      "nicht ausführbar" in _tb3.bericht()["gates"]["stand"], _tb3.bericht()["gates"])
+# Sie duerfen den Abschluss nicht blockieren - der Agent kann sie hier nicht
+# ausfuehren, zwei Ablehnungen aendern daran nichts.
+asyncio.run(_tb3.call("write_file", {"path": "app.js", "content": "const a = 1;\n"}))
+asyncio.run(_tb3.call("check_syntax", {"path": "app.js"}))
+check("unausführbare Gates blockieren finish nicht",
+      not asyncio.run(_tb3.call("finish", {"summary": "x"})).startswith("FEHLER"))
+
+# --- Die Sperre am Abschluss ---
+_w4 = ws_mod.Workspace(tempfile.mkdtemp())
+_w4.write("pyproject.toml", "[tool.ruff]\n")
+_w4.write("test_a.py", "def test_x():\n    assert True\n")
+_tb4 = tools.Toolbox(_w4, run_sandbox=_gates_sandbox)
+asyncio.run(_tb4.call("write_file", {"path": "app.py", "content": "a = 1\n"}))
+asyncio.run(_tb4.call("check_syntax", {"path": "app.py"}))
+check("check_syntax allein belegt die Datei", _tb4.unverified == set(), _tb4.unverified)
+_erg = asyncio.run(_tb4.call("finish", {"summary": "fertig"}))
+# Genau der Punkt aus der Anforderung: er darf nicht 'fertig' sagen, solange
+# Lint und Tests des Projekts nach seiner Aenderung nicht gelaufen sind.
+check("finish wird trotzdem abgewiesen — die Gates fehlen",
+      _erg.startswith("FEHLER") and "run_gates" in _erg, _erg[:160])
+_erg = asyncio.run(_tb4.call("run_gates", {}))
+check("nach grünen Gates geht finish durch",
+      not asyncio.run(_tb4.call("finish", {"summary": "x"})).startswith("FEHLER"))
+check("und der Lauf gilt als belegt", _tb4.verified is True)
+check("der Bericht sagt grün", _tb4.bericht()["gates"]["stand"] == "grün",
+      _tb4.bericht()["gates"])
+
+# Eine Aenderung NACH gruenen Gates entwertet sie wieder.
+asyncio.run(_tb4.call("write_file", {"path": "app.py", "content": "b = 2\n"}))
+check("eine neue Änderung entwertet den grünen Lauf",
+      _tb4.gates_gruen is False)
+
+# Ohne eigene Prüfbefehle darf die Sperre nicht greifen, sonst haengt jedes
+# einfache Projekt fest.
+_w5 = ws_mod.Workspace(tempfile.mkdtemp())
+_tb5 = tools.Toolbox(_w5, run_sandbox=_gates_sandbox)
+asyncio.run(_tb5.call("write_file", {"path": "a.py", "content": "x = 1\n"}))
+asyncio.run(_tb5.call("check_syntax", {"path": "a.py"}))
+check("ohne Prüfbefehle blockiert die Gate-Sperre nicht",
+      not asyncio.run(_tb5.call("finish", {"summary": "x"})).startswith("FEHLER"))
+
+# Die Skills müssen das Werkzeug auch kennen dürfen.
+for _name in ("neubau", "bugfix", "umbau", "tests", "web", "daten"):
+    _s = (main.BASE_DIR.parent / "skills" / f"{_name}.md").read_text()
+    check(f"Skill {_name} darf run_gates benutzen", "run_gates" in _s)
+
+check("der Systemtext nennt run_gates", "run_gates" in agentloop.SYSTEM_PROMPT)
+check("und verlangt, den Fehler zu beheben statt weiterzubauen",
+      "solange die vorige rot" in agentloop.SYSTEM_PROMPT)
+
+# Ohne Sandbox kann gar nichts ausgeführt werden. Dann darf die Sperre nicht
+# greifen — sie kostete nur zwei Runden und endete danach genauso.
+_w6 = ws_mod.Workspace(tempfile.mkdtemp())
+_w6.write("pyproject.toml", "[tool.ruff]\n")
+_w6.write("test_a.py", "def test_x(): pass\n")
+_tb6 = tools.Toolbox(_w6)          # bewusst ohne run_sandbox
+asyncio.run(_tb6.call("write_file", {"path": "a.py", "content": "x = 1\n"}))
+asyncio.run(_tb6.call("check_syntax", {"path": "a.py"}))
+check("ohne Sandbox blockiert die Gate-Sperre nicht",
+      not asyncio.run(_tb6.call("finish", {"summary": "x"})).startswith("FEHLER"))
+
+# Das Prüfskript selbst. Es hat einmal "Alles gruen" gemeldet, während
+# test_e2e.py rot war: '|| true' setzt PIPESTATUS zurück, die Abfrage danach
+# sah deshalb immer eine 0. Ein Prüfskript, das Rot verschluckt, ist
+# schlimmer als keines.
+_pruef = (main.BASE_DIR.parent / "pruefen.sh").read_text()
+check("das Prüfskript liest den Exit-Code nicht mehr über PIPESTATUS",
+      "${PIPESTATUS" not in _pruef, _pruef)
+check("es sammelt die Ausgabe erst ein und prüft dann den Status",
+      'ausgabe="$(python3 "$datei" 2>&1)"' in _pruef and "status=$?" in _pruef)
+check("und bricht bei einem Fehler wirklich ab",
+      'exit 1' in _pruef and '[ "$status" -eq 0 ] || fehler=1' in _pruef)
 
 
 print(f"\n=== {ok} bestanden, {fail} fehlgeschlagen ===")

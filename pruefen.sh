@@ -13,8 +13,17 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 fehler=0
 for datei in test_smoke.py test_e2e.py; do
   printf '\n\033[1;34m==> %s\033[0m\n' "$datei"
-  python3 "$datei" 2>&1 | grep -E '^  FAIL|^=== ' || true
-  [ "${PIPESTATUS[0]}" -eq 0 ] || fehler=1
+  # Ausgabe erst vollstaendig einsammeln, DANN filtern.
+  #
+  # Vorher stand hier 'python3 ... | grep ... || true' mit einer Abfrage von
+  # PIPESTATUS danach. Das '|| true' setzt PIPESTATUS aber zurueck: der
+  # Exit-Code des Testlaufs war anschliessend immer 0. Das Skript hat deshalb
+  # "Alles gruen" gemeldet, waehrend test_e2e.py rot war - der schlimmste
+  # Fehler, den ausgerechnet ein Pruefskript haben kann.
+  ausgabe="$(python3 "$datei" 2>&1)"
+  status=$?
+  printf '%s\n' "$ausgabe" | grep -E '^  FAIL|^=== ' || true
+  [ "$status" -eq 0 ] || fehler=1
 done
 
 if [ "$fehler" -ne 0 ]; then
