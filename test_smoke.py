@@ -1711,6 +1711,67 @@ check("die Sandbox bringt npm mit", "npm-cli.js" in _df2)
 check("und TypeScript, weil sie ohne Netz läuft", "typescript@5" in _df2)
 check("das Image prüft node beim Bauen", "node --version" in _df2)
 
+# --- Der Index sieht jetzt auch TypeScript --------------------------------
+#
+# Aus dem Betrieb: an einer Next.js-Anwendung hat der Agent dreissig Runden
+# lang gegrept. Kein Wunder - der Index kannte nur .py, also gab es fuer ihn
+# in diesem Projekt ueberhaupt keine Struktur, nur Volltext.
+import codeindex as _ci  # noqa: E402
+
+_iw = ws_mod.Workspace(_tf.mkdtemp())
+_iw.write("app/page.tsx",
+          "export default function Page(){ return <main>hi</main> }\n")
+_iw.write("components/nav.tsx",
+          "/** Die Navigation. */\nexport const SiteNav = () => <nav/>;\n")
+_iw.write("lib/typen.ts",
+          "export interface Waffe { name: string }\n"
+          "export type Klasse = \"a\" | \"b\";\n"
+          "export class Held { schlag(){} }\n")
+_iw.write("helfer.py", "def addiere(a, b):\n    \"\"\"Summe.\"\"\"\n    return a + b\n")
+_idx = _ci.CodeIndex.build(_iw)
+_namen = {s.name for s in _idx.symbols}
+
+check("Python bleibt im Index", "addiere" in _namen, sorted(_namen))
+if _syn.NODE and _syn.symbole([("x.ts", __file__)]) is not None:
+    check("React-Komponenten als Pfeilfunktion werden gefunden",
+          "SiteNav" in _namen, sorted(_namen))
+    check("eine default-exportierte Funktion wird gefunden", "Page" in _namen)
+    check("interface, type und class werden gefunden",
+          {"Waffe", "Klasse", "Held"} <= _namen, sorted(_namen))
+    check("Methoden einer Klasse werden gefunden",
+          any(s.qualname == "Held.schlag" for s in _idx.symbols),
+          [s.qualname for s in _idx.symbols])
+    check("JSDoc wird als Beschreibung übernommen",
+          any("Navigation" in s.doc for s in _idx.symbols),
+          [s.doc for s in _idx.symbols if s.doc])
+    check("symbol_info findet ein TypeScript-Symbol",
+          bool(_idx.find("SiteNav")), _idx.find("SiteNav"))
+    # 'def Page()' fuer eine .tsx-Datei legt dem Modell nahe, hier waere Python
+    # im Spiel - genau die Verwechslung, die einen Lauf gekostet hat.
+    _ueber = _idx.overview()
+    check("TypeScript wird nicht als Python dargestellt",
+          "function Page()" in _ueber and "def Page" not in _ueber, _ueber)
+    check("und Python weiterhin als Python", "def addiere" in _ueber, _ueber)
+    check("interface steht nicht doppelt da",
+          "interface Waffe" in _ueber and "def interface" not in _ueber, _ueber)
+
+# Ohne Parser darf der Index nichts erfinden - die Dateien gelten als
+# uebersprungen, nicht als leer.
+_orig2 = _syn.NODE
+_syn.NODE = None
+try:
+    _idx2 = _ci.CodeIndex.build(_iw)
+finally:
+    _syn.NODE = _orig2
+check("ohne Parser werden die TS-Dateien als übersprungen geführt",
+      any("TypeScript-Parser" in grund for _, grund in _idx2.skipped), _idx2.skipped)
+check("und nicht stillschweigend als symbollos ausgegeben",
+      all(not p.endswith((".ts", ".tsx")) for p in _idx2.files), _idx2.files)
+
+_ciq = (main.BASE_DIR / "codeindex.py").read_text()
+check("alle TS-Dateien laufen in EINEM Node-Aufruf",
+      "syntax.symbole(web)" in _ciq and _ciq.count("syntax.symbole") == 1)
+
 print("\n[26] Konnektoren")
 import connectors  # noqa: E402
 

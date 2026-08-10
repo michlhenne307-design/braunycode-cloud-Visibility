@@ -159,3 +159,132 @@ def pruefen(pfad: str, quelltext: str, arbeitsdatei: str = "") -> tuple[bool | N
 
     return None, (f"{pfad}: keine Prüfung für '{endung or 'ohne Endung'}' "
                   "vorhanden — die Änderung ist damit nicht belegt.")
+
+
+# --------------------------------------------------------------- Symbole
+
+# Ein Prozess fuer ALLE Dateien, nicht einer je Datei. Ein Node-Start kostet
+# rund 50 ms; bei zweihundert Dateien waeren das zehn Sekunden nur fuer das
+# Hochfahren. Die Liste kommt ueber die Standardeingabe, weil eine
+# Kommandozeile mit zweihundert Pfaden an die Laengengrenze stoesst.
+_SYMBOL_SKRIPT = r"""
+let ts;
+try { ts = require("typescript"); }
+catch (e) { console.log("[]"); process.exit(0); }
+const fs = require("fs");
+
+let roh = "";
+process.stdin.on("data", d => roh += d);
+process.stdin.on("end", () => {
+  let dateien = [];
+  try { dateien = JSON.parse(roh); } catch (e) { console.log("[]"); return; }
+  const raus = [];
+
+  for (const eintrag of dateien) {
+    const [rel, absolut] = eintrag;
+    let text;
+    try { text = fs.readFileSync(absolut, "utf8"); } catch (e) { continue; }
+    const tsx = /\.(tsx|jsx)$/.test(rel);
+    const quelle = ts.createSourceFile(rel, text, ts.ScriptTarget.Latest, true,
+      tsx ? ts.ScriptKind.TSX : ts.ScriptKind.TS);
+    if ((quelle.parseDiagnostics || []).length > 40) continue;
+
+    const zeile = n => quelle.getLineAndCharacterOfPosition(n.getStart(quelle)).line + 1;
+    const endzeile = n => quelle.getLineAndCharacterOfPosition(n.getEnd()).line + 1;
+    const doku = n => {
+      // Bei 'export const X = () => ...' haengt der Kommentar am STATEMENT,
+      // nicht an der Deklaration. Ohne den Blick nach oben bliebe die
+      // Beschreibung genau bei der haeufigsten React-Form leer.
+      let traeger = n;
+      for (let i = 0; i < 3 && traeger && !(traeger.jsDoc && traeger.jsDoc.length); i++) {
+        traeger = traeger.parent;
+      }
+      const n2 = traeger || n;
+      const j = n2.jsDoc && n2.jsDoc[0];
+      // Kein "\n" im Quelltext dieses Skripts: es steht in einer
+      // Python-Zeichenkette und wuerde dort zum echten Zeilenumbruch - mitten
+      // in einem JS-String. Genau daran ist es beim Bauen gescheitert.
+      return j && j.comment ? String(j.comment).split(/\r?\n/)[0].slice(0, 160) : "";
+    };
+    const params = n => !n.parameters ? "" :
+      "(" + n.parameters.map(p => p.name && p.name.getText ? p.name.getText(quelle) : "?")
+        .join(", ") + ")";
+
+    const nimm = (knoten, kind, name, qual, sig) => {
+      if (!name) return;
+      raus.push({kind, name, qualname: qual || name, path: rel,
+                 line: zeile(knoten), end_line: endzeile(knoten),
+                 signature: sig || (name + params(knoten)), doc: doku(knoten)});
+    };
+
+    const besuche = (knoten, praefix) => {
+      if (ts.isFunctionDeclaration(knoten) && knoten.name) {
+        nimm(knoten, "function", knoten.name.text, knoten.name.text);
+      } else if (ts.isClassDeclaration(knoten) && knoten.name) {
+        const cname = knoten.name.text;
+        nimm(knoten, "class", cname, cname, "class " + cname);
+        for (const m of knoten.members || []) {
+          if ((ts.isMethodDeclaration(m) || ts.isConstructorDeclaration(m)) && m.name) {
+            const mname = m.name.getText ? m.name.getText(quelle) : "constructor";
+            nimm(m, "method", mname, cname + "." + mname);
+          }
+        }
+      } else if (ts.isInterfaceDeclaration(knoten) && knoten.name) {
+        nimm(knoten, "interface", knoten.name.text, knoten.name.text,
+             "interface " + knoten.name.text);
+      } else if (ts.isTypeAliasDeclaration(knoten) && knoten.name) {
+        nimm(knoten, "type", knoten.name.text, knoten.name.text,
+             "type " + knoten.name.text);
+      } else if (ts.isEnumDeclaration(knoten) && knoten.name) {
+        nimm(knoten, "enum", knoten.name.text, knoten.name.text,
+             "enum " + knoten.name.text);
+      } else if (ts.isVariableStatement(knoten)) {
+        // const Foo = () => ... ist in React die haeufigste Form einer
+        // Komponente. Ohne diesen Zweig faende der Index in einer typischen
+        // .tsx-Datei ueberhaupt nichts.
+        for (const d of knoten.declarationList.declarations) {
+          if (!d.name || !d.name.text) continue;
+          const init = d.initializer;
+          if (init && (ts.isArrowFunction(init) || ts.isFunctionExpression(init))) {
+            nimm(d, "function", d.name.text, d.name.text, d.name.text + params(init));
+          }
+        }
+      }
+      ts.forEachChild(knoten, k => besuche(k, praefix));
+    };
+    ts.forEachChild(quelle, k => besuche(k, ""));
+  }
+  console.log(JSON.stringify(raus));
+});
+"""
+
+
+def symbole(dateien: list[tuple[str, str]]) -> list[dict] | None:
+    """Symbole aus TypeScript- und JavaScript-Dateien.
+
+    dateien: Paare (Pfad im Projekt, Pfad auf der Platte).
+
+    None bedeutet "nicht moeglich" - kein node, kein typescript. Auch hier
+    gilt: lieber keine Angabe als eine erfundene.
+    """
+    if not NODE or not dateien:
+        return None
+    umgebung = {**os.environ}
+    if NODE_PATH:
+        vorhanden = umgebung.get("NODE_PATH", "")
+        umgebung["NODE_PATH"] = (f"{vorhanden}{os.pathsep}{NODE_PATH}"
+                                 if vorhanden else NODE_PATH)
+    try:
+        fertig = subprocess.run(
+            [NODE, "-e", _SYMBOL_SKRIPT], env=umgebung,
+            input=json.dumps(dateien), capture_output=True, text=True,
+            timeout=max(TIMEOUT, 60))
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if fertig.returncode != 0:
+        return None
+    try:
+        ergebnis = json.loads(fertig.stdout.strip() or "[]")
+    except json.JSONDecodeError:
+        return None
+    return ergebnis if isinstance(ergebnis, list) else None
